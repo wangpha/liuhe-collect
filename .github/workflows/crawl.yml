@@ -281,11 +281,17 @@ jobs:
           pattern: products-*-${{ github.run_id }}
           path: repo/work/incoming
 
+      - name: 下载各源运行日志与审计
+        uses: actions/download-artifact@v4
+        with:
+          pattern: run-*-${{ github.run_id }}
+          path: repo/work/incoming-logs
+
       - name: 合并进数据仓 + 生成 manifest
         working-directory: repo
         run: |
           python - <<'PY'
-          import json, shutil
+          import json, shutil, sys
           from pathlib import Path
           from datetime import datetime, timezone
 
@@ -294,30 +300,41 @@ jobs:
           data = store / "data"
           data.mkdir(parents=True, exist_ok=True)
 
+          # 源目录名规范化：数据仓里统一用源 id（dahkg / aocai / tuku）
+          NAME_MAP = {"大港澳": "dahkg", "澳彩交流": "aocai", "tuku": "tuku"}
+
+          def key_for(artifact_name: str, period_dir: Path) -> str:
+              """优先用 artifact 名里的源 id；退化为期目录的父目录名。"""
+              # artifact 名形如 products-<source>-<run_id>
+              parts = artifact_name.split("-")
+              if len(parts) >= 2 and parts[1] in ("dahkg", "aocai", "tuku"):
+                  return parts[1]
+              parent = period_dir.parent.name
+              return NAME_MAP.get(parent, parent or "unknown")
+
           copied = []
           for src_root in sorted(incoming.glob("products-*")):
-              out = src_root / "work" / "out"
-              if not out.is_dir():
+              if not src_root.is_dir():
                   continue
-              for source_dir in out.iterdir():
-                  if not source_dir.is_dir() or source_dir.name.startswith('.'):
-                      continue
-                  if not list(source_dir.glob("*期")):
-                      # 图库/澳彩期目录直接在 out 根下
-                      pass
-                  for period_dir in source_dir.glob("*期"):
-                      dst = data / source_dir.name / period_dir.name
-                      if dst.exists():
-                          shutil.rmtree(dst)
-                      shutil.copytree(period_dir, dst, ignore=shutil.ignore_patterns("images", ".cache"))
-                      copied.append(f"{source_dir.name}/{period_dir.name}")
-              # 图库：期目录直接位于 out 根
-              for period_dir in out.glob("*期"):
-                  dst = data / "tuku" / period_dir.name
+              # **关键修复**：artifact 解包后的层级不固定（upload-artifact 会剥掉公共前缀），
+              # 所以按内容递归找 `*期` 目录，而不是假设固定的 work/out。
+              found = [p for p in src_root.rglob("*期") if p.is_dir()]
+              print(f"{src_root.name}: 找到期目录 {len(found)} 个 -> {[p.name for p in found][:5]}")
+              for period_dir in found:
+                  key = key_for(src_root.name, period_dir)
+                  dst = data / key / period_dir.name
                   if dst.exists():
                       shutil.rmtree(dst)
+                  dst.parent.mkdir(parents=True, exist_ok=True)
                   shutil.copytree(period_dir, dst, ignore=shutil.ignore_patterns("images", ".cache"))
-                  copied.append(f"tuku/{period_dir.name}")
+                  copied.append(f"{key}/{period_dir.name}")
+
+          if not copied:
+              print("FATAL: 没有把任何一期的产物合并进数据仓", file=sys.stderr)
+              print("incoming 结构如下：", file=sys.stderr)
+              for p in sorted(incoming.rglob("*"))[:60]:
+                  print("   ", p, file=sys.stderr)
+              sys.exit(1)
 
           manifest = {}
           for key_dir in sorted(p for p in data.iterdir() if p.is_dir()):
@@ -339,14 +356,21 @@ jobs:
         working-directory: repo
         run: |
           mkdir -p work/store/logs
-          for f in $(find work/incoming -name 'run_*.log'); do
+          FOUND=0
+          for f in $(find work/incoming work/incoming-logs -name 'run_*.log' -type f 2>/dev/null); do
             ts=$(date -u +%Y%m%d_%H%M%S)
             base=$(basename "$f" .log)
             cp "$f" "work/store/logs/${base}_${ts}_run${GITHUB_RUN_NUMBER}.log"
+            FOUND=$((FOUND+1))
           done
+          # 审计 JSON 也一起入库，验收时可逐份核对
+          for j in $(find work/incoming-logs -name 'audit_*.json' -o -name 'logaudit_*.json' 2>/dev/null | head -40); do
+            cp "$j" "work/store/logs/" 2>/dev/null || true
+          done
+          echo "拷入日志 $FOUND 份"
           ls -la work/store/logs | tail -10
           ls -1t work/store/logs/*.log 2>/dev/null | tail -n +31 | xargs -r rm -f
-          ls -1 work/store/logs/*.log 2>/dev/null | wc -l
+          echo "保留 $(ls -1 work/store/logs/*.log 2>/dev/null | wc -l) 份"
 
       - name: 提交并推送
         working-directory: repo/work/store
