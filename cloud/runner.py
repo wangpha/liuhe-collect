@@ -587,22 +587,27 @@ def do_run(args, mode: str = "run") -> int:
                 f"[防线1] ⚠ 独立扫描有 {scan.get('pageErrorCount', 0)} 页重试 {_reconcile.PAGE_RETRIES} 次仍失败"
                 f"（明细见 audit 的 postsReconcile.scanPageErrors）→ 本轮对账基准不可信，判**不通过**"
             )
-        # 「产物有、列表没扫到」的候选，先逐帖向源站详情求证，再分类
+        # 「产物有、列表没扫到」的候选 + 「列表有、产物没有」的漏帖候选，
+        # 都要向源站详情求证：前者要区分盲区/已删/幽灵，后者要拿 createTime 判断是否为索引延迟
         got_ids = {int(p.get("articleId") or 0) for p in posts if p.get("articleId")}
         late_ids = {int(x) for x in (scan.get("lateIds") or [])}
         want_ids = set(scan.get("unionIds") or [])
         candidates = sorted(got_ids - want_ids - late_ids)
-        probe = _reconcile.probe_details(source, candidates, log=log, target_period=period) if candidates else None
+        miss_candidates = sorted(want_ids - got_ids)
+        probe_ids = sorted(set(candidates) | set(miss_candidates))
+        probe = _reconcile.probe_details(source, probe_ids, log=log, target_period=period) if probe_ids else None
         post_check = _reconcile.reconcile_posts(
             posts,
             scan,
             previous_ids=set(prev_snapshot) or None,
             probe=probe,
             target_period=period,
+            collect_started=collect_started,
         )
         log(
             f"[防线1] 帖子对账：采集前已存在 {post_check['expected']} 帖 / 产物 {post_check['actual']} 帖"
             f" / 缺 {post_check['missingCount']}"
+            f" / 索引延迟(新帖刚发，列表未收录) {post_check.get('indexLagCount', 0)}"
             f" / 扫描盲区(源站确认存在) {post_check['scanGapCount']}"
             f" / 源站已删 {post_check['disappearedCount']}"
             f" / 幽灵(源站无且上轮无) {post_check['phantomCount']}"

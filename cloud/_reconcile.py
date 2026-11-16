@@ -481,6 +481,23 @@ def _fetch_page_retry(fetch, label: str, say, page_errors: list[dict], meta: dic
 # ---------------------------------------------------------------------------
 # 「这帖在源站还在不在」——逐帖求证（判定多出/幽灵的唯一可靠依据）
 # ---------------------------------------------------------------------------
+def _to_unix(value) -> float:
+    """把源站时间字段统一成 unix 秒。
+
+    三源口径不同（2026-11-16 实测）：
+      · dahkg `createTime` 是**毫秒**（如 1794762176000）
+      · tuku  `createTime` 可能是毫秒或秒
+      · aocai 部分字段是字符串
+    判据：> 1e11 视为毫秒。
+    """
+    try:
+        v = float(str(value).strip())
+    except (TypeError, ValueError):
+        return 0.0
+    if v <= 0:
+        return 0.0
+    return v / 1000.0 if v > 1e11 else v
+
 def _classify_probe_error(exc: BaseException) -> str:
     """区分「源站明确说没有这帖」与「源站拒绝提供 / 我们无法确认」。
 
@@ -522,12 +539,15 @@ def probe_details(
     say = log or (lambda message: None)
     exists: dict[int, bool] = {}
     periods: dict[int, int] = {}
+    created_map: dict[int, float] = {}
     unknown: set[int] = set()
 
-    def record(aid: int, ok: bool, period: int = 0, kind: str = "") -> None:
+    def record(aid: int, ok: bool, period: int = 0, kind: str = "", created: float = 0.0) -> None:
         exists[aid] = ok
         if ok and period:
             periods[aid] = period
+        if created and created > 0:
+            created_map[aid] = created
         if kind == "unknown":
             unknown.add(aid)
 
@@ -540,7 +560,7 @@ def probe_details(
                 try:
                     raw = scraper.api_get("/unite49/h5/article/detail", {"articleId": aid}, delay=0)
                     ok = isinstance(raw, dict) and int(raw.get("articleId") or 0) == int(aid)
-                    record(aid, ok, normalize_period((raw or {}).get("period")))
+                    record(aid, ok, normalize_period((raw or {}).get("period")), created=_to_unix((raw or {}).get("createTime")))
                     last = None
                     break
                 except Exception as exc:  # noqa: BLE001
@@ -566,7 +586,7 @@ def probe_details(
                 try:
                     raw = dahkg.fetch_detail(aid)
                     ok = isinstance(raw, dict) and bool(raw)
-                    record(aid, ok, normalize_period((raw or {}).get("periods") or (raw or {}).get("period")))
+                    record(aid, ok, normalize_period((raw or {}).get("periods") or (raw or {}).get("period")), created=_to_unix((raw or {}).get("createTime")))
                     last = None
                     break
                 except Exception as exc:  # noqa: BLE001
@@ -625,7 +645,7 @@ def probe_details(
         f"[求证] {source}: 求证 {len(ids)} 帖，源站仍在 {alive}，"
         f"明确已消失 {len(ids) - alive - len(unknown)}，无法确认 {len(unknown)}"
     )
-    return {"exists": exists, "periods": periods, "unknown": unknown}
+    return {"exists": exists, "periods": periods, "created": created_map, "unknown": unknown}
 
 
 def probe_image_urls(
@@ -710,11 +730,17 @@ def reconcile_posts(
     previous_ids: set[int] | None = None,
     probe: dict | None = None,
     target_period: int = 0,
+    collect_started: float | None = None,
+    index_grace: float = 300.0,
 ) -> dict:
     """帖子数对账。
 
     分类（每一类都明写，不静默）：
-      * `missing`      源站列表有、产物没有 → **漏帖，硬失败**（R11 红线）
+      * `missing`      源站列表有、产物没有，**且帖子早就发布了** → **漏帖，硬失败**（R11 红线）
+      * `indexLag`     源站列表有、产物没有，但帖子 `createTime` 距采集开始不到 `index_grace`(300s)
+                       → **源站列表索引延迟**，不是我们漏抓。2026-11-16 实测：期号刚从 320 切到 321，
+                         新期第 1 分钟发的那帖在采集时还没进列表索引，两分钟后才出现。
+                         用帖子自己的发布时间判定，比拍一个"忽略最近 N 分钟"的时间窗更精确。
       * `scanGap`      产物有、列表没扫到、但**详情接口证明它存在且期号正确**
                        → 属列表窗口(1000 行上限 + 顺序不稳)的扫描盲区，不是漏抓，不判失败
       * `disappeared`  产物有、列表没扫到、**详情接口证明已不在源站**
@@ -727,8 +753,18 @@ def reconcile_posts(
     prev = {int(x) for x in (previous_ids or set())}
     want = set(scan.get("unionIds") or [])
     want_period = normalize_period(target_period) or int(scan.get("period") or 0)
+    probe_created = (probe or {}).get("created") or {}
 
-    missing = sorted(want - got)
+    missing_all = sorted(want - got)
+    missing: list[int] = []
+    index_lag: list[int] = []
+    for aid in missing_all:
+        created = probe_created.get(aid) or 0
+        if collect_started and created and created > 0:
+            if abs(float(collect_started) - float(created)) <= index_grace and created <= collect_started + index_grace:
+                index_lag.append(aid)
+                continue
+        missing.append(aid)
     extra_all = got - want - late
     probe_exists = (probe or {}).get("exists") or {}
     probe_periods = (probe or {}).get("periods") or {}
@@ -773,6 +809,8 @@ def reconcile_posts(
         "lateExcluded": len(late),
         "lateButCollected": len(late_in_products),
         "missingCount": len(missing),
+        "indexLagCount": len(index_lag),
+        "indexLag": index_lag,
         "scanGapCount": len(scan_gap),
         "disappearedCount": len(disappeared),
         "phantomCount": len(phantom),
@@ -998,4 +1036,8 @@ def check_products(out_dir: Path, source: str = "dahkg") -> dict:
         "guiOnlyPresent": gui_present,
         "passed": not missing,
     }
+
+
+
+
 
