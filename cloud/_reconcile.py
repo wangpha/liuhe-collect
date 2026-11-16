@@ -614,10 +614,8 @@ def load_products(out_dir: Path) -> tuple[dict, list[dict]]:
     return {}, data
 
 
-#: 文档 3.5 的 21 个产物 —— 只适用于**论坛类**源（大港澳 / 澳彩交流）。
-#: 实测 2026-11-16：49图库（tuku）走的是另一套产物名（无 论坛原帖.html / report.html，
-#: 多出 当期文字版.txt / 文字版.html / 文字版.txt），共 22 个。
-PRODUCTS_21 = [
+#: 文档 3.5 的 21 个产物（作为**参照清单**保留）
+PRODUCTS_DOC_21 = [
     "users.json", "posts.json", "replies.json", "claims.json", "ocr.json",
     "全站文字版.json", "全站文字版.html", "全站文字版.txt", "六合_看板.html",
     "六合_结构化.xlsx", "claims.csv", "ocr.csv", "replies.csv", "posts.csv",
@@ -625,7 +623,24 @@ PRODUCTS_21 = [
     "run_meta.json", "manifest.json",
 ]
 
-#: 49图库实测产物（22 个，取自 output\澳门_2026_316期 的真实文件清单）
+#: **CLI 实际产物**（实测 2026-11-16，逐期目录比对出来的）
+#:
+#: 关键事实：文档列的 21 项里，`全站文字版.{json,html,txt}` 与 `report.html`
+#: **不是 CLI 产出的** —— 实测 `core.dahkg` 的 CLI 跑完只有 17 个文件，
+#: 而 314/316 期（用户用 GUI 跑的）有 21 个。所以：
+#:   · 云端（纯 CLI）用 17 项判完整性；
+#:   · 那 4 项属于 GUI 侧产物，CLI 跑不出来，不能因此判"产物不全"。
+PRODUCTS_CLI = [
+    "users.json", "users.csv", "posts.json", "posts.csv", "replies.json", "replies.csv",
+    "claims.json", "claims.csv", "ocr.json", "ocr.csv", "六合_看板.html",
+    "六合_结构化.xlsx", "论坛原帖.html", "report.md", "validation.json",
+    "run_meta.json", "manifest.json",
+]
+
+#: GUI 侧才会生成的产物（云端不判定，只在报告里说明）
+PRODUCTS_GUI_ONLY = ["全站文字版.json", "全站文字版.html", "全站文字版.txt", "report.html"]
+
+#: 49图库实测产物（22 个，CLI 会生成全站文字版三件套）
 PRODUCTS_TUKU = [
     "users.json", "users.csv", "posts.json", "posts.csv", "replies.json", "replies.csv",
     "claims.json", "claims.csv", "ocr.json", "ocr.csv", "全站文字版.json",
@@ -635,14 +650,17 @@ PRODUCTS_TUKU = [
 ]
 
 PRODUCTS_BY_SOURCE = {
-    "dahkg": PRODUCTS_21,
-    "aocai": PRODUCTS_21,
+    "dahkg": PRODUCTS_CLI,
+    "aocai": PRODUCTS_CLI,
     "tuku": PRODUCTS_TUKU,
 }
 
+#: 兼容旧名字（自检里引用 21 项）
+PRODUCTS_21 = PRODUCTS_DOC_21
+
 
 def check_products(out_dir: Path, source: str = "dahkg") -> dict:
-    expected_names = PRODUCTS_BY_SOURCE.get(source, PRODUCTS_21)
+    expected_names = PRODUCTS_BY_SOURCE.get(source, PRODUCTS_CLI)
     present, missing, sizes = [], [], {}
     for name in expected_names:
         p = out_dir / name
@@ -651,11 +669,14 @@ def check_products(out_dir: Path, source: str = "dahkg") -> dict:
             sizes[name] = p.stat().st_size
         else:
             missing.append(name)
+    gui_present = [n for n in PRODUCTS_GUI_ONLY if (out_dir / n).exists()]
     return {
         "source": source,
         "expected": len(expected_names),
         "present": len(present),
         "missing": missing,
         "sizes": sizes,
+        "guiOnlyExpected": PRODUCTS_GUI_ONLY,
+        "guiOnlyPresent": gui_present,
         "passed": not missing,
     }

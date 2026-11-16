@@ -676,15 +676,19 @@ def do_selftest(args) -> int:
         assert good["hitCount"] == 0 and good["passed"], f"正常文本被误判：{good}"
         return f"命中 1 / 干净文本 0"
 
-    # 产物清单自洽（论坛类 21 项 / 图库 22 项，各自不重复）
+    # 产物清单自洽（文档参照 21 项 / CLI 实产 17 项 / 图库 22 项，各自不重复）
     def case_products():
         from . import _reconcile as R
 
-        assert len(R.PRODUCTS_21) == 21, f"论坛类产物清单应为 21 项，实际 {len(R.PRODUCTS_21)}"
-        assert len(set(R.PRODUCTS_21)) == 21, "论坛类产物清单有重复项"
-        assert len(R.PRODUCTS_TUKU) == 22, f"图库产物清单应为 22 项，实际 {len(R.PRODUCTS_TUKU)}"
-        assert len(set(R.PRODUCTS_TUKU)) == 22, "图库产物清单有重复项"
-        return "论坛类 21 项无重复 / 图库 22 项无重复"
+        assert len(R.PRODUCTS_DOC_21) == 21, f"文档参照清单应为 21 项，实际 {len(R.PRODUCTS_DOC_21)}"
+        assert len(set(R.PRODUCTS_DOC_21)) == 21, "文档参照清单有重复项"
+        assert len(R.PRODUCTS_CLI) == 17, f"CLI 实产清单应为 17 项，实际 {len(R.PRODUCTS_CLI)}"
+        assert len(set(R.PRODUCTS_CLI)) == 17, "CLI 实产清单有重复项"
+        assert len(R.PRODUCTS_TUKU) == 22, f"图库清单应为 22 项，实际 {len(R.PRODUCTS_TUKU)}"
+        assert len(set(R.PRODUCTS_TUKU)) == 22, "图库清单有重复项"
+        assert set(R.PRODUCTS_CLI) | set(R.PRODUCTS_GUI_ONLY) == set(R.PRODUCTS_DOC_21), \
+            "CLI + GUI 两类合起来应正好等于文档的 21 项"
+        return "文档21 = CLI17 + GUI4；图库22，均无重复"
 
     for name, fn in [
         ("1.5 分片分配不变式", case_shard),
