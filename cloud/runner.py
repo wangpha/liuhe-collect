@@ -138,16 +138,20 @@ def do_cleanup(args) -> int:
     log("=" * 70)
 
     image_roots = [p for p in out_root.rglob("images") if p.is_dir()]
-    log(f"[cleanup] 发现图片目录 {len(image_roots)} 个")
+    log(f"[cleanup] 发现图片目录 {len(image_roots)} 个（输出根={out_root}）")
     img_stats = _cleanup.cleanup_images(
         image_roots, keep_days=args.keep_days, dry_run=args.dry_run, log=log
     )
 
-    store_root = Path(args.store or work / "store")
-    log_root = store_root / "data"
-    rot_stats = _cleanup.rotate_periods(
-        log_root, keep=args.keep_periods, dry_run=args.dry_run, log=log
-    )
+    if args.skip_periods:
+        log("[cleanup] --skip-periods：跳过产物 30 期轮转（由 publish job 统一处理）")
+        rot_stats = {"skipped": True}
+    else:
+        store_root = Path(args.store or work / "store")
+        log_root = store_root / "data"
+        rot_stats = _cleanup.rotate_periods(
+            log_root, keep=args.keep_periods, dry_run=args.dry_run, log=log
+        )
 
     report = {
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -733,6 +737,7 @@ def parse_args(argv=None):
     parser.add_argument("--no-replies", action="store_true")
     parser.add_argument("--keep-days", type=int, default=2)
     parser.add_argument("--keep-periods", type=int, default=30)
+    parser.add_argument("--skip-periods", action="store_true", help="cleanup 只清图片，不轮转产物")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 

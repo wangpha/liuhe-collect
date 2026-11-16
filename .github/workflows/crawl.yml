@@ -182,6 +182,16 @@ jobs:
           restore-keys: |
             ocr-v1-${{ matrix.source }}-
 
+      - name: 清理昨日图片（R2：保留当天+前一天，更早的删除）
+        working-directory: repo
+        run: |
+          set -o pipefail
+          python -m cloud.runner --cleanup \
+            --work work \
+            --out work/out \
+            --keep-days 2 \
+            --skip-periods 2>&1 | tee work/images_cleanup.log
+
       - name: 环境自检 + 单元自检
         working-directory: repo
         run: |
