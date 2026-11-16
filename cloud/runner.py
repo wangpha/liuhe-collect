@@ -86,6 +86,11 @@ def _find_period_dir(work: Path, out_root: Path, source: str) -> Path:
 # 采集：只调用现有模块 CLI（与本地手工跑完全相同的入口）
 # ---------------------------------------------------------------------------
 def collect(module: str, out_root: Path, args, period: int = 0) -> tuple[int, float]:
+    # **必须绝对路径**：core/dahkg.py::run_dahkg_report 里用
+    # `(out_dir / "论坛原帖.html").as_uri()` 生成 postUrl，
+    # 相对路径会抛 `ValueError: relative path can't be expressed as a file URI`
+    # （2026-11-16 Gate2 实测：dahkg/aocai 因此退出码 1）。
+    out_root = Path(out_root).resolve()
     cmd = [sys.executable, "-m", module, "--out", str(out_root)]
     if period:
         cmd += ["--period", str(period)]
@@ -127,7 +132,7 @@ def do_cleanup(args) -> int:
     from . import _cleanup, _guard
 
     work = _work_dir(args.work)
-    out_root = Path(args.out or work / "out")
+    out_root = Path(args.out or work / "out").resolve()
     log("=" * 70)
     log(f"[cleanup] 开始 {time.strftime('%Y-%m-%d %H:%M:%S')}  输出根={out_root}")
     log("=" * 70)
@@ -221,7 +226,7 @@ def do_shard(args) -> int:
     from . import _guard
 
     work = _work_dir(args.work)
-    out_root = Path(args.out or work / "out")
+    out_root = Path(args.out or work / "out").resolve()
     source = args.source
     shard_index = int(args.shard)
     shard_total = max(1, int(args.shards))
@@ -307,7 +312,7 @@ def do_run(args, mode: str = "run") -> int:
     from . import _guard, _period, _reconcile
 
     work = _work_dir(args.work)
-    out_root = Path(args.out or work / "out")
+    out_root = Path(args.out or work / "out").resolve()
     source = args.source
     started = time.time()
     log("=" * 70)
@@ -396,10 +401,10 @@ def do_run(args, mode: str = "run") -> int:
         log(f"[防线1] 漏帖样本（前 20）：{post_check['missing'][:20]}")
     if post_check["phantomCount"]:
         log(f"[防线1] 幽灵帖样本（前 20）：{post_check['phantom'][:20]}")
-    if post_check["missingCount"]:
-        log(f"[防线1] 缺失样本（前 20）：{post_check['missing'][:20]}")
-    if post_check["extraCount"]:
-        log(f"[防线1] 多出样本（前 20）：{post_check['extra'][:20]}")
+    if post_check["scanGapCount"]:
+        log(f"[防线1] 扫描盲区样本（前 20，源站详情已确认存在）：{post_check['scanGap'][:20]}")
+    if post_check["disappearedCount"]:
+        log(f"[防线1] 源站已删样本（前 20）：{post_check['disappeared'][:20]}")
 
     image_roots = [p for p in out_dir.rglob("images") if p.is_dir()]
     require_files = image_roots[0].parent if image_roots else None
@@ -428,6 +433,17 @@ def do_run(args, mode: str = "run") -> int:
             f"[防线3] 快照对比：上轮 {snap_diff['prevCount']} 帖 → 本轮 {snap_diff['currCount']} 帖"
             f" / 新增 {snap_diff['newCount']} / 变化 {snap_diff['changedCount']} / 丢失 {snap_diff['lostCount']}"
         )
+    if not monotonic["passed"] and monotonic.get("lostPosts"):
+        # 帖子集合变少：先逐帖向源站求证，区分「源站删帖」与「我们真丢了」
+        lost_int = [int(x) for x in monotonic["lostPosts"]]
+        pr = _reconcile.probe_details(source, lost_int, log=log)
+        still_alive = [a for a in lost_int if (pr.get("exists") or {}).get(a)]
+        if still_alive:
+            log(f"[防线3] 单调性：丢失 {len(lost_int)} 帖中 {len(still_alive)} 帖源站仍存在 → 真丢失 {still_alive[:10]}（不通过）")
+        else:
+            log(f"[防线3] 单调性：丢失 {len(lost_int)} 帖经详情求证**全部已从源站消失** → 记作源站删帖，不判失败")
+            monotonic["passed"] = True
+            monotonic["disappearedVerified"] = len(lost_int)
     log(
         f"[防线3] 单调性：{'通过' if monotonic['passed'] else '不通过 → ' + '; '.join(monotonic.get('problems') or [])}"
     )

@@ -65,15 +65,21 @@ def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subproce
 
 
 def ensure_repo(work: Path, repo_url: str = DATA_REPO) -> Path:
-    """准备一个带凭据的稀疏检出仓库。"""
+    """准备一个**稀疏检出**的仓库（只拉需要的期目录，避免整仓克隆）。
+
+    踩坑记录（2026-11-16）：用 `--filter=blob:none --no-checkout` 再
+    `git checkout origin/main -- <path>` 时，文件**没有真正落盘**（目录空），
+    导致补齐后本地 0 个文件。正确做法是 `--sparse` 克隆 + `git sparse-checkout set`。
+    """
     repo = work / "repo"
     if not (repo / ".git").exists():
         work.mkdir(parents=True, exist_ok=True)
-        log(f"[sync] 首次克隆数据仓到 {repo}")
+        log(f"[sync] 首次克隆数据仓到 {repo}（稀疏模式）")
         if repo.exists():
             shutil.rmtree(repo)
-        run(["git", "clone", "--filter=blob:none", "--no-checkout", repo_url, str(repo)])
+        run(["git", "clone", "--filter=blob:none", "--sparse", repo_url, str(repo)])
     run(["git", "fetch", "--depth", "1", "origin", "main"], cwd=repo)
+    run(["git", "reset", "--hard", "origin/main"], cwd=repo, check=False)
     return repo
 
 
@@ -100,17 +106,52 @@ def local_periods(dest: Path, sub: str) -> set[str]:
 
 def sync_source(repo: Path, dest: Path, key: str, info: dict, dry_run: bool) -> dict:
     sub, source_id = SOURCE_MAP.get(key, (key, key))
-    remote = set(info.get("periods") or [])
+    remote_all = set(info.get("periods") or [])
+
+    # 过滤「非正式期目录」：数据仓里可能残留中间目录（如 49图库的
+    # `历史回采/49图库/2026-11-15_第320期`，只有 5 个文件、没有 posts.json）。
+    # 判据与 publish 一致：必须有 posts.json 才算正式产物期。
+    remote: set[str] = set()
+    ignored: list[str] = []
+    for name in remote_all:
+        rel = f"data/{key}/{name}/posts.json"
+        try:
+            has_posts = run(
+                ["git", "cat-file", "-e", f"origin/main:{rel}"], cwd=repo, check=False
+            ).returncode == 0
+        except Exception:  # noqa: BLE001 - 查不到就当非正式目录
+            has_posts = False
+        if has_posts:
+            remote.add(name)
+        else:
+            ignored.append(name)
+
     have = local_periods(dest, sub)
     need = sorted(remote - have, key=period_number)
 
     log(f"\n[sync] 源 {key}（本地子目录 '{sub or '(根)'}' -> {dest}）")
-    log(f"[sync]   云端 {len(remote)} 期：{sorted(remote, key=period_number)[:3]} ... 最新 {max(remote, key=period_number) if remote else '无'}")
+    if ignored:
+        log(f"[sync]   忽略非正式目录 {len(ignored)} 个（无 posts.json）：{ignored[:5]}")
+    log(f"[sync]   云端 {len(remote)} 期" + (f"（另有 {len(ignored)} 个非正式目录已忽略）" if ignored else ""))
     log(f"[sync]   本地已有 {len(have)} 期")
     log(f"[sync]   需要补齐 {len(need)} 期：{need if len(need) <= 12 else need[:12] + ['...']}")
 
     if dry_run or not need:
-        return {"source": key, "remote": len(remote), "local": len(have), "needed": len(need), "copied": [], "verified": True}
+        pending = sorted(remote - have, key=period_number)
+        if dry_run and pending:
+            log(f"[sync]   dry-run：尚有 {len(pending)} 期待补齐（未下载，不算失败）")
+        return {
+            "source": key,
+            "remote": len(remote),
+            "ignored": ignored,
+            "local": len(have),
+            "needed": len(need),
+            "pending": pending,
+            "copied": [],
+            "problems": [],
+            "verified": True if dry_run else not pending,
+            "dryRun": dry_run,
+        }
 
     copied: list[str] = []
     problems: list[str] = []
@@ -118,10 +159,10 @@ def sync_source(repo: Path, dest: Path, key: str, info: dict, dry_run: bool) -> 
         rel = f"data/{key}/{period_name}"
         log(f"[sync]   ↓ {rel}")
         run(["git", "sparse-checkout", "set", rel], cwd=repo, check=False)
-        proc = run(["git", "checkout", "origin/main", "--", rel], cwd=repo, check=False)
         src = repo / rel
-        if not src.is_dir():
-            problems.append(f"{period_name}: 检出后目录不存在（{proc.stderr[:120]}）")
+        if not src.is_dir() or not any(src.rglob("*")):
+            problems.append(f"{period_name}: 稀疏检出后目录为空（{rel}）")
+            log(f"[sync]     ✗ {period_name} 检出后为空，跳过")
             continue
         dst = (dest / sub / period_name) if sub else (dest / period_name)
         if dst.exists():
