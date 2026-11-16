@@ -367,33 +367,54 @@ def do_run(args, mode: str = "run") -> int:
                          {"reason": "periodMismatch", "detail": period_check})
         return 30
 
-    # ---- 产物完整性（R3：论坛类 21 个 / 图库 22 个）----
+    # ---- 产物完整性（逐源：dahkg 17 / aocai 20 / tuku 22）----
     product_check = _reconcile.check_products(out_dir, source)
-    log(f"[产物] {product_check['present']}/{product_check['expected']} 个文件存在"
-        + ("" if product_check["passed"] else f"  缺失：{product_check['missing']}"))
+    if args.limit:
+        # 限量跑少生成若干派生产物（实测 tuku --limit 2 缺 文字版.html/.txt/当期文字版.txt），
+        # 属该模式固有限制；限量跑不用于验收，所以这里只报告、不阻塞，且明确写出来。
+        log(
+            f"[产物] 限量运行：{product_check['present']}/{product_check['expected']} 个文件"
+            + (f"，缺 {product_check['missing']}（限量模式固有，仅供链路验证）" if product_check["missing"] else "")
+        )
+        product_check["limitedRun"] = True
+        product_check["passedRaw"] = product_check["passed"]
+        product_check["passed"] = True
+    else:
+        log(f"[产物] {product_check['present']}/{product_check['expected']} 个文件存在"
+            + ("" if product_check["passed"] else f"  缺失：{product_check['missing']}"))
+        if product_check.get("guiOnlyPresent"):
+            log(f"[产物] 另有 GUI 侧产物存在：{product_check['guiOnlyPresent']}（云端不判定）")
 
     # ---- 防线 1 / 2：独立对账（三源都做）----
     scan = {}
     post_check = {"passed": None}
     image_check = {"passed": None}
-    scan = _reconcile.independent_scan(
-        source, period, max_pages=args.max_pages, created_before=collect_started, log=log
-    )
     if args.limit:
         # `--limit N` 是**故意只抓 N 条**，产物天然比源站少 —— 完整性对账在这种跑法下无意义。
-        # 明确写出来并跳过，而不是让它误报"漏帖 N 条"。
+        # 而且能做全量独立扫描（10 个排序 × 数十页）纯属浪费：直接跳过，明确写出来。
+        scan = {"complete": True, "unionIds": [], "lateIds": [], "pageErrors": [], "pageErrorCount": 0}
+        scan_complete = True
         log(
             f"[防线1] 本次为限量运行（--limit {args.limit}）："
-            f"源站本期 {len(scan.get('unionIds') or [])} 帖，产物 {len(posts)} 帖，"
-            "**跳过完整性对账**（限量跑不用于验收）"
+            f"产物 {len(posts)} 帖，**跳过完整性对账与独立扫描**（限量跑不用于验收）"
         )
         probe = None
-        post_check = {"passed": True, "limited": True, "expected": len(scan.get("unionIds") or []),
+        post_check = {"passed": True, "limited": True, "expected": 0,
                       "actual": len(posts), "missingCount": 0, "scanGapCount": 0, "disappearedCount": 0,
-                      "phantomCount": 0, "unverifiedCount": 0, "lateExcluded": len(scan.get("lateIds") or []),
+                      "phantomCount": 0, "unverifiedCount": 0, "lateExcluded": 0,
                       "lateButCollected": 0, "missing": [], "scanGap": [], "disappeared": [],
                       "phantom": [], "unverified": []}
     else:
+        scan = _reconcile.independent_scan(
+            source, period, max_pages=args.max_pages, created_before=collect_started, log=log
+        )
+        # 独立扫描若有不完整页（重试后仍失败），对账基准就不可信 —— 必须判不通过
+        scan_complete = scan.get("complete", True)
+        if not scan_complete:
+            log(
+                f"[防线1] ⚠ 独立扫描有 {scan.get('pageErrorCount', 0)} 页重试 {_reconcile.PAGE_RETRIES} 次仍失败"
+                f"（明细见 audit 的 postsReconcile.scanPageErrors）→ 本轮对账基准不可信，判**不通过**"
+            )
         # 「产物有、列表没扫到」的候选，先逐帖向源站详情求证，再分类
         got_ids = {int(p.get("articleId") or 0) for p in posts if p.get("articleId")}
         late_ids = {int(x) for x in (scan.get("lateIds") or [])}
@@ -490,6 +511,7 @@ def do_run(args, mode: str = "run") -> int:
         and (post_check["passed"] is not False)
         and (image_check["passed"] is not False)
         and monotonic["passed"]
+        and scan_complete          # 独立扫描不完整 → 对账不可信，不能算通过
     )
     audit = {
         "source": source,
@@ -504,7 +526,8 @@ def do_run(args, mode: str = "run") -> int:
         "checks": {
             "products": product_check,
             "periodPerPost": period_check,
-            "postsReconcile": post_check,
+            "postsReconcile": {**post_check, "scanPageErrors": scan.get("pageErrors") or [],
+                              "scanComplete": scan_complete},
             "imagesReconcile": image_check,
             "snapshot": snap_diff,
             "monotonic": monotonic,

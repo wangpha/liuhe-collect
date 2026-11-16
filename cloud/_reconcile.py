@@ -37,6 +37,7 @@ def independent_scan_dahkg(
     want = normalize_period(period)
     per_sort: dict[str, dict[str, Any]] = {}
     late_ids: dict[int, float] = {}
+    page_errors: list[dict] = []
 
     for sort_type in (1, 3):
         ids: dict[int, dict] = {}
@@ -44,21 +45,22 @@ def independent_scan_dahkg(
         pages = 0
         t0 = time.time()
         for page in range(1, max_pages + 1):
-            try:
-                data = dahkg._api_post(
+            data = _fetch_page_retry(
+                lambda p=page, s=sort_type: dahkg._api_post(
                     {
                         "uri": dahkg.URI_LIST,
-                        "currentPage": page,
+                        "currentPage": p,
                         "pageSize": dahkg.PAGE_SIZE,
-                        "sortType": sort_type,
+                        "sortType": s,
                         "lastRefreshTime": 0,
                     }
-                )
-            except Exception as exc:  # noqa: BLE001 - 单页失败如实记录，不静默
-                say(f"[独立扫描] sortType={sort_type} 第{page}页失败：{exc}")
-                streak += 1
-                if streak >= empty_streak_stop:
-                    break
+                ),
+                "dahkg",
+                say,
+                page_errors,
+                {"sortType": sort_type, "page": page},
+            )
+            if data is None:
                 continue
             rows = (data.get("data") or {}).get("list") or []
             pages = page
@@ -117,6 +119,9 @@ def independent_scan_dahkg(
         "lateIds": sorted(late_ids),
         "lateCount": len(late_ids),
         "timeAligned": bool(created_before),
+        "pageErrors": page_errors,
+        "pageErrorCount": len(page_errors),
+        "complete": not page_errors,
         "agree": a == b,
         "perSort": {k: {kk: vv for kk, vv in v.items() if kk != "ids"} for k, v in per_sort.items()},
     }
@@ -207,25 +212,27 @@ def independent_scan_tuku(
     per_sort: dict[str, dict] = {}
     pinned_skipped = 0
     late_ids: dict[int, float] = {}
+    page_errors: list[dict] = []
     for sort_value in sorts:
         t0 = time.time()
         streak = 0
         pages = 0
         for page in range(1, max_pages + 1):
-            try:
-                rows = scraper.search_page(
+            rows = _fetch_page_retry(
+                lambda p=page, s=sort_value: scraper.search_page(
                     2,                       # lotteryType：2 = 澳门
-                    page,
-                    sort_value,
+                    p,
+                    s,
                     0.05,
                     number=want,
                     user_id=scraper.PERIOD_QUERY_USER_ID,
-                )
-            except Exception as exc:  # noqa: BLE001 - 单页失败如实记录
-                say(f"[独立扫描/tuku] sort={sort_value} 第{page}页失败：{exc}")
-                streak += 1
-                if streak >= empty_streak_stop:
-                    break
+                ),
+                "tuku",
+                say,
+                page_errors,
+                {"sort": sort_value, "page": page},
+            )
+            if rows is None:
                 continue
             if not rows:
                 break
@@ -283,6 +290,9 @@ def independent_scan_tuku(
         "lateIds": sorted(late_ids),
         "lateCount": len(late_ids),
         "timeAligned": bool(created_before),
+        "pageErrors": page_errors,
+        "pageErrorCount": len(page_errors),
+        "complete": not page_errors,
         "perSort": per_sort,
         "agree": True,          # 图库只有一套列表口径，无第二条判据
     }
@@ -311,6 +321,7 @@ def independent_scan_aocai(
     want = normalize_period(period)
     ids: dict[int, dict] = {}
     per_sort: dict[str, dict] = {}
+    page_errors: list[dict] = []
 
     for paixu in (1, 2):
         t0 = time.time()
@@ -319,14 +330,16 @@ def independent_scan_aocai(
         step = int(forum_mod.PAGE_SIZE)
         for index in range(max_pages):
             began = index * step
-            try:
-                payload = forum_mod.fetch_luntan_page(began, delay=0.05, paixu=paixu)
-                listing = forum_mod.parse_list_payload(payload)
-            except Exception as exc:  # noqa: BLE001
-                say(f"[独立扫描/aocai] paixu={paixu} began={began} 失败：{exc}")
-                streak += 1
-                if streak >= empty_streak_stop:
-                    break
+            listing = _fetch_page_retry(
+                lambda b=began, p=paixu: forum_mod.parse_list_payload(
+                    forum_mod.fetch_luntan_page(b, delay=0.05, paixu=p)
+                ),
+                "aocai",
+                say,
+                page_errors,
+                {"paixu": paixu, "began": began},
+            )
+            if listing is None:
                 continue
             if not listing:
                 break
@@ -361,6 +374,9 @@ def independent_scan_aocai(
         "unionIds": sorted(ids),
         "unionMeta": {str(k): v for k, v in ids.items()},
         "countUnion": len(ids),
+        "pageErrors": page_errors,
+        "pageErrorCount": len(page_errors),
+        "complete": not page_errors,
         "perSort": per_sort,
         "agree": True,
     }
@@ -392,6 +408,43 @@ def independent_scan(
             period, max_pages=max_pages, created_before=created_before, log=log
         )
     raise ValueError(f"未知源：{source}")
+
+
+#: 独立扫描时单页的取数重试次数（第三方站点偶发 502，重试是必须的）
+PAGE_RETRIES = 4
+
+
+def _fetch_page_retry(fetch, label: str, say, page_errors: list[dict], meta: dict) -> list[dict] | None:
+    """取一页，失败按退避重试；仍失败则记入 pageErrors 并返回 None。
+
+    ## 为什么必须重试而不是跳过（2026-11-16 实测缺陷）
+    旧实现遇到单页异常只 `continue` —— 那一页的 20 行**永久丢失**，
+    独立扫描的"应有集合"就少了一块，后续对账可能把真实漏帖算成"盲区"。
+    实测案例：Gate2 的 tuku 扫描中 sort=8 第 42 页连续 502，
+    旧代码直接跳过，只在日志里留一行失败；虽然本次恰好被其它窗口覆盖，
+    但这是**静默漏扫**，属于必须消除的形态。
+
+    现在的语义：
+      · 重试 PAGE_RETRIES 次（0.5s/1.0s/1.5s 退避），成功即返回；
+      · 仍失败 → 记 pageErrors，返回 None，并由调用方把本轮标记为"扫描不完整"，
+        runner 会据此判定「对账不可信 → 不通过」，而不是假装对账通过。
+    """
+    last: Exception | None = None
+    for attempt in range(1, PAGE_RETRIES + 1):
+        try:
+            rows = fetch()
+            return rows if rows is not None else []
+        except Exception as exc:  # noqa: BLE001 - 第三方站点抖动
+            last = exc
+            if attempt < PAGE_RETRIES:
+                say(
+                    f"[独立扫描/{label}] 第 {attempt}/{PAGE_RETRIES} 次取页失败，"
+                    f"退避 {0.5 * attempt:.1f}s 后重试：{str(exc)[:90]}"
+                )
+                time.sleep(0.5 * attempt)
+    page_errors.append({**meta, "error": f"{type(last).__name__}: {str(last)[:200]}"})
+    say(f"[独立扫描/{label}] **重试 {PAGE_RETRIES} 次仍失败**，记入 pageErrors：{meta}")
+    return None
 
 
 # ---------------------------------------------------------------------------
