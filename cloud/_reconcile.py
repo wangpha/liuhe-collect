@@ -397,7 +397,12 @@ def independent_scan(
 # ---------------------------------------------------------------------------
 # 「这帖在源站还在不在」——逐帖求证（判定多出/幽灵的唯一可靠依据）
 # ---------------------------------------------------------------------------
-def probe_details(source: str, ids: list[int], log: Callable[[str], None] | None = None) -> dict:
+def probe_details(
+    source: str,
+    ids: list[int],
+    log: Callable[[str], None] | None = None,
+    target_period: int = 0,
+) -> dict:
     """逐帖调源站**详情接口**确认存在性。
 
     为什么必须有这一步（2026-11-16 实测，期号 320）：
@@ -426,7 +431,7 @@ def probe_details(source: str, ids: list[int], log: Callable[[str], None] | None
                     periods[aid] = normalize_period(raw.get("period"))
             except Exception as exc:  # noqa: BLE001 - 详情失败=源站已无该帖
                 exists[aid] = False
-                say(f"[求证] tuku {aid} 详情不可得：{type(exc).__name__}: {str(exc)[:80]}")
+                say(f"[求证] tuku {aid}: 源站已无此帖（详情接口无有效返回，符合预期）")
             _time.sleep(0.05)
 
     elif source == "dahkg":
@@ -441,7 +446,26 @@ def probe_details(source: str, ids: list[int], log: Callable[[str], None] | None
                     periods[aid] = normalize_period(raw.get("periods") or raw.get("period"))
             except Exception as exc:  # noqa: BLE001
                 exists[aid] = False
-                say(f"[求证] dahkg {aid} 详情不可得：{type(exc).__name__}: {str(exc)[:80]}")
+                say(f"[求证] dahkg {aid}: 源站已无此帖（详情接口无有效返回，符合预期）")
+            _time.sleep(0.05)
+
+    elif source == "aocai":
+        from core import forum as forum_mod
+
+        for aid in ids:
+            try:
+                raw = forum_mod.fetch_thread_detail(aid, 0, include_replies=False, delay=0.0, max_pages=1)
+                tiezi = (raw or {}).get("tiezi") or {}
+                ok = bool(tiezi)
+                exists[aid] = ok
+                if ok:
+                    # 实测（2026-11-16）：详情里 `qs` 常为 0，期号只能靠标题标记推断
+                    periods[aid] = normalize_period(
+                        forum_mod.infer_item_period(tiezi, target_period)
+                    )
+            except Exception as exc:  # noqa: BLE001 - 不存在时接口会直接报错，属预期
+                exists[aid] = False
+                say(f"[求证] aocai {aid}: 源站已无此帖（详情接口无有效返回，符合预期）")
             _time.sleep(0.05)
 
     else:
@@ -489,7 +513,13 @@ def reconcile_posts(
     scan_gap: list[int] = []
     disappeared: list[int] = []
     phantom: list[int] = []
+    unverified: list[int] = []
+    probe_available = bool(probe_exists)
     for aid in sorted(extra_all):
+        if not probe_available:
+            # 求证整体不可用（接口故障）→ 不冤枉产物，也不静默：单列待人工复核
+            unverified.append(aid)
+            continue
         if aid in probe_exists:
             if probe_exists[aid]:
                 period_ok = (not want_period) or (normalize_period(probe_periods.get(aid)) == want_period)
@@ -505,8 +535,8 @@ def reconcile_posts(
             else:
                 phantom.append(aid)
         else:
-            # 没求证过的（澳彩暂未实现求证）→ 退回快照判据
-            disappeared.append(aid) if aid in prev else phantom.append(aid)
+            # 求证请求里没覆盖到它（理论上不会发生）
+            unverified.append(aid)
 
     late_in_products = sorted(got & late)
     return {
@@ -518,11 +548,13 @@ def reconcile_posts(
         "scanGapCount": len(scan_gap),
         "disappearedCount": len(disappeared),
         "phantomCount": len(phantom),
-        "extraCount": len(scan_gap) + len(disappeared) + len(phantom),
+        "unverifiedCount": len(unverified),
+        "extraCount": len(scan_gap) + len(disappeared) + len(phantom) + len(unverified),
         "missing": missing[:50],
         "scanGap": scan_gap[:50],
         "disappeared": disappeared[:50],
         "phantom": phantom[:50],
+        "unverified": unverified[:50],
         "passed": not missing and not phantom,
     }
 

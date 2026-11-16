@@ -384,7 +384,7 @@ def do_run(args, mode: str = "run") -> int:
     late_ids = {int(x) for x in (scan.get("lateIds") or [])}
     want_ids = set(scan.get("unionIds") or [])
     candidates = sorted(got_ids - want_ids - late_ids)
-    probe = _reconcile.probe_details(source, candidates, log=log) if candidates else None
+    probe = _reconcile.probe_details(source, candidates, log=log, target_period=period) if candidates else None
     post_check = _reconcile.reconcile_posts(
         posts,
         scan,
@@ -440,7 +440,7 @@ def do_run(args, mode: str = "run") -> int:
     if not monotonic["passed"] and monotonic.get("lostPosts"):
         # 帖子集合变少：先逐帖向源站求证，区分「源站删帖」与「我们真丢了」
         lost_int = [int(x) for x in monotonic["lostPosts"]]
-        pr = _reconcile.probe_details(source, lost_int, log=log)
+        pr = _reconcile.probe_details(source, lost_int, log=log, target_period=period)
         still_alive = [a for a in lost_int if (pr.get("exists") or {}).get(a)]
         if still_alive:
             log(f"[防线3] 单调性：丢失 {len(lost_int)} 帖中 {len(still_alive)} 帖源站仍存在 → 真丢失 {still_alive[:10]}（不通过）")
