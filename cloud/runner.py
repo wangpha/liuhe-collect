@@ -235,6 +235,31 @@ def do_cleanup(args) -> int:
 # ---------------------------------------------------------------------------
 # 模式：--plan
 # ---------------------------------------------------------------------------
+def _post_total_images(post: dict) -> int:
+    """一帖的**全部图片数** = 正文图 + 每条回复里的图。
+
+    v4 权重的核心（2026-11-17 实测）：分片真正的成本是「要 OCR 多少张图」，
+    而回复图既不在列表行的 `imgTotal` 里，也无法用 `replyPoint` 估准
+    （实测三片体图都是 ~94 张、回复数相近，实际 OCR 却是 274 / 613 / 841 张，差 3.07 倍）。
+    但这些数字**上一轮 merge 的 posts.json 里就有**，同一期 id 稳定 → 直接用实测值。
+    """
+    total = len(post.get("images") or [])
+    for reply in post.get("replies") or []:
+        total += len(reply.get("images") or [])
+    return int(total)
+
+
+def _load_image_cost(state_dir: Path, source: str) -> dict:
+    """读上一轮 merge 落盘的「每帖总图数」（key 是 str(articleId)）。"""
+    from . import _guard
+
+    data = _guard.load_json(state_dir / f"imagecost_{source}.json", {})
+    if not isinstance(data, dict):
+        return {}
+    cost = data.get("cost")
+    return cost if isinstance(cost, dict) else {}
+
+
 def do_plan(args) -> int:
     from . import _guard, _period, _reconcile
 
@@ -284,32 +309,48 @@ def do_plan(args) -> int:
         },
     }
 
-    # ---- 分片均衡计划（按累计图片数，而不是 id 取模）----
+    # ---- 分片均衡计划 ----
+    # 权重优先级（2026-11-17 三次实测迭代后的结论）：
+    #   ① 上一轮 merge 实测的「每帖总图数」（正文图 + 回复图）—— 最准，同 id 稳定
+    #   ② 本期没有历史（新期首轮）→ 退回 det 输入像素面积 + 回复图估计
     shard_n = _shard_count_for(source)
     union_ids = [int(x) for x in (scan.get("unionIds") or [])]
     union_meta = scan.get("unionMeta") or {}
+    state_dir = _resolve_state_dir(args, work)
+    hist_cost = _load_image_cost(state_dir, source)
+    hist_period = int((hist_cost.get("_period") or 0)) if isinstance(hist_cost, dict) else 0
+    use_hist = bool(hist_cost) and (hist_period in (0, period, display))
     if shard_n > 1 and union_ids:
-        weights = {
-            int(aid): int((meta or {}).get("imgTotal") or 0)
-            for aid, meta in union_meta.items()
-            if str(aid).isdigit()
-        }
+        items_by_id: dict[int, dict] = {}
+        if use_hist:
+            weights = {}
+            for aid in union_ids:
+                try:
+                    weights[aid] = max(1, int(hist_cost.get(str(aid)) or 0))
+                except (TypeError, ValueError):
+                    weights[aid] = 1
+            weight_src = f"上一轮实测每帖总图数（{sum(1 for a in union_ids if str(a) in hist_cost)}/{len(union_ids)} 帖有历史）"
+        else:
+            weights = {aid: _item_image_weight(union_meta.get(str(aid)) or {"imgTotal": (union_meta.get(str(aid)) or {}).get("imgTotal", 0)})
+                       for aid in union_ids}
+            for aid in union_ids:
+                weights[aid] = _item_image_weight(union_meta.get(str(aid)) or {})
+            weight_src = "det 输入像素面积 + 回复图估计（本期无历史）"
         groups = _balanced_groups(union_ids, weights, shard_n)
         sizes = [len(g) for g in groups]
-        imgs = [
-            sum(max(1, weights.get(a, 0)) for a in g) for g in groups
-        ]
+        imgs = [sum(max(1, weights.get(a, 0)) for a in g) for g in groups]
         plan["shardPlan"] = {
             "n": shard_n,
-            "mode": "balanced-by-images",
+            "mode": "learned-images" if use_hist else "det-area",
+            "weightSource": weight_src,
             "groups": {str(i): g for i, g in enumerate(groups)},
             "postsPerShard": sizes,
-            "imagesPerShard": imgs,
-            "imagesTotal": sum(imgs),
+            "weightPerShard": imgs,
+            "weightTotal": sum(imgs),
         }
         log(
-            f"[plan] 分片均衡（按图片数）：{shard_n} 片，总图 {sum(imgs)} 张；"
-            f"每片图片 {imgs}；每片帖子 {sizes}"
+            f"[plan] 分片均衡（{plan['shardPlan']['mode']}，权重={weight_src}）：{shard_n} 片，"
+            f"总权重 {sum(imgs)}；每片 {imgs}；每片帖子 {sizes}"
         )
     else:
         log(f"[plan] 不分片（shard_n={shard_n}，帖子 {len(union_ids)}）")
@@ -574,7 +615,7 @@ def do_shard(args) -> int:
         planned_ids = {int(x) for x in group}
         log(
             f"[shard] 使用 plan 的均衡分组：本片 {len(planned_ids)} 帖，"
-            f"计划图片 {shard_plan.get('imagesPerShard', [])[shard_index] if shard_index < len(shard_plan.get('imagesPerShard') or []) else '?'} 张"
+            f"计划权重 {(shard_plan.get('weightPerShard') or shard_plan.get('imagesPerShard') or ['?'])[shard_index] if shard_index < len(shard_plan.get('weightPerShard') or shard_plan.get('imagesPerShard') or []) else '?'}"
         )
     elif shard_plan:
         log(
@@ -909,6 +950,21 @@ def do_run(args, mode: str = "run") -> int:
         }
         _guard.save_json(state_file, new_state)
         _guard.save_json(snapshot_file, curr_snapshot)
+        # v4：把本轮实测的「每帖总图数」落盘，供下一轮 plan 当分片权重（同期 id 稳定）
+        image_cost = {
+            "_period": period,
+            "_updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "cost": {
+                str(int(p.get("articleId") or 0)): _post_total_images(p)
+                for p in posts
+                if int(p.get("articleId") or 0)
+            },
+        }
+        _guard.save_json(state_dir / f"imagecost_{source}.json", image_cost)
+        log(
+            f"[{mode}] 已落盘分片成本基线 imagecost_{source}.json：{len(image_cost['cost'])} 帖，"
+            f"合计 {sum(image_cost['cost'].values())} 图（供下一轮分片均衡）"
+        )
         log(f"[{mode}] 状态已更新：期号 {last_period or '无'} -> {period}，回复总数 {reply_total}")
     else:
         log(f"[{mode}] 存在未通过项，**不更新**状态基线（避免污染下一轮）")
