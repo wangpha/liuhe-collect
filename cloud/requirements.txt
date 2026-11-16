@@ -1,25 +1,26 @@
 # 六合采集器 · 云端采集依赖
-# 版本与本地安装版 1.0.128（D:\LiuHeInstalled25\_internal）完全对齐，
-# 因为 R15「OCR 绝不认错」要求云端与本地用同一套模型/同一版库。
-python-dateutil==2.9.0.post0
-requests==2.32.5
-urllib3==2.6.0
-certifi==2026.6.15
+#
+# 钉死原则：只钉「影响输出结果」的包（OCR 模型/算子、xlsx 写入、加解密、HTTP 客户端），
+# 传递依赖（certifi / urllib3 / python-dateutil / charset-normalizer）**不钉** ——
+# 钉了会随 PyPI 下架或版本号写错而整条流水线起不来，而它们不影响识别结果。
+#
+# 校验方式（真实执行过，见 work/cloud_build/pip_resolve_check.md）：
+#   pip download -r requirements.txt --only-binary=:all: \
+#     --platform manylinux2014_x86_64 --python-version 313 --implementation cp --abi cp313
 
-# --- OCR（模型随 rapidocr_onnxruntime 1.2.3 包自带：ch_PP-OCRv3_det/rec）---
+# --- OCR：模型随包自带（ch_PP-OCRv3_det/rec），版本必须与本地 1.0.128 一致（R15）---
 rapidocr-onnxruntime==1.2.3
-onnxruntime==1.24.4          # CPU 版；本地用 DirectML 后端但模型与算子一致
+onnxruntime==1.24.4          # 与本地安装版 _internal 里的 onnxruntime 同版本
 numpy==2.4.3
-opencv-python-headless==4.13.0.92   # runner 无显示环境，headless 避免 libGL 依赖
+opencv-python-headless==4.13.0.92
 pillow==12.1.1
-shapely==2.1.2
-pyclipper==1.4.0
 
-# --- 产物（xlsx）---
+# --- 结构化产物 ---
 openpyxl==3.1.5
 
-# --- 大港澳接口 AES/CBC 加解密 ---
+# --- 大港澳接口 AES/CBC ---
 pycryptodome==4.4.0
 
-# --- 进程/资源 ---
+# --- HTTP / 进程 ---
+requests==2.32.5
 psutil==7.2.2

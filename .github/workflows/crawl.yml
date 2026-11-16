@@ -162,12 +162,17 @@ jobs:
           key: pip-${{ runner.os }}-${{ hashFiles('repo/cloud/requirements.txt') }}
           restore-keys: pip-${{ runner.os }}-
 
+      - name: 安装系统依赖（opencv 运行需要 libGL）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+
       - name: 安装依赖
         working-directory: repo
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r cloud/requirements.txt
-          python -c "import rapidocr_onnxruntime, onnxruntime, cv2, openpyxl, Crypto; print('deps ok')"
+          python -c "import rapidocr_onnxruntime, onnxruntime, cv2, openpyxl, Crypto; print('deps ok', onnxruntime.__version__, cv2.__version__)"
 
       - name: 恢复 OCR 缓存（跨运行命中率的关键）
         uses: actions/cache@v4
