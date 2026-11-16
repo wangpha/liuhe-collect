@@ -355,24 +355,35 @@ def _plan_item_id(item: dict) -> int:
 
 
 def _item_image_weight(item: dict) -> int:
-    """一条列表行大概会带来几张图（用于分片均衡）。
+    """一条列表行的**真实工作量权重**（用于分片均衡）。
 
-    实测（2026-11-17）：dahkg 列表行同时有
-      · `imgTotal`：正文图数（如 2）
-      · `img`：逗号分隔的图片 URL（与 imgTotal 一致的条数）
-    优先用 imgTotal；没有就数 img 里的逗号；都没有按 1 张算。
-    tuku/aocai 的列表行没有图片数（实测 imgTotal 恒 0）→ 退化成按帖子数均分。
+    2026-11-17 实测教训（run 43937627617）：
+      只按 `imgTotal`（正文图）均衡后，plan 认为每片 ~100 张，
+      但分片实际 OCR 了 **242~705 张** —— 因为还要 OCR **回复图**，
+      而回复图不在 `imgTotal` 里。11 片合计：plan 912 张 vs 实际 3594 张，
+      **75% 的工作量对权重不可见**，导致最慢片 28.6 分钟、最快 4.9 分钟。
+
+    修法：权重 = 正文图 + 回复图估计。
+      列表行有 `replyPoint`（回复条数），实测 2682 张回复图 / 4813 条回复 ≈ **0.56 张/条**，
+      取 1/2 作为系数（整数运算：imgTotal*2 + replyPoint，最后统一按 2 缩放）。
+    tuku/aocai 的列表行没有 imgTotal（恒 0）→ 退化成按回复量 + 帖子数均分。
     """
     try:
-        total = int(item.get("imgTotal") or 0)
+        body = int(item.get("imgTotal") or 0)
     except (TypeError, ValueError):
-        total = 0
-    if total > 0:
-        return total
-    raw = item.get("img") or ""
-    if isinstance(raw, str) and raw.strip():
-        return max(1, raw.count(",") + 1)
-    return 1
+        body = 0
+    if body <= 0:
+        raw = item.get("img") or ""
+        if isinstance(raw, str) and raw.strip():
+            body = max(1, raw.count(",") + 1)
+        else:
+            body = 1
+    try:
+        replies = int(item.get("replyPoint") or 0)
+    except (TypeError, ValueError):
+        replies = 0
+    # *2 缩放避免浮点（回复图 ≈ 0.56 张/条，取 0.5）
+    return max(1, body * 2 + max(0, replies))
 
 
 def _balanced_groups(ids: list[int], weights: dict[int, int], n: int) -> list[list[int]]:
