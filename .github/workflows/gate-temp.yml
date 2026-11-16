@@ -506,12 +506,7 @@ jobs:
           done
           echo "共解开 $n 份分片缓存到 work/cache-in/"
           find work/cache-in -maxdepth 1 -mindepth 1 -type d | head -20
-      - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
-        working-directory: repo
-        run: |
-          set -o pipefail
-          python cloud/merge_caches.py --target work/out --sources work/cache-in/* 2>&1 | tee work/merge_caches.log
-      - name: 恢复 OCR 缓存（actions/cache 兜底）
+      - name: 恢复 OCR 缓存（actions/cache 兜底；必须在合并分片缓存**之前**，否则会用旧快照覆盖合并结果）
         uses: actions/cache@v4
         with:
           path: repo/work/out
@@ -519,6 +514,11 @@ jobs:
           restore-keys: |
             ocr-v3-dahkg-
             ocr-v1-dahkg-
+      - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
+        working-directory: repo
+        run: |
+          set -o pipefail
+          python cloud/merge_caches.py --target work/out --sources work/cache-in/* 2>&1 | tee work/merge_caches.log
       - name: 清理昨日图片（R2）
         working-directory: repo
         run: |
@@ -633,12 +633,7 @@ jobs:
           done
           echo "共解开 $n 份分片缓存到 work/cache-in/"
           find work/cache-in -maxdepth 1 -mindepth 1 -type d | head -20
-      - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
-        working-directory: repo
-        run: |
-          set -o pipefail
-          python cloud/merge_caches.py --target work/out --sources work/cache-in/* 2>&1 | tee work/merge_caches.log
-      - name: 恢复 OCR 缓存（actions/cache 兜底）
+      - name: 恢复 OCR 缓存（actions/cache 兜底；必须在合并分片缓存**之前**，否则会用旧快照覆盖合并结果）
         uses: actions/cache@v4
         with:
           path: repo/work/out
@@ -646,6 +641,11 @@ jobs:
           restore-keys: |
             ocr-v3-aocai-
             ocr-v1-aocai-
+      - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
+        working-directory: repo
+        run: |
+          set -o pipefail
+          python cloud/merge_caches.py --target work/out --sources work/cache-in/* 2>&1 | tee work/merge_caches.log
       - name: 清理昨日图片（R2）
         working-directory: repo
         run: |
@@ -760,12 +760,7 @@ jobs:
           done
           echo "共解开 $n 份分片缓存到 work/cache-in/"
           find work/cache-in -maxdepth 1 -mindepth 1 -type d | head -20
-      - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
-        working-directory: repo
-        run: |
-          set -o pipefail
-          python cloud/merge_caches.py --target work/out --sources work/cache-in/* 2>&1 | tee work/merge_caches.log
-      - name: 恢复 OCR 缓存（actions/cache 兜底）
+      - name: 恢复 OCR 缓存（actions/cache 兜底；必须在合并分片缓存**之前**，否则会用旧快照覆盖合并结果）
         uses: actions/cache@v4
         with:
           path: repo/work/out
@@ -773,6 +768,11 @@ jobs:
           restore-keys: |
             ocr-v3-tuku-
             ocr-v1-tuku-
+      - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
+        working-directory: repo
+        run: |
+          set -o pipefail
+          python cloud/merge_caches.py --target work/out --sources work/cache-in/* 2>&1 | tee work/merge_caches.log
       - name: 清理昨日图片（R2）
         working-directory: repo
         run: |

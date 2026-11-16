@@ -18,13 +18,14 @@ from pathlib import Path
 #: 云端只用 CPU（文档 3.6：GPU/CPU 识别结果逐字段一致；3.1：runner 无 GPU）
 FORCE_ENV = {
     "QODE_OCR_DML": "0",          # 关掉 DirectML，走 rapidocr CPU
-    # 进程数=4、线程数=2 → ONNX 共 8 线程。
-    # 实测依据（用户 2026-11-16 Actions 真机基准 run 43808226501，AMD EPYC 7763 4 逻辑核）：
-    #   4 线程 0.866 s/张 / 6 线程 0.819 / **8 线程 0.776** / 12 线程 0.697 / 16 线程 0.694
-    #   （16 线程虽再快，但只剩 4 个逻辑核，抓取与 OCR 会互抢）
-    # 代码里 `ocr_parallel_plan()`：QODE_OCR_PROCS=N 时返回 (N, 2)。
-    # 之前设 1 → 走 `cpu<=4` 分支变成 (1, 4) = 只有 4 线程，正是最慢那档。
-    "QODE_OCR_PROCS": "4",
+    # 进程数保持 1：`ocr_parallel_plan()` 在 QODE_OCR_PROCS=N 时返回 (N, 2)，
+    # 设 4 会变成 **4 进程 × 2 线程**。2026-11-16 实测（Gate1 分片版 run 43817560024）：
+    #   QODE_OCR_PROCS=4 → OCR 批次 **全失败**（110/281/91/124 张：新识别 0、成功 0、失败 N）
+    #   QODE_OCR_PROCS=1 → 所有串行 run 均 0 失败
+    # 用户给的 8 线程基准（run 43808226501）测的是**单进程内 ONNX 线程数**，
+    # 与"多进程"不是一回事；要真正拿到 8 线程需要改 core 的 configure_onnx_threads 调用，
+    # 属核心改动，未做。这里取"实测 0 失败"的配置优先。
+    "QODE_OCR_PROCS": "1",
     "PYTHONIOENCODING": "utf-8",
     "PYTHONUTF8": "1",
     "PYTHONUNBUFFERED": "1",
