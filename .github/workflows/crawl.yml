@@ -1,6 +1,21 @@
 name: 六合云端采集
 
 # 门禁纪律（文档 6B.5）：Gate 1–5 全部 ✅ 之前，schedule 段保持注释，只允许手动触发。
+#
+# 分片架构（v3，2026-11-16）：
+#   plan → cleanup → prepare(每源 --plan) → shard_{dahkg,aocai,tuku} ×N（并行预热缓存）
+#        → merge_{dahkg,aocai,tuku}（每源一次完整跑）→ publish
+#
+# 为什么 shard / merge 都拆成三个独立 job：
+#   GitHub Actions 的 `needs` 是 job 级。若 shard 是一个含三源的 matrix job，
+#   任何 merge 都必须等整个 shard 结束（含最慢的源），跨源会互相拖。
+#   拆开后 aocai/tuku 的 merge 可在 dahkg 还在分片时就完成。
+#
+# 为什么分片只在「列表取数函数」上打补丁：
+#   三源采集流程差异极大（tuku 有 details/replies/ocr 三段缓存；aocai 走
+#   collect_forum_posts；dahkg 自带 collect_posts）。若逐个复刻流程，
+#   任何一处顺序/参数不同都会让 merge 产物与串行版不一致 —— 而一致性正是分片要证明的。
+#   现在只切列表结果，下游全部是该模块自己的代码，语义天然一致。
 
 on:
   workflow_dispatch:
@@ -12,7 +27,7 @@ on:
         type: choice
         options: [tuku, aocai, dahkg, all]
       no_ocr:
-        description: "跳过 OCR（只抓数据，验证链路用）"
+        description: "跳过 OCR（只抓数据，验链路用）"
         required: false
         default: false
         type: boolean
@@ -43,20 +58,26 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: "3.13"
+  PYTHON_VERSION: "3.13"      # cloud/core/*.pyc 是 3.13 编译（magic f30d0d0a），必须一致
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PYTHONIOENCODING: "utf-8"
 
 jobs:
-  # ---------------- Job P：决定要跑哪些源（动态 matrix）----------------
+  # ---------------- JobP：决定跑哪些源 + 每源分片数 ----------------
   plan:
     name: "JobP 计划"
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       sources: ${{ steps.pick.outputs.sources }}
+      shards_dahkg: ${{ steps.pick.outputs.shards_dahkg }}
+      count_dahkg: ${{ steps.pick.outputs.count_dahkg }}
+      shards_aocai: ${{ steps.pick.outputs.shards_aocai }}
+      count_aocai: ${{ steps.pick.outputs.count_aocai }}
+      shards_tuku: ${{ steps.pick.outputs.shards_tuku }}
+      count_tuku: ${{ steps.pick.outputs.count_tuku }}
     steps:
-      - name: 计算源列表
+      - name: 计算源列表与分片数
         id: pick
         env:
           REQ: ${{ github.event.inputs.source || 'tuku' }}
@@ -67,6 +88,9 @@ jobs:
             tuku|aocai|dahkg) echo "sources=[\"$REQ\"]" >> "$GITHUB_OUTPUT" ;;
             *) echo "未知源: $REQ" >&2; exit 2 ;;
           esac
+          python -c "import json;n=11;print('shards_dahkg='+json.dumps(list(range(n))));print('count_dahkg='+str(n))" >> "$GITHUB_OUTPUT"
+          python -c "import json;n=4;print('shards_aocai='+json.dumps(list(range(n))));print('count_aocai='+str(n))" >> "$GITHUB_OUTPUT"
+          python -c "import json;n=3;print('shards_tuku='+json.dumps(list(range(n))));print('count_tuku='+str(n))" >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
 
   # ---------------- Job 0：清理（图片 2 天轮转 + 产物 30 期轮转）----------------
@@ -80,45 +104,29 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: repo
-
       - name: 安装 Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-
       - name: 检出私有数据仓
         uses: actions/checkout@v4
         with:
           repository: wangpha/liuhe-data
           token: ${{ secrets.LIUHE_DATA_TOKEN }}
           path: repo/work/store
-
       - name: 清理轮转（图片 2 天 / 产物 30 期）
         working-directory: repo
         run: |
           set -o pipefail
-          python -m cloud.runner --cleanup \
-            --work work \
-            --store work/store \
-            --keep-days 2 \
-            --keep-periods 30 2>&1 | tee work/cleanup.log
-
+          python -m cloud.runner --cleanup --work work --store work/store --keep-days 2 --keep-periods 30 2>&1 | tee work/cleanup.log
       - name: 提交轮转结果
-        id: commit
         working-directory: repo/work/store
         run: |
           git config user.name  "liuhe-bot"
           git config user.email "liuhe-bot@users.noreply.github.com"
           git add -A
-          if git diff --cached --quiet; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "无变化，不提交"
-          else
-            git commit -m "cleanup: 图片2天/产物30期轮转 $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            git push
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
+          if git diff --cached --quiet; then echo "无变化"; else
+            git commit -m "cleanup: 图片2天/产物30期轮转 $(date -u +%Y-%m-%dT%H:%M:%SZ)"; git push; fi
       - name: 保存清理日志
         if: always()
         uses: actions/upload-artifact@v4
@@ -127,12 +135,12 @@ jobs:
           path: repo/work/cleanup.log
           if-no-files-found: warn
 
-  # ---------------- Job 1：采集（动态 matrix，每个源一个 job）----------------
-  collect:
-    name: "采集 ${{ matrix.source }}"
+  # ---------------- Job 1：逐源 plan（期号探测，三源口径不同）----------------
+  prepare:
+    name: "计划 ${{ matrix.source }}"
     needs: [plan, cleanup]
     runs-on: ubuntu-24.04
-    timeout-minutes: 330
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -142,63 +150,382 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: repo
-
       - name: 安装 Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: 检出私有数据仓（读状态：期号/快照）
+      - name: 检出私有数据仓（读状态）
         uses: actions/checkout@v4
         with:
           repository: wangpha/liuhe-data
           token: ${{ secrets.LIUHE_DATA_TOKEN }}
           path: repo/work/store
+      - name: 安装依赖
+        working-directory: repo
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r cloud/requirements.txt
+      - name: 生成 plan（含期号探测证据）
+        working-directory: repo
+        run: |
+          set -o pipefail
+          python -m cloud.runner --plan --source "${{ matrix.source }}" \
+            --work work --state work/store/state 2>&1 | tee "work/plan_${{ matrix.source }}.log"
+      - name: 上传 plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: plans-${{ matrix.source }}-${{ github.run_id }}
+          path: |
+            repo/work/plan
+            repo/work/plan_${{ matrix.source }}.log
+          if-no-files-found: error
 
+  # ---------------- 分片 dahkg：#=0..10 （并行预热缓存）----------------
+  shard_dahkg:
+    name: "分片 dahkg#${{ matrix.shard }}"
+    needs: [plan, prepare]
+    if: contains(needs.plan.outputs.sources, 'dahkg')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards_dahkg) }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          path: repo
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: 安装系统依赖（opencv 需要 libGL）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
       - name: 恢复 pip 缓存
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-${{ hashFiles('repo/cloud/requirements.txt') }}
           restore-keys: pip-${{ runner.os }}-
-
-      - name: 安装系统依赖（opencv 运行需要 libGL）
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
-
       - name: 安装依赖
         working-directory: repo
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r cloud/requirements.txt
           python -c "import rapidocr_onnxruntime, onnxruntime, cv2, openpyxl, Crypto; print('deps ok', onnxruntime.__version__, cv2.__version__)"
-
-      - name: 恢复 OCR 缓存（跨运行命中率的关键）
+      - name: 下载本源 plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plans-dahkg-${{ github.run_id }}
+          path: repo/work/plan-dl
+      - name: 归位 plan
+        working-directory: repo
+        run: |
+          mkdir -p work/plan
+          cp -v work/plan-dl/plan/*.json work/plan/ 2>/dev/null || true
+          find work/plan-dl -name 'plan_*.json' -exec cp -v {} work/plan/ \;
+          ls -la work/plan
+      - name: 恢复 OCR 缓存
         uses: actions/cache@v4
         with:
           path: repo/work/out
-          key: ocr-v1-${{ matrix.source }}-${{ github.run_id }}
+          key: ocr-v3-dahkg-${{ github.run_id }}-${{ matrix.shard }}
           restore-keys: |
-            ocr-v1-${{ matrix.source }}-
+            ocr-v3-dahkg-
+            ocr-v1-dahkg-
+      - name: 分片预热（只处理本片：详情+回复+图片+OCR）
+        id: shard
+        working-directory: repo
+        env:
+          NO_OCR: ${{ github.event.inputs.no_ocr || 'false' }}
+          NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
+        run: |
+          set -o pipefail
+          EXTRA=""
+          [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
+          [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
+          python -m cloud.runner --shard "${{ matrix.shard }}" \
+            --shards "${{ needs.plan.outputs.count_dahkg }}" \
+            --source "dahkg" --work work --out work/out --workers 4 \
+            $EXTRA 2>&1 | tee "work/shard_dahkg_${{ matrix.shard }}.log"
+      - name: 打包本片缓存
+        if: always()
+        working-directory: repo
+        run: |
+          mkdir -p work/cacheout
+          ( cd work/out && find . -type d -name .cache -print0 2>/dev/null \
+            | tar -czf ../../work/cacheout/cache_dahkg_${{ matrix.shard }}.tar.gz --null -T - 2>/dev/null ) \
+            || echo "没有 .cache 可打包（本片可能是空片）"
+          ls -la work/cacheout
+      - name: 上传本片缓存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-dahkg-${{ matrix.shard }}-${{ github.run_id }}
+          path: |
+            repo/work/cacheout
+            repo/work/shard_dahkg_${{ matrix.shard }}.log
+          if-no-files-found: warn
 
-      - name: 清理昨日图片（R2：保留当天+前一天，更早的删除）
+  # ---------------- 分片 aocai：#=0..3 （并行预热缓存）----------------
+  shard_aocai:
+    name: "分片 aocai#${{ matrix.shard }}"
+    needs: [plan, prepare]
+    if: contains(needs.plan.outputs.sources, 'aocai')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards_aocai) }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          path: repo
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: 安装系统依赖（opencv 需要 libGL）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+      - name: 恢复 pip 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('repo/cloud/requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+      - name: 安装依赖
+        working-directory: repo
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r cloud/requirements.txt
+          python -c "import rapidocr_onnxruntime, onnxruntime, cv2, openpyxl, Crypto; print('deps ok', onnxruntime.__version__, cv2.__version__)"
+      - name: 下载本源 plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plans-aocai-${{ github.run_id }}
+          path: repo/work/plan-dl
+      - name: 归位 plan
+        working-directory: repo
+        run: |
+          mkdir -p work/plan
+          cp -v work/plan-dl/plan/*.json work/plan/ 2>/dev/null || true
+          find work/plan-dl -name 'plan_*.json' -exec cp -v {} work/plan/ \;
+          ls -la work/plan
+      - name: 恢复 OCR 缓存
+        uses: actions/cache@v4
+        with:
+          path: repo/work/out
+          key: ocr-v3-aocai-${{ github.run_id }}-${{ matrix.shard }}
+          restore-keys: |
+            ocr-v3-aocai-
+            ocr-v1-aocai-
+      - name: 分片预热（只处理本片：详情+回复+图片+OCR）
+        id: shard
+        working-directory: repo
+        env:
+          NO_OCR: ${{ github.event.inputs.no_ocr || 'false' }}
+          NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
+        run: |
+          set -o pipefail
+          EXTRA=""
+          [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
+          [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
+          python -m cloud.runner --shard "${{ matrix.shard }}" \
+            --shards "${{ needs.plan.outputs.count_aocai }}" \
+            --source "aocai" --work work --out work/out --workers 4 \
+            $EXTRA 2>&1 | tee "work/shard_aocai_${{ matrix.shard }}.log"
+      - name: 打包本片缓存
+        if: always()
+        working-directory: repo
+        run: |
+          mkdir -p work/cacheout
+          ( cd work/out && find . -type d -name .cache -print0 2>/dev/null \
+            | tar -czf ../../work/cacheout/cache_aocai_${{ matrix.shard }}.tar.gz --null -T - 2>/dev/null ) \
+            || echo "没有 .cache 可打包（本片可能是空片）"
+          ls -la work/cacheout
+      - name: 上传本片缓存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-aocai-${{ matrix.shard }}-${{ github.run_id }}
+          path: |
+            repo/work/cacheout
+            repo/work/shard_aocai_${{ matrix.shard }}.log
+          if-no-files-found: warn
+
+  # ---------------- 分片 tuku：#=0..2 （并行预热缓存）----------------
+  shard_tuku:
+    name: "分片 tuku#${{ matrix.shard }}"
+    needs: [plan, prepare]
+    if: contains(needs.plan.outputs.sources, 'tuku')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards_tuku) }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          path: repo
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: 安装系统依赖（opencv 需要 libGL）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+      - name: 恢复 pip 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('repo/cloud/requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+      - name: 安装依赖
+        working-directory: repo
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r cloud/requirements.txt
+          python -c "import rapidocr_onnxruntime, onnxruntime, cv2, openpyxl, Crypto; print('deps ok', onnxruntime.__version__, cv2.__version__)"
+      - name: 下载本源 plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plans-tuku-${{ github.run_id }}
+          path: repo/work/plan-dl
+      - name: 归位 plan
+        working-directory: repo
+        run: |
+          mkdir -p work/plan
+          cp -v work/plan-dl/plan/*.json work/plan/ 2>/dev/null || true
+          find work/plan-dl -name 'plan_*.json' -exec cp -v {} work/plan/ \;
+          ls -la work/plan
+      - name: 恢复 OCR 缓存
+        uses: actions/cache@v4
+        with:
+          path: repo/work/out
+          key: ocr-v3-tuku-${{ github.run_id }}-${{ matrix.shard }}
+          restore-keys: |
+            ocr-v3-tuku-
+            ocr-v1-tuku-
+      - name: 分片预热（只处理本片：详情+回复+图片+OCR）
+        id: shard
+        working-directory: repo
+        env:
+          NO_OCR: ${{ github.event.inputs.no_ocr || 'false' }}
+          NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
+        run: |
+          set -o pipefail
+          EXTRA=""
+          [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
+          [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
+          python -m cloud.runner --shard "${{ matrix.shard }}" \
+            --shards "${{ needs.plan.outputs.count_tuku }}" \
+            --source "tuku" --work work --out work/out --workers 4 \
+            $EXTRA 2>&1 | tee "work/shard_tuku_${{ matrix.shard }}.log"
+      - name: 打包本片缓存
+        if: always()
+        working-directory: repo
+        run: |
+          mkdir -p work/cacheout
+          ( cd work/out && find . -type d -name .cache -print0 2>/dev/null \
+            | tar -czf ../../work/cacheout/cache_tuku_${{ matrix.shard }}.tar.gz --null -T - 2>/dev/null ) \
+            || echo "没有 .cache 可打包（本片可能是空片）"
+          ls -la work/cacheout
+      - name: 上传本片缓存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-tuku-${{ matrix.shard }}-${{ github.run_id }}
+          path: |
+            repo/work/cacheout
+            repo/work/shard_tuku_${{ matrix.shard }}.log
+          if-no-files-found: warn
+
+  # ---------------- 合并 dahkg：解开各片缓存后完整跑一次 ----------------
+  merge_dahkg:
+    name: "合并 dahkg"
+    needs: [plan, prepare, shard_dahkg]
+    # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
+    if: always() && !cancelled() && contains(needs.plan.outputs.sources, 'dahkg')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          path: repo
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: 检出私有数据仓（读状态：期号/快照）
+        uses: actions/checkout@v4
+        with:
+          repository: wangpha/liuhe-data
+          token: ${{ secrets.LIUHE_DATA_TOKEN }}
+          path: repo/work/store
+      - name: 安装系统依赖（opencv 需要 libGL）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+      - name: 恢复 pip 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('repo/cloud/requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+      - name: 安装依赖
+        working-directory: repo
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r cloud/requirements.txt
+      - name: 下载各分片缓存
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cache-dahkg-*-${{ github.run_id }}
+          path: repo/work/incoming-cache
+      - name: 解开各分片缓存到独立目录（不能直接解到 work/out，否则同名 JSON 互相覆盖）
+        working-directory: repo
+        run: |
+          rm -rf work/cache-in && mkdir -p work/cache-in work/out
+          n=0
+          for f in $(find work/incoming-cache -name 'cache_*.tar.gz' -type f 2>/dev/null); do
+            name=$(basename "$f" .tar.gz)
+            mkdir -p "work/cache-in/$name"
+            tar -xzf "$f" -C "work/cache-in/$name"
+            n=$((n+1))
+          done
+          echo "共解开 $n 份分片缓存到 work/cache-in/"
+          find work/cache-in -maxdepth 1 -mindepth 1 -type d | head -20
+      - name: 恢复 OCR 缓存（actions/cache 兜底；必须在合并分片缓存**之前**，否则会用旧快照覆盖合并结果）
+        uses: actions/cache@v4
+        with:
+          path: repo/work/out
+          key: ocr-v3-dahkg-${{ github.run_id }}-merge
+          restore-keys: |
+            ocr-v3-dahkg-
+            ocr-v1-dahkg-
+      - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
         working-directory: repo
         run: |
           set -o pipefail
-          python -m cloud.runner --cleanup \
-            --work work \
-            --out work/out \
-            --keep-days 2 \
-            --skip-periods 2>&1 | tee work/images_cleanup.log
-
-      - name: 环境自检 + 单元自检
+          python cloud/merge_caches.py --target work/out --sources work/cache-in/* 2>&1 | tee work/merge_caches.log
+      - name: 清理昨日图片（R2）
         working-directory: repo
         run: |
-          python -m cloud.runner --selftest --work work
-
-      - name: 采集 + 五道防线校验
-        id: crawl
+          set -o pipefail
+          python -m cloud.runner --cleanup --work work --out work/out --keep-days 2 --skip-periods 2>&1 | tee work/images_cleanup.log
+      - name: 完整跑一次（缓存全命中）+ 五道防线校验
+        id: merge
         working-directory: repo
         env:
           LIUHE_CLOUD_WORK: work
@@ -211,69 +538,304 @@ jobs:
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
           [ "$LIMIT" != "0" ] && EXTRA="$EXTRA --limit $LIMIT"
-          echo "附加参数: $EXTRA"
-          python -m cloud.runner --run \
-            --source "${{ matrix.source }}" \
-            --work work \
-            --out work/out \
-            --state work/store/state \
-            --workers 4 \
-            $EXTRA 2>&1 | tee "work/run_${{ matrix.source }}.log"
-
+          python -m cloud.runner --merge --source "dahkg" --work work --out work/out \
+            --state work/store/state --workers 4 $EXTRA 2>&1 | tee "work/run_dahkg.log"
       - name: 日志零错误审计（文档 6B.3 方式 1）
         if: always()
         working-directory: repo
         run: |
-          LOG="work/run_${{ matrix.source }}.log"
+          LOG="work/run_dahkg.log"
           if [ -f "$LOG" ]; then
-            python cloud/audit_logs.py "$LOG" --json "work/audit/logaudit_${{ matrix.source }}.json" || true
-          else
-            echo "没有日志文件"
+            python cloud/audit_logs.py "$LOG" --json "work/audit/logaudit_dahkg.json" || true
           fi
-
       - name: 汇总产物清单
         if: always()
         working-directory: repo
         run: |
-          echo "=== 产物目录 ==="
-          find work/out -maxdepth 3 -type d > work/_dirs.txt 2>/dev/null || true
-          sed -n '1,40p' work/_dirs.txt
-          echo "=== 每期文件数与大小 ==="
           find work/out -maxdepth 3 -type d -name '*期' > work/_periods.txt 2>/dev/null || true
-          while read -r d; do
-            [ -n "$d" ] || continue
-            echo "$d : $(find "$d" -maxdepth 1 -type f | wc -l) 个文件"
-          done < work/_periods.txt
+          while read -r d; do [ -n "$d" ] || continue; echo "$d : $(find "$d" -maxdepth 1 -type f | wc -l) 个文件"; done < work/_periods.txt
           du -sh work/out 2>/dev/null || true
-
       - name: 上传日志与审计证据
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: run-${{ matrix.source }}-${{ github.run_id }}
+          name: run-dahkg-${{ github.run_id }}
           path: |
-            repo/work/run_${{ matrix.source }}.log
+            repo/work/run_dahkg.log
             repo/work/audit
             repo/work/state
             repo/work/plan
-            repo/work/cleanup.log
+            repo/work/images_cleanup.log
           if-no-files-found: warn
-
       - name: 上传产物（数据类，不含图片）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: products-${{ matrix.source }}-${{ github.run_id }}
+          name: products-dahkg-${{ github.run_id }}
           path: |
             repo/work/out
             !repo/work/out/**/images/**
           if-no-files-found: warn
 
-  # ---------------- Job 12：合并产物并推送到私有数据仓 ----------------
+  # ---------------- 合并 aocai：解开各片缓存后完整跑一次 ----------------
+  merge_aocai:
+    name: "合并 aocai"
+    needs: [plan, prepare, shard_aocai]
+    # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
+    if: always() && !cancelled() && contains(needs.plan.outputs.sources, 'aocai')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          path: repo
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: 检出私有数据仓（读状态：期号/快照）
+        uses: actions/checkout@v4
+        with:
+          repository: wangpha/liuhe-data
+          token: ${{ secrets.LIUHE_DATA_TOKEN }}
+          path: repo/work/store
+      - name: 安装系统依赖（opencv 需要 libGL）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+      - name: 恢复 pip 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('repo/cloud/requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+      - name: 安装依赖
+        working-directory: repo
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r cloud/requirements.txt
+      - name: 下载各分片缓存
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cache-aocai-*-${{ github.run_id }}
+          path: repo/work/incoming-cache
+      - name: 解开各分片缓存到独立目录（不能直接解到 work/out，否则同名 JSON 互相覆盖）
+        working-directory: repo
+        run: |
+          rm -rf work/cache-in && mkdir -p work/cache-in work/out
+          n=0
+          for f in $(find work/incoming-cache -name 'cache_*.tar.gz' -type f 2>/dev/null); do
+            name=$(basename "$f" .tar.gz)
+            mkdir -p "work/cache-in/$name"
+            tar -xzf "$f" -C "work/cache-in/$name"
+            n=$((n+1))
+          done
+          echo "共解开 $n 份分片缓存到 work/cache-in/"
+          find work/cache-in -maxdepth 1 -mindepth 1 -type d | head -20
+      - name: 恢复 OCR 缓存（actions/cache 兜底；必须在合并分片缓存**之前**，否则会用旧快照覆盖合并结果）
+        uses: actions/cache@v4
+        with:
+          path: repo/work/out
+          key: ocr-v3-aocai-${{ github.run_id }}-merge
+          restore-keys: |
+            ocr-v3-aocai-
+            ocr-v1-aocai-
+      - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
+        working-directory: repo
+        run: |
+          set -o pipefail
+          python cloud/merge_caches.py --target work/out --sources work/cache-in/* 2>&1 | tee work/merge_caches.log
+      - name: 清理昨日图片（R2）
+        working-directory: repo
+        run: |
+          set -o pipefail
+          python -m cloud.runner --cleanup --work work --out work/out --keep-days 2 --skip-periods 2>&1 | tee work/images_cleanup.log
+      - name: 完整跑一次（缓存全命中）+ 五道防线校验
+        id: merge
+        working-directory: repo
+        env:
+          LIUHE_CLOUD_WORK: work
+          NO_OCR: ${{ github.event.inputs.no_ocr || 'false' }}
+          NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
+          LIMIT: ${{ github.event.inputs.limit || '0' }}
+        run: |
+          set -o pipefail
+          EXTRA=""
+          [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
+          [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
+          [ "$LIMIT" != "0" ] && EXTRA="$EXTRA --limit $LIMIT"
+          python -m cloud.runner --merge --source "aocai" --work work --out work/out \
+            --state work/store/state --workers 4 $EXTRA 2>&1 | tee "work/run_aocai.log"
+      - name: 日志零错误审计（文档 6B.3 方式 1）
+        if: always()
+        working-directory: repo
+        run: |
+          LOG="work/run_aocai.log"
+          if [ -f "$LOG" ]; then
+            python cloud/audit_logs.py "$LOG" --json "work/audit/logaudit_aocai.json" || true
+          fi
+      - name: 汇总产物清单
+        if: always()
+        working-directory: repo
+        run: |
+          find work/out -maxdepth 3 -type d -name '*期' > work/_periods.txt 2>/dev/null || true
+          while read -r d; do [ -n "$d" ] || continue; echo "$d : $(find "$d" -maxdepth 1 -type f | wc -l) 个文件"; done < work/_periods.txt
+          du -sh work/out 2>/dev/null || true
+      - name: 上传日志与审计证据
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-aocai-${{ github.run_id }}
+          path: |
+            repo/work/run_aocai.log
+            repo/work/audit
+            repo/work/state
+            repo/work/plan
+            repo/work/images_cleanup.log
+          if-no-files-found: warn
+      - name: 上传产物（数据类，不含图片）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: products-aocai-${{ github.run_id }}
+          path: |
+            repo/work/out
+            !repo/work/out/**/images/**
+          if-no-files-found: warn
+
+  # ---------------- 合并 tuku：解开各片缓存后完整跑一次 ----------------
+  merge_tuku:
+    name: "合并 tuku"
+    needs: [plan, prepare, shard_tuku]
+    # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
+    if: always() && !cancelled() && contains(needs.plan.outputs.sources, 'tuku')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          path: repo
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: 检出私有数据仓（读状态：期号/快照）
+        uses: actions/checkout@v4
+        with:
+          repository: wangpha/liuhe-data
+          token: ${{ secrets.LIUHE_DATA_TOKEN }}
+          path: repo/work/store
+      - name: 安装系统依赖（opencv 需要 libGL）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+      - name: 恢复 pip 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('repo/cloud/requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+      - name: 安装依赖
+        working-directory: repo
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r cloud/requirements.txt
+      - name: 下载各分片缓存
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cache-tuku-*-${{ github.run_id }}
+          path: repo/work/incoming-cache
+      - name: 解开各分片缓存到独立目录（不能直接解到 work/out，否则同名 JSON 互相覆盖）
+        working-directory: repo
+        run: |
+          rm -rf work/cache-in && mkdir -p work/cache-in work/out
+          n=0
+          for f in $(find work/incoming-cache -name 'cache_*.tar.gz' -type f 2>/dev/null); do
+            name=$(basename "$f" .tar.gz)
+            mkdir -p "work/cache-in/$name"
+            tar -xzf "$f" -C "work/cache-in/$name"
+            n=$((n+1))
+          done
+          echo "共解开 $n 份分片缓存到 work/cache-in/"
+          find work/cache-in -maxdepth 1 -mindepth 1 -type d | head -20
+      - name: 恢复 OCR 缓存（actions/cache 兜底；必须在合并分片缓存**之前**，否则会用旧快照覆盖合并结果）
+        uses: actions/cache@v4
+        with:
+          path: repo/work/out
+          key: ocr-v3-tuku-${{ github.run_id }}-merge
+          restore-keys: |
+            ocr-v3-tuku-
+            ocr-v1-tuku-
+      - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
+        working-directory: repo
+        run: |
+          set -o pipefail
+          python cloud/merge_caches.py --target work/out --sources work/cache-in/* 2>&1 | tee work/merge_caches.log
+      - name: 清理昨日图片（R2）
+        working-directory: repo
+        run: |
+          set -o pipefail
+          python -m cloud.runner --cleanup --work work --out work/out --keep-days 2 --skip-periods 2>&1 | tee work/images_cleanup.log
+      - name: 完整跑一次（缓存全命中）+ 五道防线校验
+        id: merge
+        working-directory: repo
+        env:
+          LIUHE_CLOUD_WORK: work
+          NO_OCR: ${{ github.event.inputs.no_ocr || 'false' }}
+          NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
+          LIMIT: ${{ github.event.inputs.limit || '0' }}
+        run: |
+          set -o pipefail
+          EXTRA=""
+          [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
+          [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
+          [ "$LIMIT" != "0" ] && EXTRA="$EXTRA --limit $LIMIT"
+          python -m cloud.runner --merge --source "tuku" --work work --out work/out \
+            --state work/store/state --workers 4 $EXTRA 2>&1 | tee "work/run_tuku.log"
+      - name: 日志零错误审计（文档 6B.3 方式 1）
+        if: always()
+        working-directory: repo
+        run: |
+          LOG="work/run_tuku.log"
+          if [ -f "$LOG" ]; then
+            python cloud/audit_logs.py "$LOG" --json "work/audit/logaudit_tuku.json" || true
+          fi
+      - name: 汇总产物清单
+        if: always()
+        working-directory: repo
+        run: |
+          find work/out -maxdepth 3 -type d -name '*期' > work/_periods.txt 2>/dev/null || true
+          while read -r d; do [ -n "$d" ] || continue; echo "$d : $(find "$d" -maxdepth 1 -type f | wc -l) 个文件"; done < work/_periods.txt
+          du -sh work/out 2>/dev/null || true
+      - name: 上传日志与审计证据
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-tuku-${{ github.run_id }}
+          path: |
+            repo/work/run_tuku.log
+            repo/work/audit
+            repo/work/state
+            repo/work/plan
+            repo/work/images_cleanup.log
+          if-no-files-found: warn
+      - name: 上传产物（数据类，不含图片）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: products-tuku-${{ github.run_id }}
+          path: |
+            repo/work/out
+            !repo/work/out/**/images/**
+          if-no-files-found: warn
+
+  # ---------------- Job 13：推送到私有数据仓 ----------------
   publish:
-    name: "Job12 publish 推数据仓"
-    needs: collect
-    if: always() && !cancelled() && needs.collect.result == 'success' && github.event.inputs.dry_publish != 'true'
+    name: "Job13 publish 推数据仓"
+    needs: [merge_dahkg, merge_aocai, merge_tuku]
+    if: always() && !cancelled() && github.event.inputs.dry_publish != 'true' && !contains(needs.*.result, 'failure')
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -281,26 +843,22 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: repo
-
       - name: 检出私有数据仓
         uses: actions/checkout@v4
         with:
           repository: wangpha/liuhe-data
           token: ${{ secrets.LIUHE_DATA_TOKEN }}
           path: repo/work/store
-
       - name: 下载各源产物
         uses: actions/download-artifact@v4
         with:
           pattern: products-*-${{ github.run_id }}
           path: repo/work/incoming
-
       - name: 下载各源运行日志与审计
         uses: actions/download-artifact@v4
         with:
           pattern: run-*-${{ github.run_id }}
           path: repo/work/incoming-logs
-
       - name: 合并进数据仓 + 生成 manifest
         working-directory: repo
         run: |
@@ -313,39 +871,23 @@ jobs:
           store = Path("work/store")
           data = store / "data"
           data.mkdir(parents=True, exist_ok=True)
-
-          # 源目录名规范化：数据仓里统一用源 id（dahkg / aocai / tuku）
           NAME_MAP = {"大港澳": "dahkg", "澳彩交流": "aocai", "tuku": "tuku"}
 
-          def key_for(artifact_name: str, period_dir: Path) -> str:
-              """优先用 artifact 名里的源 id；退化为期目录的父目录名。"""
-              # artifact 名形如 products-<source>-<run_id>
+          def key_for(artifact_name, period_dir):
               parts = artifact_name.split("-")
               if len(parts) >= 2 and parts[1] in ("dahkg", "aocai", "tuku"):
                   return parts[1]
-              parent = period_dir.parent.name
-              return NAME_MAP.get(parent, parent or "unknown")
+              return NAME_MAP.get(period_dir.parent.name, period_dir.parent.name or "unknown")
 
           copied = []
           for src_root in sorted(incoming.glob("products-*")):
               if not src_root.is_dir():
                   continue
-              # **关键修复**：artifact 解包后的层级不固定（upload-artifact 会剥掉公共前缀），
-              # 所以按内容递归找 `*期` 目录，而不是假设固定的 work/out。
-              # 还必须排除中间目录：49图库会写 `历史回采/49图库/2026-11-15_第320期`
-              # （只有 5 个文件），它和正式产物 `澳门_2026_320期` 期号相同，
-              # 判据 = 必须有 posts.json（正式产物必有，中间目录没有）。
-              found = [
-                  p for p in src_root.rglob("*期")
-                  if p.is_dir() and (p / "posts.json").exists()
-              ]
-              skipped = [
-                  p for p in src_root.rglob("*期")
-                  if p.is_dir() and not (p / "posts.json").exists()
-              ]
+              found = [p for p in src_root.rglob("*期") if p.is_dir() and (p / "posts.json").exists()]
+              skipped = [p for p in src_root.rglob("*期") if p.is_dir() and not (p / "posts.json").exists()]
               print(f"{src_root.name}: 正式期目录 {len(found)} 个 -> {[p.name for p in found][:5]}")
               if skipped:
-                  print(f"{src_root.name}: 跳过非产物目录 {len(skipped)} 个 -> {[str(p.relative_to(src_root)) for p in skipped][:5]}")
+                  print(f"{src_root.name}: 跳过非产物目录 {len(skipped)} 个")
               for period_dir in found:
                   key = key_for(src_root.name, period_dir)
                   dst = data / key / period_dir.name
@@ -357,9 +899,6 @@ jobs:
 
           if not copied:
               print("FATAL: 没有把任何一期的产物合并进数据仓", file=sys.stderr)
-              print("incoming 结构如下：", file=sys.stderr)
-              for p in sorted(incoming.rglob("*"))[:60]:
-                  print("   ", p, file=sys.stderr)
               sys.exit(1)
 
           manifest = {}
@@ -377,40 +916,29 @@ jobs:
           print("copied:", copied)
           print("manifest:", {k: v["count"] for k, v in manifest.items()})
           PY
-
       - name: 保存日志到数据仓（保留最近 30 份）
         working-directory: repo
         run: |
           mkdir -p work/store/logs
           FOUND=0
           for f in $(find work/incoming work/incoming-logs -name 'run_*.log' -type f 2>/dev/null); do
-            ts=$(date -u +%Y%m%d_%H%M%S)
-            base=$(basename "$f" .log)
-            cp "$f" "work/store/logs/${base}_${ts}_run${GITHUB_RUN_NUMBER}.log"
-            FOUND=$((FOUND+1))
+            ts=$(date -u +%Y%m%d_%H%M%S); base=$(basename "$f" .log)
+            cp "$f" "work/store/logs/${base}_${ts}_run${GITHUB_RUN_NUMBER}.log"; FOUND=$((FOUND+1))
           done
-          # 审计 JSON 也一起入库，验收时可逐份核对
           for j in $(find work/incoming-logs -name 'audit_*.json' -o -name 'logaudit_*.json' 2>/dev/null | head -40); do
             cp "$j" "work/store/logs/" 2>/dev/null || true
           done
           echo "拷入日志 $FOUND 份"
-          ls -la work/store/logs | tail -10
           ls -1t work/store/logs/*.log 2>/dev/null | tail -n +31 | xargs -r rm -f
-          echo "保留 $(ls -1 work/store/logs/*.log 2>/dev/null | wc -l) 份"
-
       - name: 提交并推送
         working-directory: repo/work/store
         run: |
           git config user.name  "liuhe-bot"
           git config user.email "liuhe-bot@users.noreply.github.com"
           git add -A
-          if git diff --cached --quiet; then
-            echo "无变化，跳过提交"
-            exit 0
-          fi
-          git commit -m "data: 云端采集 $(date -u +%Y-%m-%dT%H:%M:%SZ) run#${{ github.run_number }}"
+          if git diff --cached --quiet; then echo "无变化"; exit 0; fi
+          git commit -m "data: 云端采集(分片) $(date -u +%Y-%m-%dT%H:%M:%SZ) run#${{ github.run_number }}"
           git push
-
       - name: 上传合并结果
         if: always()
         uses: actions/upload-artifact@v4
