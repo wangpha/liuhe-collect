@@ -562,6 +562,55 @@ def probe_details(
     return {"exists": exists, "periods": periods}
 
 
+def probe_image_urls(urls: list[str], log: Callable[[str], None] | None = None, timeout: float = 15.0) -> dict:
+    """逐张向源站求证：这张没下载下来的图，是「源站物理不可救」还是「我们没下成」。
+
+    ## 为什么必须分开（文档防线2 第4道 + R12）
+    文档写「单张图下载失败 → 重试 3 次（间隔递增）；仍失败 → 记入失败清单，
+    计入最终报告的『物理不可救』项」。所以「源站就是坏图」与「我们有能力却没下成」
+    必须分开：前者如实列清单，后者是缺陷必须失败。
+    一刀切判失败会把源站坏图变成永远无法通过的门禁；一刀切放过就会掩盖真的漏图。
+
+    判定：
+      · HTTP 404 / 403 / 410，或 200 但 0 字节  → `unrecoverable`（源站物理不可救）
+      · 超时 / 连接错误 / 5xx                   → `retryable`（我们或网络的问题）
+      · 200/206 且拿到字节                       → `recoverable`（能下到，说明是我们漏了）
+    """
+    import time as _time
+
+    import requests
+
+    say = log or (lambda message: None)
+    result: dict[str, dict] = {}
+    for url in urls:
+        if not url:
+            continue
+        try:
+            resp = requests.get(url, timeout=timeout, headers={"Range": "bytes=0-2047"}, stream=True)
+            code = resp.status_code
+            got = 0
+            try:
+                for chunk in resp.iter_content(1024):
+                    got += len(chunk)
+                    if got >= 2048:
+                        break
+            finally:
+                resp.close()
+            if code in (404, 403, 410):
+                kind = "unrecoverable"
+            elif code in (200, 206):
+                kind = "recoverable" if got > 0 else "unrecoverable"   # 200 但 0 字节 = 空文件
+            else:
+                kind = "retryable"                                     # 5xx 等
+            result[url] = {"httpStatus": code, "bytes": got, "kind": kind}
+            say(f"[求证图片] HTTP {code} {got}B -> {kind}：{url[:100]}")
+        except Exception as exc:  # noqa: BLE001 - 超时/连接失败属可重试
+            result[url] = {"kind": "retryable", "error": f"{type(exc).__name__}: {str(exc)[:100]}"}
+            say(f"[求证图片] 请求失败（可重试）{type(exc).__name__}：{url[:100]}")
+        _time.sleep(0.05)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 防线 1 第 2 道：帖子数对账
 # ---------------------------------------------------------------------------
@@ -646,19 +695,30 @@ def reconcile_posts(
 # ---------------------------------------------------------------------------
 # 防线 2：逐帖图片数对账
 # ---------------------------------------------------------------------------
-def reconcile_images(posts: list[dict], scan: dict, require_files: Path | None = None) -> dict:
+def reconcile_images(
+    posts: list[dict],
+    scan: dict,
+    require_files: Path | None = None,
+    probe_bad_images: bool = True,
+    log: Callable[[str], None] | None = None,
+) -> dict:
     """每帖：正文图片数 vs 列表 `imgTotal`；并核对下载状态。
 
     - `imgTotal` 是源站列表行里的**正文图**总数（实测字段名确定，2026-11-16）；
     - 回复图不参与 `imgTotal`，单独按 `commentImageCount`/回复内 images 统计并报告；
-    - `downloadStatus` 非 exists/downloaded 的计入失败清单（物理不可救要列明）。
+    - `downloadStatus` 非 exists/downloaded 的，**逐张向源站求证**后分类：
+        · 源站物理不可救（404/410/200 但 0 字节）→ 记入 `unrecoverable` 清单，不判失败（文档防线2 第4道）
+        · 能下到 / 超时 / 5xx → `retryable`，**判失败**（说明我们或网络没处理好）
     """
+    say = log or (lambda message: None)
     union_meta = scan.get("unionMeta") or {}
     rows: list[dict] = []
     mismatch_total = 0
-    not_downloaded_total = 0
+    retryable_total = 0
+    unrecoverable_total = 0
     missing_file_total = 0
     no_declared = 0
+    bad_urls: list[str] = []
     # 图片文件是否存在**只能**在有图片的目录里检查。
     # 数据仓按设计不含 images（4.2：图片不上仓库），拿仓库目录来查会把 243 张全判缺失。
     files_checkable = bool(require_files is not None and (Path(require_files) / "images").is_dir())
@@ -668,11 +728,15 @@ def reconcile_images(posts: list[dict], scan: dict, require_files: Path | None =
         declared = int((union_meta.get(str(aid)) or {}).get("imgTotal") or 0)
         body_imgs = post.get("images") or []
         got = len(body_imgs)
-        bad_status = [
-            img.get("downloadStatus")
-            for img in body_imgs
+        bad_imgs = [
+            img for img in body_imgs
             if str(img.get("downloadStatus") or "") not in {"exists", "downloaded", "cached"}
         ]
+        bad_status = [img.get("downloadStatus") for img in bad_imgs]
+        for img in bad_imgs:
+            url = str(img.get("url") or "")
+            if url:
+                bad_urls.append(url)
         missing_files: list[str] = []
         if files_checkable:
             for img in body_imgs:
@@ -682,12 +746,11 @@ def reconcile_images(posts: list[dict], scan: dict, require_files: Path | None =
         # 源站行里没有图片数字段（如澳彩）→ 无法逐帖比声明，只统计不判定
         if declared == 0:
             no_declared += 1
-            delta = 0 if not body_imgs else 0
+            delta = 0
         else:
             delta = got - declared
             if delta != 0:
                 mismatch_total += 1
-        not_downloaded_total += len(bad_status)
         missing_file_total += len(missing_files)
         rows.append(
             {
@@ -696,24 +759,50 @@ def reconcile_images(posts: list[dict], scan: dict, require_files: Path | None =
                 "actual": got,
                 "delta": delta,
                 "badStatus": bad_status[:5],
+                "badUrls": [str(i.get("url") or "") for i in bad_imgs][:5],
                 "missingFiles": missing_files[:5],
                 "replyImages": sum(len(r.get("images") or []) for r in (post.get("replies") or [])),
             }
         )
 
+    # 逐张向源站求证「坏图」到底是源站坏还是我们没下成
+    probe: dict[str, dict] = {}
+    if bad_urls and probe_bad_images:
+        uniq = list(dict.fromkeys(bad_urls))
+        say(f"[防线2] 有 {len(uniq)} 张图下载状态异常，逐张向源站求证…")
+        probe = probe_image_urls(uniq, log=log)
+        for info in probe.values():
+            if info.get("kind") == "unrecoverable":
+                unrecoverable_total += 1
+            else:
+                retryable_total += 1
+    else:
+        retryable_total = sum(len(r["badStatus"]) for r in rows)
+
     problems = [r for r in rows if r["delta"] != 0 or r["badStatus"] or r["missingFiles"]]
+    unrecoverable = [
+        {"url": u, **info} for u, info in probe.items() if info.get("kind") == "unrecoverable"
+    ]
+    retryable = [{"url": u, **info} for u, info in probe.items() if info.get("kind") != "unrecoverable"]
     return {
         "postsChecked": len(rows),
         "declaredTotal": sum(r["declared"] for r in rows),
         "actualTotal": sum(r["actual"] for r in rows),
         "replyImagesTotal": sum(r["replyImages"] for r in rows),
         "mismatchPosts": mismatch_total,
-        "notDownloadedImages": not_downloaded_total,
+        "notDownloadedImages": retryable_total + unrecoverable_total,
+        "retryableImages": retryable_total,
+        "unrecoverableImages": unrecoverable_total,
+        "unrecoverable": unrecoverable[:30],
+        "retryable": retryable[:30],
         "missingFiles": missing_file_total,
         "noDeclaredPosts": no_declared,
         "filesChecked": files_checkable,
+        "probed": bool(probe),
         "problems": problems[:30],
-        "passed": mismatch_total == 0 and not_downloaded_total == 0 and missing_file_total == 0,
+        # 只有「能下到却没下」「文件缺失」「声明数不符」才算失败；
+        # 源站物理不可救（404/空文件）按文档记清单，不阻塞
+        "passed": mismatch_total == 0 and retryable_total == 0 and missing_file_total == 0,
     }
 
 

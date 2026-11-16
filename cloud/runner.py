@@ -539,14 +539,18 @@ def do_run(args, mode: str = "run") -> int:
 
     image_roots = [p for p in out_dir.rglob("images") if p.is_dir()]
     require_files = image_roots[0].parent if image_roots else None
-    image_check = _reconcile.reconcile_images(posts, scan, require_files=require_files)
+    image_check = _reconcile.reconcile_images(posts, scan, require_files=require_files, log=log)
     log(
         f"[防线2] 图片对账：声明 {image_check['declaredTotal']} 张 / 实际 {image_check['actualTotal']} 张"
-        f" / 不符帖子 {image_check['mismatchPosts']} / 未下载 {image_check['notDownloadedImages']}"
+        f" / 不符帖子 {image_check['mismatchPosts']}"
+        f" / 可重试坏图 {image_check.get('retryableImages', 0)}"
+        f" / 源站不可救 {image_check.get('unrecoverableImages', 0)}"
         f" / 文件缺失 {image_check['missingFiles']}"
         f" / 无声明口径帖子 {image_check.get('noDeclaredPosts', 0)}"
         f"  ← {'通过' if image_check['passed'] else '不通过'}"
     )
+    if image_check.get("unrecoverable"):
+        log(f"[防线2] 源站物理不可救清单（如实列出，不算失败）：{[u['url'][:80] for u in image_check['unrecoverable'][:5]]}")
 
     # ---- 防线 3：快照 + 单调性（prev_snapshot 已在流程开头读过）----
     curr_snapshot = _guard.build_snapshot(posts)
