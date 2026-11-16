@@ -206,6 +206,7 @@ jobs:
             --source "${{ matrix.source }}" \
             --work work \
             --out work/out \
+            --state work/store/state \
             --workers 4 \
             $EXTRA 2>&1 | tee "work/run_${{ matrix.source }}.log"
 

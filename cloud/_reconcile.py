@@ -20,6 +20,7 @@ def independent_scan_dahkg(
     period: int,
     max_pages: int = 200,
     empty_streak_stop: int = 3,
+    created_before: float = 0.0,
     log: Callable[[str], None] | None = None,
 ) -> dict:
     """独立逻辑重扫列表，返回本期应有帖子集合 + 每帖 imgTotal。
@@ -35,6 +36,7 @@ def independent_scan_dahkg(
     say = log or (lambda message: None)
     want = normalize_period(period)
     per_sort: dict[str, dict[str, Any]] = {}
+    late_ids: dict[int, float] = {}
 
     for sort_type in (1, 3):
         ids: dict[int, dict] = {}
@@ -68,6 +70,12 @@ def independent_scan_dahkg(
                     continue
                 hit += 1
                 aid = int(row.get("singaporeId") or 0)
+                # 时间对齐：采集开始后新发的帖子不计入"应有集合"（当期还在长）
+                ts = _ts_dahkg(row)
+                if created_before and ts and ts > created_before:
+                    if aid:
+                        late_ids[aid] = ts
+                    continue
                 if aid:
                     ids[aid] = {
                         "imgTotal": int(row.get("imgTotal") or 0),
@@ -94,8 +102,11 @@ def independent_scan_dahkg(
 
     a = set(per_sort.get("sortType1", {}).get("ids", {}))
     b = set(per_sort.get("sortType3", {}).get("ids", {}))
+    if late_ids:
+        say(f"[独立扫描] 采集开始后新发 {len(late_ids)} 帖，不计入漏帖判定（时间对齐）")
     return {
         "period": want,
+        "source": "dahkg",
         "unionIds": sorted(union),
         "unionMeta": {str(k): v for k, v in union.items()},
         "countUnion": len(union),
@@ -103,9 +114,68 @@ def independent_scan_dahkg(
         "countByLike": len(b),
         "onlyByTime": sorted(a - b)[:50],
         "onlyByLike": sorted(b - a)[:50],
+        "lateIds": sorted(late_ids),
+        "lateCount": len(late_ids),
+        "timeAligned": bool(created_before),
         "agree": a == b,
         "perSort": {k: {kk: vv for kk, vv in v.items() if kk != "ids"} for k, v in per_sort.items()},
     }
+
+
+def _ts_tuku(raw: dict) -> float:
+    """图库列表行的"**可见/变更**时间"（unix 秒）。
+
+    实测（2026-11-16 10:17，期号 320）：
+      某批帖子 `pubdate` = 09:27~09:50，但 `createTime` / `updateTime` 全是 **10:05:30**。
+      也就是**发布时间与实际进列表时间不是同一个**（审核/审核通过后才可见）。
+    只比 pubdate 会把"09:52 采集时还看不见、10:05 才出现"的帖子误判成漏帖。
+
+    所以取三个时间信号里的**最大值**：只要任一字段晚于采集开始，就说明它可能是
+    采集之后才变的，对账时排除（数量会写进日志，不静默）。
+    """
+    cands: list[float] = []
+
+    pub = raw.get("pubdate")
+    try:
+        ts = float(pub)
+        if ts > 1e12:
+            ts /= 1000.0
+        if ts > 0:
+            cands.append(ts)
+    except (TypeError, ValueError):
+        pass
+
+    upd = raw.get("updateTime")
+    try:
+        ts = float(upd)
+        if ts > 1e12:          # 毫秒
+            ts /= 1000.0
+        if ts > 0:
+            cands.append(ts)
+    except (TypeError, ValueError):
+        pass
+
+    for key in ("createTimeStr", "createTime"):
+        text = str(raw.get(key) or "")
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                cands.append(time.mktime(time.strptime(text, fmt)))
+                break
+            except ValueError:
+                continue
+
+    return max(cands) if cands else 0.0
+
+
+def _ts_dahkg(raw: dict) -> float:
+    """大港澳列表行时间戳（unix 秒）。实测字段：`createTime`(毫秒)。"""
+    try:
+        ms = float(raw.get("createTime") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if ms <= 0:
+        return 0.0
+    return ms / 1000.0 if ms > 1e11 else ms
 
 
 # ---------------------------------------------------------------------------
@@ -116,18 +186,15 @@ def independent_scan_tuku(
     max_pages: int = 60,
     empty_streak_stop: int = 2,
     include_pinned: bool = False,
+    created_before: float = 0.0,
     log: Callable[[str], None] | None = None,
 ) -> dict:
     """49图库独立扫描。
 
-    实测约束（2026-11-16）：站点对**单个排序窗口**只给前 1000 行，
-    所以要按 `core.scraper.period_sorts("full")` 的 10 种排序各翻一遍再取并集
-    （`(1, 0, 2, 4, 5, 6, 7, 8, 9, 15)`）。
-    列表行字段实测：`articleId` / `period` / `pictureList`（图片数 = len(pictureList)）/ `top`。
-
-    与采集链路的差异（保证"独立"）：
-      * 不复用 `fetch_period_posts`（它还做标题过滤、缓存、编号去重等）；
-      * 停止条件用「连续 N 页 0 条本期」而不是复用它的窗口合并逻辑。
+    `created_before`：只统计**采集开始之前**就存在的帖子（unix 秒）。
+    当期仍在发布，采集结束后再扫必然多出新帖（实测 2026-11-16：云端产物 984 帖，
+    2 小时后重扫 996 帖，差 12 帖全部是采集之后新发的）—— 这不是漏帖。
+    不传 0 以外的值时退化为"全部统计"，但会在返回里标 `timeAligned=False`。
     """
     from core import scraper
 
@@ -139,6 +206,7 @@ def independent_scan_tuku(
     ids: dict[int, dict] = {}
     per_sort: dict[str, dict] = {}
     pinned_skipped = 0
+    late_ids: dict[int, float] = {}
     for sort_value in sorts:
         t0 = time.time()
         streak = 0
@@ -169,12 +237,18 @@ def independent_scan_tuku(
                 if normalize_period(raw.get("period")) != want:
                     continue
                 hit += 1
+                aid = int(raw.get("articleId") or 0)
+                # 时间对齐：采集开始之后新发的帖子不计入"应有集合"（当期还在长）
+                ts = _ts_tuku(raw)
+                if created_before and ts and ts > created_before:
+                    if aid:
+                        late_ids[aid] = ts
+                    continue
                 # 采集链路默认排除置顶帖（scraper.fetch_period_posts: top and not include_pinned）
                 # 对账必须用同一口径，否则会把置顶帖误判成"漏帖"
                 if raw.get("top") and not include_pinned:
                     pinned_skipped += 1
                     continue
-                aid = int(raw.get("articleId") or 0)
                 if not aid:
                     continue
                 pics = raw.get("pictureList") or []
@@ -197,6 +271,8 @@ def independent_scan_tuku(
 
     if pinned_skipped:
         say(f"[独立扫描/tuku] 按采集口径排除置顶帖 {pinned_skipped} 次命中")
+    if late_ids:
+        say(f"[独立扫描/tuku] 采集开始后新发 {len(late_ids)} 帖，不计入漏帖判定（时间对齐）")
     return {
         "period": want,
         "source": "tuku",
@@ -204,6 +280,9 @@ def independent_scan_tuku(
         "unionMeta": {str(k): v for k, v in ids.items()},
         "countUnion": len(ids),
         "pinnedSkipped": pinned_skipped,
+        "lateIds": sorted(late_ids),
+        "lateCount": len(late_ids),
+        "timeAligned": bool(created_before),
         "perSort": per_sort,
         "agree": True,          # 图库只有一套列表口径，无第二条判据
     }
@@ -216,6 +295,7 @@ def independent_scan_aocai(
     period: int,
     max_pages: int = 200,
     empty_streak_stop: int = 3,
+    created_before: float = 0.0,
     log: Callable[[str], None] | None = None,
 ) -> dict:
     """澳彩交流独立扫描。
@@ -286,32 +366,66 @@ def independent_scan_aocai(
     }
 
 
-def independent_scan(source: str, period: int, max_pages: int = 200, log=None) -> dict:
-    """按源分派独立扫描。"""
+def independent_scan(
+    source: str,
+    period: int,
+    max_pages: int = 200,
+    created_before: float = 0.0,
+    log=None,
+) -> dict:
+    """按源分派独立扫描。
+
+    `created_before`（unix 秒）：只统计采集开始之前就存在的帖子。
+    当期仍在发布时，采集后再扫必然多出新帖，不时间对齐就会把"涨期"误判成"漏帖"
+    （2026-11-16 实测：云端 984 帖 vs 2 小时后重扫 996 帖，差 12 帖全是新发的）。
+    """
     if source == "dahkg":
-        return independent_scan_dahkg(period, max_pages=max_pages, log=log)
+        return independent_scan_dahkg(
+            period, max_pages=max_pages, created_before=created_before, log=log
+        )
     if source == "tuku":
-        return independent_scan_tuku(period, max_pages=max_pages, log=log)
+        return independent_scan_tuku(
+            period, max_pages=min(max_pages, 60), created_before=created_before, log=log
+        )
     if source == "aocai":
-        return independent_scan_aocai(period, max_pages=max_pages, log=log)
+        return independent_scan_aocai(
+            period, max_pages=max_pages, created_before=created_before, log=log
+        )
     raise ValueError(f"未知源：{source}")
 
 
 # ---------------------------------------------------------------------------
 # 防线 1 第 2 道：帖子数对账
 # ---------------------------------------------------------------------------
-def reconcile_posts(posts: list[dict], scan: dict) -> dict:
+def reconcile_posts(posts: list[dict], scan: dict, previous_ids: set[int] | None = None) -> dict:
+    """帖子数对账。
+
+    `lateIds`（采集开始后新发的帖子）两边都不计入：
+      * 不可能出现在"应当存在"的集合里（采集开始时还没有）；
+      * 但确实可能出现于产物里（采集途中翻到了）—— 那也不算"多出"。
+    `previous_ids`（上轮快照里的 ID）：产物里有、当前列表没有、上轮快照有
+      → 判为「源站删帖/隐藏」，属正常（文档防线3 第3道），不计入失败，但必须列出。
+    """
     got = {int(p.get("articleId") or 0) for p in posts if p.get("articleId")}
+    late = {int(x) for x in (scan.get("lateIds") or [])}
+    prev = {int(x) for x in (previous_ids or set())}
     want = set(scan.get("unionIds") or [])
     missing = sorted(want - got)
-    extra = sorted(got - want)
+    extra_all = got - want - late
+    disappeared = sorted(extra_all & prev)      # 源站删帖：上轮快照证明它存在过
+    extra = sorted(extra_all - prev)            # 真·多出：上轮也没有它
+    late_in_products = sorted(got & late)
     return {
         "expected": len(want),
         "actual": len(got),
+        "lateExcluded": len(late),
+        "lateButCollected": len(late_in_products),
         "missingCount": len(missing),
         "extraCount": len(extra),
+        "disappearedCount": len(disappeared),
         "missing": missing[:50],
         "extra": extra[:50],
+        "disappeared": disappeared[:50],
         "passed": not missing and not extra,
     }
 
@@ -332,6 +446,9 @@ def reconcile_images(posts: list[dict], scan: dict, require_files: Path | None =
     not_downloaded_total = 0
     missing_file_total = 0
     no_declared = 0
+    # 图片文件是否存在**只能**在有图片的目录里检查。
+    # 数据仓按设计不含 images（4.2：图片不上仓库），拿仓库目录来查会把 243 张全判缺失。
+    files_checkable = bool(require_files is not None and (Path(require_files) / "images").is_dir())
 
     for post in posts:
         aid = int(post.get("articleId") or 0)
@@ -344,10 +461,10 @@ def reconcile_images(posts: list[dict], scan: dict, require_files: Path | None =
             if str(img.get("downloadStatus") or "") not in {"exists", "downloaded", "cached"}
         ]
         missing_files: list[str] = []
-        if require_files is not None:
+        if files_checkable:
             for img in body_imgs:
                 lp = img.get("localPath")
-                if lp and not (require_files / str(lp)).exists():
+                if lp and not (Path(require_files) / str(lp)).exists():
                     missing_files.append(str(lp))
         # 源站行里没有图片数字段（如澳彩）→ 无法逐帖比声明，只统计不判定
         if declared == 0:
@@ -381,6 +498,7 @@ def reconcile_images(posts: list[dict], scan: dict, require_files: Path | None =
         "notDownloadedImages": not_downloaded_total,
         "missingFiles": missing_file_total,
         "noDeclaredPosts": no_declared,
+        "filesChecked": files_checkable,
         "problems": problems[:30],
         "passed": mismatch_total == 0 and not_downloaded_total == 0 and missing_file_total == 0,
     }

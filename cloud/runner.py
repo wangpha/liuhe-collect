@@ -44,7 +44,20 @@ def _work_dir(explicit: str | None) -> Path:
 
 
 def _state_path(work: Path, source: str, name: str) -> Path:
+    """状态文件路径。
+
+    实测 bug（2026-11-16）：state 原先写在工作目录 `work/state`，而 workflow 只把
+    `work/store`（数据仓检出目录）提交回仓库 → 期号/快照从来没落地过，
+    导致「单调性检查」永远走首轮分支、`lastPeriod` 永远是 0。
+    现在支持 `--state` 指定目录，workflow 传 `work/store/state` 让它随数据仓持久化。
+    """
     return work / "state" / f"{name}_{source}.json"
+
+
+def _resolve_state_dir(args, work: Path) -> Path:
+    if getattr(args, "state", ""):
+        return Path(args.state).resolve()
+    return work / "state"
 
 
 def _find_period_dir(work: Path, out_root: Path, source: str) -> Path:
@@ -153,7 +166,7 @@ def do_plan(args) -> int:
     log(f"[plan] source={source}  {time.strftime('%Y-%m-%d %H:%M:%S')}")
     log("=" * 70)
 
-    state = _guard.load_json(_state_path(work, source, "periods"), {})
+    state = _guard.load_json(_resolve_state_dir(args, work) / f"periods_{source}.json", {})
     last_period = int(state.get("lastPeriod") or 0)
     learned_offset = int(state.get("learnedOffset") or 0)
 
@@ -301,10 +314,14 @@ def do_run(args, mode: str = "run") -> int:
     log(f"[{mode}] source={source} 输出根={out_root}")
     log("=" * 70)
 
-    state_file = _state_path(work, source, "periods")
+    state_file = _resolve_state_dir(args, work) / f"periods_{source}.json"
     state = _guard.load_json(state_file, {})
     last_period = int(state.get("lastPeriod") or 0)
     learned_offset = int(state.get("learnedOffset") or 0)
+    # 上轮快照要早读：防线1 需要用它把「源站删帖」与「真多出」区分开
+    snapshot_file = _resolve_state_dir(args, work) / f"snapshot_{source}.json"
+    prev_snapshot = _guard.load_json(snapshot_file, {})
+    log(f"[state] 期号状态={state_file.name} 上轮期号={last_period or '无'} 上轮快照={len(prev_snapshot)} 帖")
 
     # ---- 期号（R6/M2：每次重新探测，绝不沿用上次）----
     period = 0
@@ -316,6 +333,7 @@ def do_run(args, mode: str = "run") -> int:
         log(f"[大港澳] 未指定期号，自动使用当期 {period}")
 
     # ---- 采集（现有模块，同参数入口）----
+    collect_started = time.time()          # 时间对齐基准：只对账"采集前已存在"的帖子
     rc, elapsed = collect(MODULE_OF[source], out_root, args, period=period)
     if rc != 0:
         log(f"[{mode}] 采集退出码 {rc} ≠ 0 —— 中止，不进入校验（文档 3-C 第 7 项）")
@@ -349,11 +367,16 @@ def do_run(args, mode: str = "run") -> int:
     scan = {}
     post_check = {"passed": None}
     image_check = {"passed": None}
-    scan = _reconcile.independent_scan(source, period, max_pages=args.max_pages, log=log)
-    post_check = _reconcile.reconcile_posts(posts, scan)
+    scan = _reconcile.independent_scan(
+        source, period, max_pages=args.max_pages, created_before=collect_started, log=log
+    )
+    post_check = _reconcile.reconcile_posts(posts, scan, previous_ids=set(prev_snapshot) or None)
     log(
-        f"[防线1] 帖子对账：源站独立扫描 {post_check['expected']} 帖 / 实际 {post_check['actual']} 帖"
+        f"[防线1] 帖子对账：采集前已存在 {post_check['expected']} 帖 / 产物 {post_check['actual']} 帖"
         f" / 缺 {post_check['missingCount']} / 多 {post_check['extraCount']}"
+        f" / 源站已删 {post_check.get('disappearedCount', 0)}"
+        f" / 时间对齐排除新帖 {post_check.get('lateExcluded', 0)}"
+        f"（其中已采到 {post_check.get('lateButCollected', 0)}）"
         f"  ← {'通过' if post_check['passed'] else '不通过'}"
     )
     if post_check["missingCount"]:
@@ -372,9 +395,7 @@ def do_run(args, mode: str = "run") -> int:
         f"  ← {'通过' if image_check['passed'] else '不通过'}"
     )
 
-    # ---- 防线 3：快照 + 单调性 ----
-    snapshot_file = _state_path(work, source, "snapshot")
-    prev_snapshot = _guard.load_json(snapshot_file, {})
+    # ---- 防线 3：快照 + 单调性（prev_snapshot 已在流程开头读过）----
     curr_snapshot = _guard.build_snapshot(posts)
     reply_total = sum(len(p.get("replies") or []) for p in posts)
     snap_diff = _guard.diff_snapshots(prev_snapshot, curr_snapshot) if prev_snapshot else {"firstRun": True}
@@ -668,6 +689,7 @@ def parse_args(argv=None):
     parser.add_argument("--work", default="", help="工作目录（默认 ./work）")
     parser.add_argument("--out", default="", help="产物输出根")
     parser.add_argument("--store", default="", help="数据仓目录（--cleanup 轮转用）")
+    parser.add_argument("--state", default="", help="状态目录（期号/快照），默认 <work>/state")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--delay", type=float, default=0.05)
     parser.add_argument("--max-pages", type=int, default=200)
