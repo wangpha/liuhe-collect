@@ -1,0 +1,169 @@
+{
+  "pythonVersion": "3.13.12",
+  "pycMagic": "f30d0d0a",
+  "modules": [
+    {
+      "module": "_probe_model",
+      "src": "D:\\qode工作区\\core\\_probe_model.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\_probe_model.pyc",
+      "srcBytes": 2508,
+      "pycBytes": 4522,
+      "sha256": "86d09c31eba5f09dbe2ebba1771c86abbe084145d772654e92de4eee4575849e"
+    },
+    {
+      "module": "analysis",
+      "src": "D:\\qode工作区\\core\\analysis.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\analysis.pyc",
+      "srcBytes": 634459,
+      "pycBytes": 698651,
+      "sha256": "505147efac0c9608e7e6a6e0032a8d260b597bf44ef2c843bf06a36450506175"
+    },
+    {
+      "module": "backfill",
+      "src": "D:\\qode工作区\\core\\backfill.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\backfill.pyc",
+      "srcBytes": 78456,
+      "pycBytes": 99165,
+      "sha256": "cdc90a71943d38a1fa670f52936b49c55ff7c6560b52256fcb0748bba70f9d08"
+    },
+    {
+      "module": "dahkg",
+      "src": "D:\\qode工作区\\core\\dahkg.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\dahkg.pyc",
+      "srcBytes": 44471,
+      "pycBytes": 54504,
+      "sha256": "79c3dc9b84e8d50390dec898c0f280c656c3d90d0cf5d0375fdbfe442b96f71c"
+    },
+    {
+      "module": "fileio",
+      "src": "D:\\qode工作区\\core\\fileio.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\fileio.pyc",
+      "srcBytes": 4010,
+      "pycBytes": 7462,
+      "sha256": "0adf012d2046dc05ad484e302a039689a3390381449ced078401b900c4e3b9d3"
+    },
+    {
+      "module": "forum",
+      "src": "D:\\qode工作区\\core\\forum.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\forum.pyc",
+      "srcBytes": 76869,
+      "pycBytes": 96863,
+      "sha256": "fa1a6d11a3aedaa1ddfdf9e65fef60359b346e535499d4396e0cf20264400cba"
+    },
+    {
+      "module": "history",
+      "src": "D:\\qode工作区\\core\\history.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\history.pyc",
+      "srcBytes": 58982,
+      "pycBytes": 78166,
+      "sha256": "e272c18a20af619253f0c9629b78bbbea5b7d5ec7d49e8166f3a5a27f7bf768a"
+    },
+    {
+      "module": "live",
+      "src": "D:\\qode工作区\\core\\live.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\live.pyc",
+      "srcBytes": 51805,
+      "pycBytes": 73508,
+      "sha256": "bc4d5cc14dcac47c767b14d69a4ecd5b50cb59944b411e14401c2c3fd9a11a83"
+    },
+    {
+      "module": "nethealth",
+      "src": "D:\\qode工作区\\core\\nethealth.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\nethealth.pyc",
+      "srcBytes": 18771,
+      "pycBytes": 25466,
+      "sha256": "3045726ccb754335f0bffe9ba4984e95e37ede7b6d83207b6985d970f70276ff"
+    },
+    {
+      "module": "ocr",
+      "src": "D:\\qode工作区\\core\\ocr.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\ocr.pyc",
+      "srcBytes": 277751,
+      "pycBytes": 318430,
+      "sha256": "287db38bdb744f0a59a0edafe00cf8dd58c21f86a4bdb99ad00df4fcd89c5dd9"
+    },
+    {
+      "module": "ocr_samples",
+      "src": "D:\\qode工作区\\core\\ocr_samples.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\ocr_samples.pyc",
+      "srcBytes": 13279,
+      "pycBytes": 18088,
+      "sha256": "319cde43fc0e33e70769c1d00768d840db4c30d279f238be3acf74f24bcbd9ad"
+    },
+    {
+      "module": "paths",
+      "src": "D:\\qode工作区\\core\\paths.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\paths.pyc",
+      "srcBytes": 3698,
+      "pycBytes": 6272,
+      "sha256": "60f43dd17d89c2dbb17737b2300b60d0cb4e1d378dda42951d59b84cd31bc149"
+    },
+    {
+      "module": "proxypool",
+      "src": "D:\\qode工作区\\core\\proxypool.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\proxypool.pyc",
+      "srcBytes": 8536,
+      "pycBytes": 12877,
+      "sha256": "4dde09f47529e0654c013e113129c2fda67e97f954ea1b5c6532cf994a4ebc1b"
+    },
+    {
+      "module": "ranking",
+      "src": "D:\\qode工作区\\core\\ranking.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\ranking.pyc",
+      "srcBytes": 13234,
+      "pycBytes": 19981,
+      "sha256": "d489dd72d24bcb7eb8792b6fd7f64a7e798ba57c8c7ee6b69809756bb29053a5"
+    },
+    {
+      "module": "report",
+      "src": "D:\\qode工作区\\core\\report.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\report.pyc",
+      "srcBytes": 66056,
+      "pycBytes": 81175,
+      "sha256": "c5924a4f6c93fd83d66f956bfe85eb6ad11fa000f0ac1c85138ea0350d3bed07"
+    },
+    {
+      "module": "scraper",
+      "src": "D:\\qode工作区\\core\\scraper.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\scraper.pyc",
+      "srcBytes": 262925,
+      "pycBytes": 264828,
+      "sha256": "8f72f971d7b520d036ef9e21fb140be74f6b3136b7cf32a5f4a237f3e36237b4"
+    },
+    {
+      "module": "source",
+      "src": "D:\\qode工作区\\core\\source.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\source.pyc",
+      "srcBytes": 3248,
+      "pycBytes": 3877,
+      "sha256": "a56e2734aaed9158f34d8a8877ec308e4815146ab3d2980c5a65a49945575eb4"
+    },
+    {
+      "module": "text_report",
+      "src": "D:\\qode工作区\\core\\text_report.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\text_report.pyc",
+      "srcBytes": 50906,
+      "pycBytes": 63961,
+      "sha256": "564fd252d28f05a84df1be03bd13ce067715fd35def5e64aa245df356b3f6c47"
+    },
+    {
+      "module": "user_content",
+      "src": "D:\\qode工作区\\core\\user_content.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\user_content.pyc",
+      "srcBytes": 38366,
+      "pycBytes": 58470,
+      "sha256": "444d799ba678f0605cfcbc113f788e1b3222ca14af8681ee4c1b3006a20b34bc"
+    },
+    {
+      "module": "user_text",
+      "src": "D:\\qode工作区\\core\\user_text.py",
+      "dst": "D:\\qode工作区\\work\\repo\\liuhe-collect\\cloud\\core\\user_text.pyc",
+      "srcBytes": 44968,
+      "pycBytes": 61750,
+      "sha256": "cdabab99c97358d5397a31a101c6d0979f04bbbb183ece433eca849a0a518d7c"
+    }
+  ],
+  "count": 20,
+  "totalPycBytes": 2048016,
+  "compiledAt": "2026-11-16 09:28:44"
+}

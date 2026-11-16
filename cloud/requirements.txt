@@ -1,0 +1,25 @@
+# 六合采集器 · 云端采集依赖
+# 版本与本地安装版 1.0.128（D:\LiuHeInstalled25\_internal）完全对齐，
+# 因为 R15「OCR 绝不认错」要求云端与本地用同一套模型/同一版库。
+python-dateutil==2.9.0.post0
+requests==2.32.5
+urllib3==2.6.0
+certifi==2026.6.15
+
+# --- OCR（模型随 rapidocr_onnxruntime 1.2.3 包自带：ch_PP-OCRv3_det/rec）---
+rapidocr-onnxruntime==1.2.3
+onnxruntime==1.24.4          # CPU 版；本地用 DirectML 后端但模型与算子一致
+numpy==2.4.3
+opencv-python-headless==4.13.0.92   # runner 无显示环境，headless 避免 libGL 依赖
+pillow==12.1.1
+shapely==2.1.2
+pyclipper==1.4.0
+
+# --- 产物（xlsx）---
+openpyxl==3.1.5
+
+# --- 大港澳接口 AES/CBC 加解密 ---
+pycryptodome==4.4.0
+
+# --- 进程/资源 ---
+psutil==7.2.2
