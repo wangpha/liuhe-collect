@@ -655,24 +655,21 @@ PRODUCTS_DOC_21 = [
     "run_meta.json", "manifest.json",
 ]
 
-#: **CLI 实际产物**（实测 2026-11-16，逐期目录比对出来的）
-#:
-#: 关键事实：文档列的 21 项里，`全站文字版.{json,html,txt}` 与 `report.html`
-#: **不是 CLI 产出的** —— 实测 `core.dahkg` 的 CLI 跑完只有 17 个文件，
-#: 而 314/316 期（用户用 GUI 跑的）有 21 个。所以：
-#:   · 云端（纯 CLI）用 17 项判完整性；
-#:   · 那 4 项属于 GUI 侧产物，CLI 跑不出来，不能因此判"产物不全"。
-PRODUCTS_CLI = [
+#: **CLI 实际产物** —— 2026-11-16 逐源逐文件实测出来的，三源各不一样：
+#:   · dahkg（大港澳） 17 个：没有 全站文字版×3，也没有 report.html
+#:   · aocai（澳彩）   20 个：有 全站文字版×3，没有 report.html
+#:   · tuku （49图库） 22 个：产物名另一套（文字版/当期文字版），无 论坛原帖.html/report.html
+#: 文档 3.5 列的 21 项里，`report.html` 是**GUI 侧**产物，CLI 三源都不生成。
+PRODUCTS_CLI_CORE = [
     "users.json", "users.csv", "posts.json", "posts.csv", "replies.json", "replies.csv",
     "claims.json", "claims.csv", "ocr.json", "ocr.csv", "六合_看板.html",
     "六合_结构化.xlsx", "论坛原帖.html", "report.md", "validation.json",
     "run_meta.json", "manifest.json",
 ]
+PRODUCTS_SITE_TEXT = ["全站文字版.json", "全站文字版.html", "全站文字版.txt"]
 
-#: GUI 侧才会生成的产物（云端不判定，只在报告里说明）
-PRODUCTS_GUI_ONLY = ["全站文字版.json", "全站文字版.html", "全站文字版.txt", "report.html"]
-
-#: 49图库实测产物（22 个，CLI 会生成全站文字版三件套）
+#: 49图库（tuku）实测产物 22 个：产物名另一套（文字版/当期文字版），
+#: 无 `论坛原帖.html` / `report.html`，有 `全站文字版` 三件套
 PRODUCTS_TUKU = [
     "users.json", "users.csv", "posts.json", "posts.csv", "replies.json", "replies.csv",
     "claims.json", "claims.csv", "ocr.json", "ocr.csv", "全站文字版.json",
@@ -682,17 +679,27 @@ PRODUCTS_TUKU = [
 ]
 
 PRODUCTS_BY_SOURCE = {
-    "dahkg": PRODUCTS_CLI,
-    "aocai": PRODUCTS_CLI,
-    "tuku": PRODUCTS_TUKU,
+    "dahkg": PRODUCTS_CLI_CORE,                                   # 17
+    "aocai": PRODUCTS_CLI_CORE + PRODUCTS_SITE_TEXT,              # 20
+    "tuku": PRODUCTS_TUKU,                                        # 22
 }
 
-#: 兼容旧名字（自检里引用 21 项）
+#: 各源的 GUI 侧额外产物（云端不判定，只在报告里说明）
+PRODUCTS_GUI_ONLY_BY_SOURCE = {
+    "dahkg": PRODUCTS_SITE_TEXT + ["report.html"],
+    "aocai": ["report.html"],
+    "tuku": [],
+}
+
+#: 兼容旧名字
+PRODUCTS_CLI = PRODUCTS_CLI_CORE
+PRODUCTS_GUI_ONLY = PRODUCTS_SITE_TEXT + ["report.html"]
 PRODUCTS_21 = PRODUCTS_DOC_21
 
 
 def check_products(out_dir: Path, source: str = "dahkg") -> dict:
-    expected_names = PRODUCTS_BY_SOURCE.get(source, PRODUCTS_CLI)
+    expected_names = PRODUCTS_BY_SOURCE.get(source, PRODUCTS_CLI_CORE)
+    gui_only = PRODUCTS_GUI_ONLY_BY_SOURCE.get(source, [])
     present, missing, sizes = [], [], {}
     for name in expected_names:
         p = out_dir / name
@@ -701,14 +708,14 @@ def check_products(out_dir: Path, source: str = "dahkg") -> dict:
             sizes[name] = p.stat().st_size
         else:
             missing.append(name)
-    gui_present = [n for n in PRODUCTS_GUI_ONLY if (out_dir / n).exists()]
+    gui_present = [n for n in gui_only if (out_dir / n).exists()]
     return {
         "source": source,
         "expected": len(expected_names),
         "present": len(present),
         "missing": missing,
         "sizes": sizes,
-        "guiOnlyExpected": PRODUCTS_GUI_ONLY,
+        "guiOnlyExpected": gui_only,
         "guiOnlyPresent": gui_present,
         "passed": not missing,
     }

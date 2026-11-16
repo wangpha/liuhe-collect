@@ -379,36 +379,52 @@ def do_run(args, mode: str = "run") -> int:
     scan = _reconcile.independent_scan(
         source, period, max_pages=args.max_pages, created_before=collect_started, log=log
     )
-    # 「产物有、列表没扫到」的候选，先逐帖向源站详情求证，再分类
-    got_ids = {int(p.get("articleId") or 0) for p in posts if p.get("articleId")}
-    late_ids = {int(x) for x in (scan.get("lateIds") or [])}
-    want_ids = set(scan.get("unionIds") or [])
-    candidates = sorted(got_ids - want_ids - late_ids)
-    probe = _reconcile.probe_details(source, candidates, log=log, target_period=period) if candidates else None
-    post_check = _reconcile.reconcile_posts(
-        posts,
-        scan,
-        previous_ids=set(prev_snapshot) or None,
-        probe=probe,
-        target_period=period,
-    )
-    log(
-        f"[防线1] 帖子对账：采集前已存在 {post_check['expected']} 帖 / 产物 {post_check['actual']} 帖"
-        f" / 缺 {post_check['missingCount']}"
-        f" / 扫描盲区(源站确认存在) {post_check['scanGapCount']}"
-        f" / 源站已删 {post_check['disappearedCount']}"
-        f" / 幽灵(源站无且上轮无) {post_check['phantomCount']}"
-        f" / 时间对齐排除 {post_check['lateExcluded']}"
-        f"  ← {'通过' if post_check['passed'] else '不通过'}"
-    )
-    if post_check["missingCount"]:
-        log(f"[防线1] 漏帖样本（前 20）：{post_check['missing'][:20]}")
-    if post_check["phantomCount"]:
-        log(f"[防线1] 幽灵帖样本（前 20）：{post_check['phantom'][:20]}")
-    if post_check["scanGapCount"]:
-        log(f"[防线1] 扫描盲区样本（前 20，源站详情已确认存在）：{post_check['scanGap'][:20]}")
-    if post_check["disappearedCount"]:
-        log(f"[防线1] 源站已删样本（前 20）：{post_check['disappeared'][:20]}")
+    if args.limit:
+        # `--limit N` 是**故意只抓 N 条**，产物天然比源站少 —— 完整性对账在这种跑法下无意义。
+        # 明确写出来并跳过，而不是让它误报"漏帖 N 条"。
+        log(
+            f"[防线1] 本次为限量运行（--limit {args.limit}）："
+            f"源站本期 {len(scan.get('unionIds') or [])} 帖，产物 {len(posts)} 帖，"
+            "**跳过完整性对账**（限量跑不用于验收）"
+        )
+        probe = None
+        post_check = {"passed": True, "limited": True, "expected": len(scan.get("unionIds") or []),
+                      "actual": len(posts), "missingCount": 0, "scanGapCount": 0, "disappearedCount": 0,
+                      "phantomCount": 0, "unverifiedCount": 0, "lateExcluded": len(scan.get("lateIds") or []),
+                      "lateButCollected": 0, "missing": [], "scanGap": [], "disappeared": [],
+                      "phantom": [], "unverified": []}
+    else:
+        # 「产物有、列表没扫到」的候选，先逐帖向源站详情求证，再分类
+        got_ids = {int(p.get("articleId") or 0) for p in posts if p.get("articleId")}
+        late_ids = {int(x) for x in (scan.get("lateIds") or [])}
+        want_ids = set(scan.get("unionIds") or [])
+        candidates = sorted(got_ids - want_ids - late_ids)
+        probe = _reconcile.probe_details(source, candidates, log=log, target_period=period) if candidates else None
+        post_check = _reconcile.reconcile_posts(
+            posts,
+            scan,
+            previous_ids=set(prev_snapshot) or None,
+            probe=probe,
+            target_period=period,
+        )
+        log(
+            f"[防线1] 帖子对账：采集前已存在 {post_check['expected']} 帖 / 产物 {post_check['actual']} 帖"
+            f" / 缺 {post_check['missingCount']}"
+            f" / 扫描盲区(源站确认存在) {post_check['scanGapCount']}"
+            f" / 源站已删 {post_check['disappearedCount']}"
+            f" / 幽灵(源站无且上轮无) {post_check['phantomCount']}"
+            f" / 待复核(求证不可用) {post_check.get('unverifiedCount', 0)}"
+            f" / 时间对齐排除 {post_check['lateExcluded']}"
+            f"  ← {'通过' if post_check['passed'] else '不通过'}"
+        )
+        if post_check["missingCount"]:
+            log(f"[防线1] 漏帖样本（前 20）：{post_check['missing'][:20]}")
+        if post_check["phantomCount"]:
+            log(f"[防线1] 幽灵帖样本（前 20）：{post_check['phantom'][:20]}")
+        if post_check["scanGapCount"]:
+            log(f"[防线1] 扫描盲区样本（前 20，源站详情已确认存在）：{post_check['scanGap'][:20]}")
+        if post_check["disappearedCount"]:
+            log(f"[防线1] 源站已删样本（前 20）：{post_check['disappeared'][:20]}")
 
     image_roots = [p for p in out_dir.rglob("images") if p.is_dir()]
     require_files = image_roots[0].parent if image_roots else None
@@ -676,19 +692,19 @@ def do_selftest(args) -> int:
         assert good["hitCount"] == 0 and good["passed"], f"正常文本被误判：{good}"
         return f"命中 1 / 干净文本 0"
 
-    # 产物清单自洽（文档参照 21 项 / CLI 实产 17 项 / 图库 22 项，各自不重复）
+    # 产物清单自洽（逐源实测：dahkg 17 / aocai 20 / tuku 22；文档 21 = 核心17 + 文字版3 + report.html）
     def case_products():
         from . import _reconcile as R
 
         assert len(R.PRODUCTS_DOC_21) == 21, f"文档参照清单应为 21 项，实际 {len(R.PRODUCTS_DOC_21)}"
         assert len(set(R.PRODUCTS_DOC_21)) == 21, "文档参照清单有重复项"
-        assert len(R.PRODUCTS_CLI) == 17, f"CLI 实产清单应为 17 项，实际 {len(R.PRODUCTS_CLI)}"
-        assert len(set(R.PRODUCTS_CLI)) == 17, "CLI 实产清单有重复项"
-        assert len(R.PRODUCTS_TUKU) == 22, f"图库清单应为 22 项，实际 {len(R.PRODUCTS_TUKU)}"
-        assert len(set(R.PRODUCTS_TUKU)) == 22, "图库清单有重复项"
-        assert set(R.PRODUCTS_CLI) | set(R.PRODUCTS_GUI_ONLY) == set(R.PRODUCTS_DOC_21), \
-            "CLI + GUI 两类合起来应正好等于文档的 21 项"
-        return "文档21 = CLI17 + GUI4；图库22，均无重复"
+        assert len(R.PRODUCTS_CLI_CORE) == 17, f"核心 CLI 产物应为 17 项，实际 {len(R.PRODUCTS_CLI_CORE)}"
+        expect = {"dahkg": 17, "aocai": 20, "tuku": 22}
+        got = {k: len(v) for k, v in R.PRODUCTS_BY_SOURCE.items()}
+        assert got == expect, f"逐源产物数不符：实际 {got}，期望 {expect}"
+        assert set(R.PRODUCTS_CLI_CORE) | set(R.PRODUCTS_SITE_TEXT) | {"report.html"} == set(R.PRODUCTS_DOC_21), \
+            "核心17 + 文字版3 + report.html 应正好等于文档 21 项"
+        return f"逐源 17/20/22 项；文档21 = 核心17 + 文字版3 + report.html"
 
     for name, fn in [
         ("1.5 分片分配不变式", case_shard),
