@@ -8,12 +8,17 @@ on:
         required: false
         default: '测 4/8 线程在真实 runner 上的表现'
 
+permissions:
+  contents: write
+
 jobs:
   bench:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 输出真实机器信息
         run: |
@@ -26,7 +31,7 @@ jobs:
           echo "===== 磁盘 ====="
           df -h / | tail -1
           echo ""
-          echo "===== 是否被限流（cgroup）====="
+          echo "===== cgroup 配额（看是否被限流）====="
           cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo "无 cgroup v2 cpu.max"
           cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || true
 
@@ -46,13 +51,18 @@ jobs:
           QODE_OCR_DML: "0"
         run: |
           python bench_threads.py 2>&1 | tee bench.log
+          echo "--- 退出码: $? ---"
 
-      - name: 上传结果
+      - name: 把结果提交回仓库（避免依赖 artifact API）
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bench-result-${{ github.run_id }}
-          path: |
-            bench.log
-            bench_result.json
-          if-no-files-found: warn
+        run: |
+          mkdir -p bench_out
+          cp -f bench.log bench_out/bench_${{ github.run_id }}.log 2>/dev/null || true
+          cp -f bench_result.json bench_out/result_${{ github.run_id }}.json 2>/dev/null || true
+          cp -f /tmp/lscpu.txt bench_out/ 2>/dev/null || lscpu > bench_out/lscpu_${{ github.run_id }}.txt
+          free -h > bench_out/mem_${{ github.run_id }}.txt
+          git config user.name "bench-bot"
+          git config user.email "bench@local"
+          git add bench_out
+          git commit -m "bench: run ${{ github.run_id }}" || echo "无变化"
+          git push || echo "push 失败（继续）"
