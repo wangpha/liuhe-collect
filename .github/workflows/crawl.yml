@@ -68,7 +68,7 @@ env:
   PYTHONIOENCODING: "utf-8"
   # 每源分片数（唯一事实源）：plan 用它算「按累计图片数」的均衡分组，
   # shard job 的 matrix 用它取下标 —— 两处必须同源，否则分组与下标对不上。
-  SHARD_MAP: "dahkg:11,aocai:4,tuku:3"
+  SHARD_MAP: "dahkg:14,aocai:3,tuku:2"
 
 jobs:
   # ---------------- JobP：决定跑哪些源 + 每源分片数 ----------------
@@ -96,9 +96,9 @@ jobs:
             tuku|aocai|dahkg) echo "sources=[\"$REQ\"]" >> "$GITHUB_OUTPUT" ;;
             *) echo "未知源: $REQ" >&2; exit 2 ;;
           esac
-          python -c "import json;n=11;print('shards_dahkg='+json.dumps(list(range(n))));print('count_dahkg='+str(n))" >> "$GITHUB_OUTPUT"
-          python -c "import json;n=4;print('shards_aocai='+json.dumps(list(range(n))));print('count_aocai='+str(n))" >> "$GITHUB_OUTPUT"
-          python -c "import json;n=3;print('shards_tuku='+json.dumps(list(range(n))));print('count_tuku='+str(n))" >> "$GITHUB_OUTPUT"
+          python -c "import json;n=14;print('shards_dahkg='+json.dumps(list(range(n))));print('count_dahkg='+str(n))" >> "$GITHUB_OUTPUT"
+          python -c "import json;n=3;print('shards_aocai='+json.dumps(list(range(n))));print('count_aocai='+str(n))" >> "$GITHUB_OUTPUT"
+          python -c "import json;n=2;print('shards_tuku='+json.dumps(list(range(n))));print('count_tuku='+str(n))" >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
 
   # ---------------- Job 0：清理（图片 2 天轮转 + 产物 30 期轮转）----------------
@@ -188,7 +188,7 @@ jobs:
             repo/work/plan_${{ matrix.source }}.log
           if-no-files-found: error
 
-  # ---------------- 分片 dahkg：#=0..10 （并行预热缓存）----------------
+  # ---------------- 分片 dahkg：#=0..13 （并行预热缓存）----------------
   shard_dahkg:
     name: "分片 dahkg#${{ matrix.shard }}"
     needs: [plan, prepare]
@@ -277,7 +277,7 @@ jobs:
             repo/work/shard_dahkg_${{ matrix.shard }}.log
           if-no-files-found: warn
 
-  # ---------------- 分片 aocai：#=0..3 （并行预热缓存）----------------
+  # ---------------- 分片 aocai：#=0..2 （并行预热缓存）----------------
   shard_aocai:
     name: "分片 aocai#${{ matrix.shard }}"
     needs: [plan, prepare]
@@ -366,7 +366,7 @@ jobs:
             repo/work/shard_aocai_${{ matrix.shard }}.log
           if-no-files-found: warn
 
-  # ---------------- 分片 tuku：#=0..2 （并行预热缓存）----------------
+  # ---------------- 分片 tuku：#=0..1 （并行预热缓存）----------------
   shard_tuku:
     name: "分片 tuku#${{ matrix.shard }}"
     needs: [plan, prepare]
