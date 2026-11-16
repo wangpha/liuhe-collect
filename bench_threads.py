@@ -14,7 +14,19 @@ from pathlib import Path
 
 os.environ["QODE_OCR_DML"] = "0"   # CI 无 GPU，强制 CPU
 
-from core import ocr
+# 仓库结构：cloud/core/*.pyc，所以把 cloud/ 加进 sys.path 才能 from core import ocr
+_ROOT = Path(__file__).resolve().parent
+for _p in (str(_ROOT / "cloud"), str(_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+try:
+    from core import ocr
+except ImportError as _exc:  # 给出可诊断的报错，而不是裸 ImportError
+    print(f"[错误] 无法导入 core.ocr: {_exc}")
+    print(f"  sys.path 前 5 项: {sys.path[:5]}")
+    print(f"  cloud/core 存在: {(Path(_ROOT) / 'cloud' / 'core').exists()}")
+    raise SystemExit(1)
 
 
 def machine_info() -> dict:
