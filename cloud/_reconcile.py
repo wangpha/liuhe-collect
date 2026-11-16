@@ -482,15 +482,18 @@ def _fetch_page_retry(fetch, label: str, say, page_errors: list[dict], meta: dic
 # 「这帖在源站还在不在」——逐帖求证（判定多出/幽灵的唯一可靠依据）
 # ---------------------------------------------------------------------------
 def _classify_probe_error(exc: BaseException) -> str:
-    """区分「源站明确说没有这帖」与「我们没法确认」。
+    """区分「源站明确说没有这帖」与「源站拒绝提供 / 我们无法确认」。
 
-    2026-11-16 实测教训：aocai 的详情接口对不存在的 tid 返回空 body → 抛
-    `RuntimeError: 论坛接口不可用：/getbbsreply（Expecting value: line 1 column 1 (char 0)）`。
-    这是"明确没有"。但如果是超时/连接错误，就**不能**当成"帖子被删了" ——
-    否则一次网络抖动会把真实帖子判成"幽灵"，直接让门禁误失败（本轮就是这样）。
+    2026-11-16 实测（aocai，3 次重试均为同一结果）：
+        tid 3223956 / 3223957 / 3223992 →
+        `RuntimeError: 论坛接口不可用：/getbbsreply（Expecting value: line 1 column 1 (char 0)）`
+    这三个 tid **确实出现在列表里**（模块正是从列表行建出的产物），只是详情接口拒绝提供内容。
+    所以 `Expecting value`（空 body）**不能**当成"帖子不存在" —— 它同样可能来自限流/接口异常。
+    只有真正表示"资源不存在"的信号才判 absent：HTTP 404/410、或明确的"不存在/没有找到"。
+    其余（空 body、超时、连接错误、5xx）一律 unknown → 记"待复核"，**不判失败**（不冤枉数据）。
     """
     text = f"{type(exc).__name__}: {exc}"
-    absent_markers = ("Expecting value", "404", "410", "不存在", "没有找到")
+    absent_markers = ("404", "410", "不存在", "没有找到")
     return "absent" if any(m in text for m in absent_markers) else "unknown"
 
 
