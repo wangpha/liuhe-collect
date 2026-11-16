@@ -395,25 +395,119 @@ def independent_scan(
 
 
 # ---------------------------------------------------------------------------
+# 「这帖在源站还在不在」——逐帖求证（判定多出/幽灵的唯一可靠依据）
+# ---------------------------------------------------------------------------
+def probe_details(source: str, ids: list[int], log: Callable[[str], None] | None = None) -> dict:
+    """逐帖调源站**详情接口**确认存在性。
+
+    为什么必须有这一步（2026-11-16 实测，期号 320）：
+      列表接口每个排序窗口只给 1000 行且顺序不稳定（同一秒内多次请求返回的行集合会变），
+      所以「独立扫描看不到某帖」**不等于**「产物里那帖是错的」：
+      实测 42969692 / 42969732 / 42969831 三帖在列表 10 个窗口前 55 页都找不到，
+      但详情接口都能正常返回 period=320 —— 那是**扫描盲区**，不是漏抓也不是多抓。
+
+    返回 {"exists": {id: bool}, "periods": {id: period}}
+    """
+    import time as _time
+
+    say = log or (lambda message: None)
+    exists: dict[int, bool] = {}
+    periods: dict[int, int] = {}
+
+    if source == "tuku":
+        from core import scraper
+
+        for aid in ids:
+            try:
+                raw = scraper.api_get("/unite49/h5/article/detail", {"articleId": aid}, delay=0)
+                ok = isinstance(raw, dict) and int(raw.get("articleId") or 0) == int(aid)
+                exists[aid] = ok
+                if ok:
+                    periods[aid] = normalize_period(raw.get("period"))
+            except Exception as exc:  # noqa: BLE001 - 详情失败=源站已无该帖
+                exists[aid] = False
+                say(f"[求证] tuku {aid} 详情不可得：{type(exc).__name__}: {str(exc)[:80]}")
+            _time.sleep(0.05)
+
+    elif source == "dahkg":
+        from core import dahkg
+
+        for aid in ids:
+            try:
+                raw = dahkg.fetch_detail(aid)
+                ok = isinstance(raw, dict) and bool(raw)
+                exists[aid] = ok
+                if ok:
+                    periods[aid] = normalize_period(raw.get("periods") or raw.get("period"))
+            except Exception as exc:  # noqa: BLE001
+                exists[aid] = False
+                say(f"[求证] dahkg {aid} 详情不可得：{type(exc).__name__}: {str(exc)[:80]}")
+            _time.sleep(0.05)
+
+    else:
+        say(f"[求证] {source} 暂无详情求证实现（只靠快照分类）")
+        for aid in ids:
+            exists[aid] = False
+
+    alive = sum(1 for v in exists.values() if v)
+    say(f"[求证] {source}: 求证 {len(ids)} 帖，源站仍在 {alive}，已消失 {len(ids) - alive}")
+    return {"exists": exists, "periods": periods}
+
+
+# ---------------------------------------------------------------------------
 # 防线 1 第 2 道：帖子数对账
 # ---------------------------------------------------------------------------
-def reconcile_posts(posts: list[dict], scan: dict, previous_ids: set[int] | None = None) -> dict:
+def reconcile_posts(
+    posts: list[dict],
+    scan: dict,
+    previous_ids: set[int] | None = None,
+    probe: dict | None = None,
+    target_period: int = 0,
+) -> dict:
     """帖子数对账。
 
-    `lateIds`（采集开始后新发的帖子）两边都不计入：
-      * 不可能出现在"应当存在"的集合里（采集开始时还没有）；
-      * 但确实可能出现于产物里（采集途中翻到了）—— 那也不算"多出"。
-    `previous_ids`（上轮快照里的 ID）：产物里有、当前列表没有、上轮快照有
-      → 判为「源站删帖/隐藏」，属正常（文档防线3 第3道），不计入失败，但必须列出。
+    分类（每一类都明写，不静默）：
+      * `missing`      源站列表有、产物没有 → **漏帖，硬失败**（R11 红线）
+      * `scanGap`      产物有、列表没扫到、但**详情接口证明它存在且期号正确**
+                       → 属列表窗口(1000 行上限 + 顺序不稳)的扫描盲区，不是漏抓，不判失败
+      * `disappeared`  产物有、列表没扫到、**详情接口证明已不在源站**
+                       → 源站删帖（文档防线3 第3道），如实记录，不判失败
+      * `phantom`      产物有、列表没扫到、详情拿不到且上轮快照也没有 → **疑似垃圾数据，硬失败**
+      * `late`         采集开始之后才出现/变更的帖子 → 两边都不计入（时间对齐）
     """
     got = {int(p.get("articleId") or 0) for p in posts if p.get("articleId")}
     late = {int(x) for x in (scan.get("lateIds") or [])}
     prev = {int(x) for x in (previous_ids or set())}
     want = set(scan.get("unionIds") or [])
+    want_period = normalize_period(target_period) or int(scan.get("period") or 0)
+
     missing = sorted(want - got)
     extra_all = got - want - late
-    disappeared = sorted(extra_all & prev)      # 源站删帖：上轮快照证明它存在过
-    extra = sorted(extra_all - prev)            # 真·多出：上轮也没有它
+    probe_exists = (probe or {}).get("exists") or {}
+    probe_periods = (probe or {}).get("periods") or {}
+
+    scan_gap: list[int] = []
+    disappeared: list[int] = []
+    phantom: list[int] = []
+    for aid in sorted(extra_all):
+        if aid in probe_exists:
+            if probe_exists[aid]:
+                period_ok = (not want_period) or (normalize_period(probe_periods.get(aid)) == want_period)
+                if period_ok:
+                    scan_gap.append(aid)
+                else:
+                    # 源站有这帖，但期号不是本期 → 内容归属错了，必须失败
+                    phantom.append(aid)
+                continue
+            # 源站已无此帖
+            if aid in prev:
+                disappeared.append(aid)
+            else:
+                phantom.append(aid)
+        else:
+            # 没求证过的（澳彩暂未实现求证）→ 退回快照判据
+            disappeared.append(aid) if aid in prev else phantom.append(aid)
+
     late_in_products = sorted(got & late)
     return {
         "expected": len(want),
@@ -421,12 +515,15 @@ def reconcile_posts(posts: list[dict], scan: dict, previous_ids: set[int] | None
         "lateExcluded": len(late),
         "lateButCollected": len(late_in_products),
         "missingCount": len(missing),
-        "extraCount": len(extra),
+        "scanGapCount": len(scan_gap),
         "disappearedCount": len(disappeared),
+        "phantomCount": len(phantom),
+        "extraCount": len(scan_gap) + len(disappeared) + len(phantom),
         "missing": missing[:50],
-        "extra": extra[:50],
+        "scanGap": scan_gap[:50],
         "disappeared": disappeared[:50],
-        "passed": not missing and not extra,
+        "phantom": phantom[:50],
+        "passed": not missing and not phantom,
     }
 
 

@@ -370,15 +370,32 @@ def do_run(args, mode: str = "run") -> int:
     scan = _reconcile.independent_scan(
         source, period, max_pages=args.max_pages, created_before=collect_started, log=log
     )
-    post_check = _reconcile.reconcile_posts(posts, scan, previous_ids=set(prev_snapshot) or None)
+    # 「产物有、列表没扫到」的候选，先逐帖向源站详情求证，再分类
+    got_ids = {int(p.get("articleId") or 0) for p in posts if p.get("articleId")}
+    late_ids = {int(x) for x in (scan.get("lateIds") or [])}
+    want_ids = set(scan.get("unionIds") or [])
+    candidates = sorted(got_ids - want_ids - late_ids)
+    probe = _reconcile.probe_details(source, candidates, log=log) if candidates else None
+    post_check = _reconcile.reconcile_posts(
+        posts,
+        scan,
+        previous_ids=set(prev_snapshot) or None,
+        probe=probe,
+        target_period=period,
+    )
     log(
         f"[防线1] 帖子对账：采集前已存在 {post_check['expected']} 帖 / 产物 {post_check['actual']} 帖"
-        f" / 缺 {post_check['missingCount']} / 多 {post_check['extraCount']}"
-        f" / 源站已删 {post_check.get('disappearedCount', 0)}"
-        f" / 时间对齐排除新帖 {post_check.get('lateExcluded', 0)}"
-        f"（其中已采到 {post_check.get('lateButCollected', 0)}）"
+        f" / 缺 {post_check['missingCount']}"
+        f" / 扫描盲区(源站确认存在) {post_check['scanGapCount']}"
+        f" / 源站已删 {post_check['disappearedCount']}"
+        f" / 幽灵(源站无且上轮无) {post_check['phantomCount']}"
+        f" / 时间对齐排除 {post_check['lateExcluded']}"
         f"  ← {'通过' if post_check['passed'] else '不通过'}"
     )
+    if post_check["missingCount"]:
+        log(f"[防线1] 漏帖样本（前 20）：{post_check['missing'][:20]}")
+    if post_check["phantomCount"]:
+        log(f"[防线1] 幽灵帖样本（前 20）：{post_check['phantom'][:20]}")
     if post_check["missingCount"]:
         log(f"[防线1] 缺失样本（前 20）：{post_check['missing'][:20]}")
     if post_check["extraCount"]:
