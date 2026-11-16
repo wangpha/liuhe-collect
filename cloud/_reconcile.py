@@ -481,11 +481,25 @@ def _fetch_page_retry(fetch, label: str, say, page_errors: list[dict], meta: dic
 # ---------------------------------------------------------------------------
 # 「这帖在源站还在不在」——逐帖求证（判定多出/幽灵的唯一可靠依据）
 # ---------------------------------------------------------------------------
+def _classify_probe_error(exc: BaseException) -> str:
+    """区分「源站明确说没有这帖」与「我们没法确认」。
+
+    2026-11-16 实测教训：aocai 的详情接口对不存在的 tid 返回空 body → 抛
+    `RuntimeError: 论坛接口不可用：/getbbsreply（Expecting value: line 1 column 1 (char 0)）`。
+    这是"明确没有"。但如果是超时/连接错误，就**不能**当成"帖子被删了" ——
+    否则一次网络抖动会把真实帖子判成"幽灵"，直接让门禁误失败（本轮就是这样）。
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    absent_markers = ("Expecting value", "404", "410", "不存在", "没有找到")
+    return "absent" if any(m in text for m in absent_markers) else "unknown"
+
+
 def probe_details(
     source: str,
     ids: list[int],
     log: Callable[[str], None] | None = None,
     target_period: int = 0,
+    attempts: int = 3,
 ) -> dict:
     """逐帖调源站**详情接口**确认存在性。
 
@@ -495,71 +509,120 @@ def probe_details(
       实测 42969692 / 42969732 / 42969831 三帖在列表 10 个窗口前 55 页都找不到，
       但详情接口都能正常返回 period=320 —— 那是**扫描盲区**，不是漏抓也不是多抓。
 
-    返回 {"exists": {id: bool}, "periods": {id: period}}
+    返回 {"exists": {id: bool}, "unknown": set(ids), "periods": {id: period}}
+      · exists True  → 源站确认还在
+      · exists False → 源站**明确**没有（或重试后仍拿不到明确结论之外的确定不存在）
+      · unknown      → 重试用尽仍是网络/接口类错误 → **不判定**，交人工复核（不冤枉数据）
     """
     import time as _time
 
     say = log or (lambda message: None)
     exists: dict[int, bool] = {}
     periods: dict[int, int] = {}
+    unknown: set[int] = set()
+
+    def record(aid: int, ok: bool, period: int = 0, kind: str = "") -> None:
+        exists[aid] = ok
+        if ok and period:
+            periods[aid] = period
+        if kind == "unknown":
+            unknown.add(aid)
 
     if source == "tuku":
         from core import scraper
 
         for aid in ids:
-            try:
-                raw = scraper.api_get("/unite49/h5/article/detail", {"articleId": aid}, delay=0)
-                ok = isinstance(raw, dict) and int(raw.get("articleId") or 0) == int(aid)
-                exists[aid] = ok
-                if ok:
-                    periods[aid] = normalize_period(raw.get("period"))
-            except Exception as exc:  # noqa: BLE001 - 详情失败=源站已无该帖
-                exists[aid] = False
-                say(f"[求证] tuku {aid}: 源站已无此帖（详情接口无有效返回，符合预期）")
+            last: Exception | None = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    raw = scraper.api_get("/unite49/h5/article/detail", {"articleId": aid}, delay=0)
+                    ok = isinstance(raw, dict) and int(raw.get("articleId") or 0) == int(aid)
+                    record(aid, ok, normalize_period((raw or {}).get("period")))
+                    last = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last = exc
+                    if attempt < attempts:
+                        _time.sleep(0.6 * attempt)
+            if last is not None:
+                kind = _classify_probe_error(last)
+                if kind == "absent":
+                    record(aid, False)
+                    say(f"[求证] tuku {aid}: 源站明确无此帖（{str(last)[:60]}）")
+                else:
+                    record(aid, False, kind="unknown")
+                    say(f"[求证] tuku {aid}: 无法确认（{type(last).__name__}），记为待复核")
             _time.sleep(0.05)
 
     elif source == "dahkg":
         from core import dahkg
 
         for aid in ids:
-            try:
-                raw = dahkg.fetch_detail(aid)
-                ok = isinstance(raw, dict) and bool(raw)
-                exists[aid] = ok
-                if ok:
-                    periods[aid] = normalize_period(raw.get("periods") or raw.get("period"))
-            except Exception as exc:  # noqa: BLE001
-                exists[aid] = False
-                say(f"[求证] dahkg {aid}: 源站已无此帖（详情接口无有效返回，符合预期）")
+            last: Exception | None = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    raw = dahkg.fetch_detail(aid)
+                    ok = isinstance(raw, dict) and bool(raw)
+                    record(aid, ok, normalize_period((raw or {}).get("periods") or (raw or {}).get("period")))
+                    last = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last = exc
+                    if attempt < attempts:
+                        _time.sleep(0.6 * attempt)
+            if last is not None:
+                kind = _classify_probe_error(last)
+                if kind == "absent":
+                    record(aid, False)
+                    say(f"[求证] dahkg {aid}: 源站明确无此帖（{str(last)[:60]}）")
+                else:
+                    record(aid, False, kind="unknown")
+                    say(f"[求证] dahkg {aid}: 无法确认（{type(last).__name__}），记为待复核")
             _time.sleep(0.05)
 
     elif source == "aocai":
         from core import forum as forum_mod
 
         for aid in ids:
-            try:
-                raw = forum_mod.fetch_thread_detail(aid, 0, include_replies=False, delay=0.0, max_pages=1)
-                tiezi = (raw or {}).get("tiezi") or {}
-                ok = bool(tiezi)
-                exists[aid] = ok
-                if ok:
-                    # 实测（2026-11-16）：详情里 `qs` 常为 0，期号只能靠标题标记推断
-                    periods[aid] = normalize_period(
-                        forum_mod.infer_item_period(tiezi, target_period)
+            last: Exception | None = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    raw = forum_mod.fetch_thread_detail(aid, 0, include_replies=False, delay=0.0, max_pages=1)
+                    tiezi = (raw or {}).get("tiezi") or {}
+                    ok = bool(tiezi)
+                    record(
+                        aid,
+                        ok,
+                        normalize_period(forum_mod.infer_item_period(tiezi, target_period)) if ok else 0,
                     )
-            except Exception as exc:  # noqa: BLE001 - 不存在时接口会直接报错，属预期
-                exists[aid] = False
-                say(f"[求证] aocai {aid}: 源站已无此帖（详情接口无有效返回，符合预期）")
+                    last = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last = exc
+                    if attempt < attempts:
+                        _time.sleep(0.6 * attempt)
+            if last is not None:
+                kind = _classify_probe_error(last)
+                if kind == "absent":
+                    record(aid, False)
+                    say(f"[求证] aocai {aid}: 源站明确无此帖（{str(last)[:60]}）")
+                else:
+                    record(aid, False, kind="unknown")
+                    say(f"[求证] aocai {aid}: 无法确认（{type(last).__name__}），记为待复核")
             _time.sleep(0.05)
 
     else:
         say(f"[求证] {source} 暂无详情求证实现（只靠快照分类）")
         for aid in ids:
+            unknown.add(aid)
             exists[aid] = False
 
     alive = sum(1 for v in exists.values() if v)
-    say(f"[求证] {source}: 求证 {len(ids)} 帖，源站仍在 {alive}，已消失 {len(ids) - alive}")
-    return {"exists": exists, "periods": periods}
+    say(
+        f"[求证] {source}: 求证 {len(ids)} 帖，源站仍在 {alive}，"
+        f"明确已消失 {len(ids) - alive - len(unknown)}，无法确认 {len(unknown)}"
+    )
+    return {"exists": exists, "periods": periods, "unknown": unknown}
 
 
 def probe_image_urls(urls: list[str], log: Callable[[str], None] | None = None, timeout: float = 15.0) -> dict:
@@ -642,6 +705,7 @@ def reconcile_posts(
     extra_all = got - want - late
     probe_exists = (probe or {}).get("exists") or {}
     probe_periods = (probe or {}).get("periods") or {}
+    probe_unknown = set((probe or {}).get("unknown") or ())
 
     scan_gap: list[int] = []
     disappeared: list[int] = []
@@ -651,6 +715,10 @@ def reconcile_posts(
     for aid in sorted(extra_all):
         if not probe_available:
             # 求证整体不可用（接口故障）→ 不冤枉产物，也不静默：单列待人工复核
+            unverified.append(aid)
+            continue
+        if aid in probe_unknown:
+            # 求证请求失败（超时/接口异常，重试 3 次仍无明确结论）→ 不冤枉产物，单列待复核
             unverified.append(aid)
             continue
         if aid in probe_exists:

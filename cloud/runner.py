@@ -550,7 +550,7 @@ def do_run(args, mode: str = "run") -> int:
         f"  ← {'通过' if image_check['passed'] else '不通过'}"
     )
     if image_check.get("unrecoverable"):
-        log(f"[防线2] 源站物理不可救清单（如实列出，不算失败）：{[u['url'][:80] for u in image_check['unrecoverable'][:5]]}")
+        log(f"[防线2] 源站物理不可救清单（如实列出，不阻塞门禁）：{[u['url'][:80] for u in image_check['unrecoverable'][:5]]}")
 
     # ---- 防线 3：快照 + 单调性（prev_snapshot 已在流程开头读过）----
     curr_snapshot = _guard.build_snapshot(posts)
@@ -903,4 +903,5 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
