@@ -454,7 +454,8 @@ jobs:
   merge_dahkg:
     name: "合并 dahkg"
     needs: [plan, prepare, shard_dahkg]
-    if: always() && !cancelled()
+    # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
+    if: always() && !cancelled() && contains(needs.plan.outputs.sources, 'dahkg')
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     steps:
@@ -572,7 +573,8 @@ jobs:
   merge_aocai:
     name: "合并 aocai"
     needs: [plan, prepare, shard_aocai]
-    if: always() && !cancelled()
+    # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
+    if: always() && !cancelled() && contains(needs.plan.outputs.sources, 'aocai')
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     steps:
@@ -690,7 +692,8 @@ jobs:
   merge_tuku:
     name: "合并 tuku"
     needs: [plan, prepare, shard_tuku]
-    if: always() && !cancelled()
+    # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
+    if: always() && !cancelled() && contains(needs.plan.outputs.sources, 'tuku')
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     steps:
