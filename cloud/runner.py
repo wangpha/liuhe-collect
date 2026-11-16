@@ -260,6 +260,105 @@ def _load_image_cost(state_dir: Path, source: str) -> dict:
     return cost if isinstance(cost, dict) else {}
 
 
+def _prefetch_post_costs(
+    source: str,
+    ids: list[int],
+    log,
+    workers: int = 16,
+    delay: float = 0.02,
+) -> dict:
+    """**只抓详情 + 回复**（不下载图片、不 OCR），算出每帖的真实图数与 det 面积。
+
+    ## 为什么必须在 prepare 阶段做（v6，2026-11-17 用户设计）
+    v4 用「上一轮产物里的每帖图数」当权重，但**新期第一轮没有历史**，
+    而第一轮恰恰是最慢的一轮（实测 34.2 分钟）。每天第一次跑就是第一轮，
+    所以必须在分片之前就知道真实工作量。
+
+    实测依据（run 43952322314，v3 面积均衡到 1.00 后）：
+      #9  274 张 / 1.9 分 = 0.42 秒/张
+      #6  613 张 / 8.9 分 = 0.87 秒/张
+      #10 841 张 /16.5 分 = 1.18 秒/张
+    不仅张数差 3.07 倍，**每张难度也差 2.8 倍** → 必须同时按面积（不是只按张数）均衡。
+
+    只做网络请求：详情 1 次 + 回复分页 N 次；不触发图片下载与 OCR。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    say = log or (lambda message: None)
+    if not ids:
+        return {}
+    total = len(ids)
+    done = 0
+    out: dict[int, dict] = {}
+    failed = 0
+
+    def fetch_one(aid: int) -> tuple[int, dict | None]:
+        try:
+            urls: list[str] = []
+            if source == "dahkg":
+                from core import dahkg
+
+                detail = dahkg.fetch_detail(aid)
+                urls += [u.strip() for u in str(detail.get("img") or "").split(",") if u.strip()]
+                reps = dahkg.fetch_all_replies(aid)
+                body_count = len(urls)
+                for rep in reps:
+                    urls += [u.strip() for u in str(rep.get("img") or "").split(",") if u.strip()]
+                return aid, {
+                    "count": len(urls),
+                    "detArea": sum(_det_input_area(u) for u in urls),
+                    "bodyCount": body_count,
+                    "replyCount": len(urls) - body_count,
+                }
+            if source == "aocai":
+                from core import forum as forum_mod
+
+                detail = forum_mod.fetch_thread_detail(aid, 0, include_replies=True, delay=0.0, max_pages=50)
+                tiezi = (detail or {}).get("tiezi") or {}
+                urls += [u.strip() for u in str(tiezi.get("img") or "").split(",") if u.strip()]
+                body_count = len(urls)
+                for rep in (detail or {}).get("replies") or []:
+                    urls += [u.strip() for u in str(rep.get("img") or "").split(",") if u.strip()]
+                return aid, {"count": len(urls), "detArea": 0,
+                             "bodyCount": body_count, "replyCount": len(urls) - body_count}
+            if source == "tuku":
+                from core import scraper
+
+                raw = scraper.api_get("/unite49/h5/article/detail", {"articleId": aid}, delay=0)
+                pics = (raw or {}).get("pictureList") or []
+                urls += [str((pic or {}).get("url") or "") for pic in pics if (pic or {}).get("url")]
+                return aid, {"count": len(urls), "detArea": 0, "bodyCount": len(urls), "replyCount": 0}
+        except Exception:  # noqa: BLE001 - 预抓失败不算致命，后面有兜底
+            return aid, None
+        return aid, None
+
+    say(f"[prefetch] 开始预抓详情+回复：{total} 帖，并发 {workers}")
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(fetch_one, aid): aid for aid in ids}
+        for fut in as_completed(futures):
+            aid, info = fut.result()
+            done += 1
+            if info:
+                out[aid] = info
+            else:
+                failed += 1
+            if done % 100 == 0 or done == total:
+                say(f"[prefetch] 进度 {done}/{total}，成功 {len(out)}，失败 {failed}")
+            if delay:
+                time.sleep(0)
+
+    total_count = sum(v["count"] for v in out.values())
+    total_area = sum(v["detArea"] for v in out.values())
+    say(
+        f"[prefetch] 完成：{len(out)}/{total} 帖成功（失败 {failed}）；"
+        f"总图 {total_count} 张，总 det 面积 {total_area/1e8:.2f} 亿像素"
+    )
+    if out and failed / max(1, total) > 0.2:
+        say(f"[prefetch] ⚠ 失败率 {failed/total*100:.0f}% 过高，本轮分片权重退回原模型")
+        return {}
+    return out
+
+
 def do_plan(args) -> int:
     from . import _guard, _period, _reconcile
 
@@ -309,39 +408,65 @@ def do_plan(args) -> int:
         },
     }
 
-    # ---- 分片均衡计划 ----
-    # 权重优先级（2026-11-17 三次实测迭代后的结论）：
-    #   ① 上一轮 merge 实测的「每帖总图数」（正文图 + 回复图）—— 最准，同 id 稳定
-    #   ② 本期没有历史（新期首轮）→ 退回 det 输入像素面积 + 回复图估计
+    # ---- 分片均衡计划（v6：prepare 预抓详情+回复，按真实 det 面积 LPT 分组）----
+    # 权重优先级：
+    #   ① prepare 阶段预抓详情+回复算出的「每帖 det 输入面积」（最准，新期第一轮也有效）
+    #   ② 上一轮 merge 实测的「每帖总图数」（若没预抓）
+    #   ③ det 输入像素面积 + 回复图估计（兜底）
     shard_n = _shard_count_for(source)
     union_ids = [int(x) for x in (scan.get("unionIds") or [])]
     union_meta = scan.get("unionMeta") or {}
     state_dir = _resolve_state_dir(args, work)
+
+    prefetched: dict = {}
+    if shard_n > 1 and union_ids and not getattr(args, "no_prefetch", False):
+        try:
+            prefetched = _prefetch_post_costs(
+                source, union_ids, log, workers=max(8, int(getattr(args, "workers", 0) or 4) * 4)
+            )
+        except Exception as exc:  # noqa: BLE001 - 预抓炸了不能拖垮 plan
+            log(f"[prefetch] 异常，本轮退回原权重模型：{type(exc).__name__}: {exc}")
+            prefetched = {}
+        if prefetched:
+            plan["postCost"] = {
+                str(aid): {"count": int(v.get("count") or 0), "detArea": int(v.get("detArea") or 0)}
+                for aid, v in prefetched.items()
+            }
+
     hist_cost = _load_image_cost(state_dir, source)
     hist_period = int((hist_cost.get("_period") or 0)) if isinstance(hist_cost, dict) else 0
     use_hist = bool(hist_cost) and (hist_period in (0, period, display))
+
     if shard_n > 1 and union_ids:
-        items_by_id: dict[int, dict] = {}
-        if use_hist:
+        if prefetched:
             weights = {}
             for aid in union_ids:
-                try:
-                    weights[aid] = max(1, int(hist_cost.get(str(aid)) or 0))
-                except (TypeError, ValueError):
-                    weights[aid] = 1
-            weight_src = f"上一轮实测每帖总图数（{sum(1 for a in union_ids if str(a) in hist_cost)}/{len(union_ids)} 帖有历史）"
-        else:
-            weights = {aid: _item_image_weight(union_meta.get(str(aid)) or {"imgTotal": (union_meta.get(str(aid)) or {}).get("imgTotal", 0)})
-                       for aid in union_ids}
+                info = prefetched.get(aid) or {}
+                w = int(info.get("detArea") or 0) or int(info.get("count") or 0)
+                weights[aid] = max(1, w)
+            mode = "prefetch-det-area"
+            weight_src = f"prepare 预抓实测 {len(prefetched)}/{len(union_ids)} 帖（det 面积，无尺寸的源退化为图数）"
+        elif use_hist:
+            weights = {}
             for aid in union_ids:
-                weights[aid] = _item_image_weight(union_meta.get(str(aid)) or {})
-            weight_src = "det 输入像素面积 + 回复图估计（本期无历史）"
+                v = hist_cost.get(str(aid))
+                if isinstance(v, dict):
+                    w = int(v.get("detArea") or 0) or int(v.get("count") or 0)
+                else:
+                    w = int(v or 0)
+                weights[aid] = max(1, w)
+            mode = "learned-images"
+            weight_src = f"上一轮实测每帖工作量（{sum(1 for a in union_ids if str(a) in hist_cost)}/{len(union_ids)} 帖有历史）"
+        else:
+            weights = {aid: _item_image_weight(union_meta.get(str(aid)) or {}) for aid in union_ids}
+            mode = "det-area-estimated"
+            weight_src = "det 输入像素面积 + 回复图估计（无预抓、无历史）"
         groups = _balanced_groups(union_ids, weights, shard_n)
         sizes = [len(g) for g in groups]
         imgs = [sum(max(1, weights.get(a, 0)) for a in g) for g in groups]
         plan["shardPlan"] = {
             "n": shard_n,
-            "mode": "learned-images" if use_hist else "det-area",
+            "mode": mode,
             "weightSource": weight_src,
             "groups": {str(i): g for i, g in enumerate(groups)},
             "postsPerShard": sizes,
@@ -349,9 +474,11 @@ def do_plan(args) -> int:
             "weightTotal": sum(imgs),
         }
         log(
-            f"[plan] 分片均衡（{plan['shardPlan']['mode']}，权重={weight_src}）：{shard_n} 片，"
-            f"总权重 {sum(imgs)}；每片 {imgs}；每片帖子 {sizes}"
+            f"[plan] 分片均衡（{mode}）：{shard_n} 片，总权重 {sum(imgs)}；每片 {imgs}；每片帖子 {sizes}"
         )
+        log(f"[plan] 权重来源：{weight_src}")
+        if imgs and min(imgs) > 0:
+            log(f"[plan] 均衡度：最慢/最快 = {max(imgs)/min(imgs):.2f} 倍")
     else:
         log(f"[plan] 不分片（shard_n={shard_n}，帖子 {len(union_ids)}）")
 
@@ -950,12 +1077,22 @@ def do_run(args, mode: str = "run") -> int:
         }
         _guard.save_json(state_file, new_state)
         _guard.save_json(snapshot_file, curr_snapshot)
-        # v4：把本轮实测的「每帖总图数」落盘，供下一轮 plan 当分片权重（同期 id 稳定）
+        # v4/v6：把本轮实测的「每帖图数 + det 面积」落盘，供下一轮 plan 当分片权重
+        def _post_images_all(p: dict) -> list[str]:
+            urls = [str((img or {}).get("url") or "") for img in (p.get("images") or [])]
+            for rep in p.get("replies") or []:
+                urls += [str((img or {}).get("url") or "") for img in (rep.get("images") or [])]
+            return [u for u in urls if u]
+
         image_cost = {
             "_period": period,
             "_updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "_note": "每帖 count=正文图+回复图张数；detArea=det 输入端像素和（URL 无尺寸的源为 0）",
             "cost": {
-                str(int(p.get("articleId") or 0)): _post_total_images(p)
+                str(int(p.get("articleId") or 0)): {
+                    "count": len(_post_images_all(p)),
+                    "detArea": sum(_det_input_area(u) for u in _post_images_all(p)),
+                }
                 for p in posts
                 if int(p.get("articleId") or 0)
             },
@@ -963,7 +1100,8 @@ def do_run(args, mode: str = "run") -> int:
         _guard.save_json(state_dir / f"imagecost_{source}.json", image_cost)
         log(
             f"[{mode}] 已落盘分片成本基线 imagecost_{source}.json：{len(image_cost['cost'])} 帖，"
-            f"合计 {sum(image_cost['cost'].values())} 图（供下一轮分片均衡）"
+            f"合计 {sum(v['count'] for v in image_cost['cost'].values())} 图 / "
+            f"{sum(v['detArea'] for v in image_cost['cost'].values())/1e8:.2f} 亿像素（供下一轮分片均衡）"
         )
         log(f"[{mode}] 状态已更新：期号 {last_period or '无'} -> {period}，回复总数 {reply_total}")
     else:
@@ -1186,6 +1324,11 @@ def parse_args(argv=None):
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--ocr-limit", type=int, default=0)
     parser.add_argument("--no-images", action="store_true")
+    parser.add_argument(
+        "--no-prefetch",
+        action="store_true",
+        help="plan 阶段不预抓详情+回复（预抓用于算出每帖真实图数/det 面积，让分片均衡）",
+    )
     parser.add_argument("--no-ocr", action="store_true")
     parser.add_argument("--no-replies", action="store_true")
     parser.add_argument("--keep-days", type=int, default=2)
