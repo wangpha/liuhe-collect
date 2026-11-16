@@ -628,19 +628,27 @@ def probe_details(
     return {"exists": exists, "periods": periods, "unknown": unknown}
 
 
-def probe_image_urls(urls: list[str], log: Callable[[str], None] | None = None, timeout: float = 15.0) -> dict:
-    """逐张向源站求证：这张没下载下来的图，是「源站物理不可救」还是「我们没下成」。
+def probe_image_urls(
+    urls: list[str],
+    log: Callable[[str], None] | None = None,
+    timeout: float = 15.0,
+    attempts: int = 3,
+) -> dict:
+    """逐张向源站求证：这张没下载下来的图，到底是谁的问题。
 
-    ## 为什么必须分开（文档防线2 第4道 + R12）
+    ## 为什么必须分开（文档防线2 第4道 + R12「一个不放过」）
     文档写「单张图下载失败 → 重试 3 次（间隔递增）；仍失败 → 记入失败清单，
-    计入最终报告的『物理不可救』项」。所以「源站就是坏图」与「我们有能力却没下成」
-    必须分开：前者如实列清单，后者是缺陷必须失败。
-    一刀切判失败会把源站坏图变成永远无法通过的门禁；一刀切放过就会掩盖真的漏图。
+    计入最终报告的『物理不可救』项」。所以四类必须分开，不能一刀切：
 
-    判定：
-      · HTTP 404 / 403 / 410，或 200 但 0 字节  → `unrecoverable`（源站物理不可救）
-      · 超时 / 连接错误 / 5xx                   → `retryable`（我们或网络的问题）
-      · 200/206 且拿到字节                       → `recoverable`（能下到，说明是我们漏了）
+    | 源站返回 | 分类 | 判定 | 依据 |
+    |---|---|---|---|
+    | 200/206 且有字节 | `recoverable` | **硬失败** | 我们能下到却没下 → 是我们的缺陷 |
+    | 404/403/410，或 200 但 0 字节 | `absent` | 记清单不阻塞 | 源站物理不可救（空文件已见） |
+    | 5xx / 429 | `unavailable` | 记清单不阻塞 | **源站自己不可用**（2026-11-16 实测 13 张全 503） |
+    | 超时 / 连接错误 | `unknown` | 记清单不阻塞 | 网络问题，不能归罪于数据 |
+
+    一刀切判失败会把「源站 503」变成永远过不了的门禁；
+    一刀切放过就会掩盖真的漏图。只有 `recoverable` 才是我们该负责的。
     """
     import time as _time
 
@@ -651,28 +659,44 @@ def probe_image_urls(urls: list[str], log: Callable[[str], None] | None = None, 
     for url in urls:
         if not url:
             continue
-        try:
-            resp = requests.get(url, timeout=timeout, headers={"Range": "bytes=0-2047"}, stream=True)
-            code = resp.status_code
-            got = 0
+        verdict = "unknown"
+        detail: dict = {}
+        for attempt in range(1, attempts + 1):
             try:
-                for chunk in resp.iter_content(1024):
-                    got += len(chunk)
-                    if got >= 2048:
-                        break
-            finally:
-                resp.close()
-            if code in (404, 403, 410):
-                kind = "unrecoverable"
-            elif code in (200, 206):
-                kind = "recoverable" if got > 0 else "unrecoverable"   # 200 但 0 字节 = 空文件
-            else:
-                kind = "retryable"                                     # 5xx 等
-            result[url] = {"httpStatus": code, "bytes": got, "kind": kind}
-            say(f"[求证图片] HTTP {code} {got}B -> {kind}：{url[:100]}")
-        except Exception as exc:  # noqa: BLE001 - 超时/连接失败属可重试
-            result[url] = {"kind": "retryable", "error": f"{type(exc).__name__}: {str(exc)[:100]}"}
-            say(f"[求证图片] 请求失败（可重试）{type(exc).__name__}：{url[:100]}")
+                resp = requests.get(url, timeout=timeout, headers={"Range": "bytes=0-2047"}, stream=True)
+                code = resp.status_code
+                got = 0
+                try:
+                    for chunk in resp.iter_content(1024):
+                        got += len(chunk)
+                        if got >= 2048:
+                            break
+                finally:
+                    resp.close()
+                detail = {"httpStatus": code, "bytes": got, "attempts": attempt}
+                if code in (200, 206):
+                    verdict = "recoverable" if got > 0 else "absent"
+                    break
+                if code in (404, 403, 410):
+                    verdict = "absent"
+                    break
+                if code in (429, 500, 502, 503, 504):
+                    verdict = "unavailable"
+                    if attempt < attempts:
+                        _time.sleep(1.0 * attempt)
+                        continue
+                    break
+                verdict = "unknown"
+                break
+            except Exception as exc:  # noqa: BLE001 - 超时/连接失败属可重试
+                detail = {"error": f"{type(exc).__name__}: {str(exc)[:100]}", "attempts": attempt}
+                verdict = "unknown"
+                if attempt < attempts:
+                    _time.sleep(1.0 * attempt)
+                    continue
+        result[url] = {**detail, "kind": verdict}
+        if verdict != "recoverable":
+            say(f"[求证图片] {verdict} {detail.get('httpStatus', '')} -> 记清单（不阻塞）：{url[-60:]}")
         _time.sleep(0.05)
     return result
 
@@ -787,6 +811,8 @@ def reconcile_images(
     mismatch_total = 0
     retryable_total = 0
     unrecoverable_total = 0
+    unavailable_total = 0
+    unknown_total = 0
     missing_file_total = 0
     no_declared = 0
     bad_urls: list[str] = []
@@ -836,43 +862,52 @@ def reconcile_images(
             }
         )
 
-    # 逐张向源站求证「坏图」到底是源站坏还是我们没下成
+    # 逐张向源站求证「坏图」到底是谁的问题
     probe: dict[str, dict] = {}
     if bad_urls and probe_bad_images:
         uniq = list(dict.fromkeys(bad_urls))
         say(f"[防线2] 有 {len(uniq)} 张图下载状态异常，逐张向源站求证…")
         probe = probe_image_urls(uniq, log=log)
         for info in probe.values():
-            if info.get("kind") == "unrecoverable":
-                unrecoverable_total += 1
+            kind = info.get("kind")
+            if kind == "recoverable":
+                retryable_total += 1          # 我们能下到却没下 → 硬失败
+            elif kind == "absent":
+                unrecoverable_total += 1      # 源站物理不可救 → 记清单
+            elif kind == "unavailable":
+                unavailable_total += 1        # 源站 5xx/429 → 记清单
             else:
-                retryable_total += 1
+                unknown_total += 1            # 超时/连接错误 → 记清单
     else:
         retryable_total = sum(len(r["badStatus"]) for r in rows)
 
     problems = [r for r in rows if r["delta"] != 0 or r["badStatus"] or r["missingFiles"]]
-    unrecoverable = [
-        {"url": u, **info} for u, info in probe.items() if info.get("kind") == "unrecoverable"
-    ]
-    retryable = [{"url": u, **info} for u, info in probe.items() if info.get("kind") != "unrecoverable"]
+    unrecoverable = [{"url": u, **i} for u, i in probe.items() if i.get("kind") == "absent"]
+    unavailable = [{"url": u, **i} for u, i in probe.items() if i.get("kind") == "unavailable"]
+    unknown = [{"url": u, **i} for u, i in probe.items() if i.get("kind") == "unknown"]
+    recoverable = [{"url": u, **i} for u, i in probe.items() if i.get("kind") == "recoverable"]
     return {
         "postsChecked": len(rows),
         "declaredTotal": sum(r["declared"] for r in rows),
         "actualTotal": sum(r["actual"] for r in rows),
         "replyImagesTotal": sum(r["replyImages"] for r in rows),
         "mismatchPosts": mismatch_total,
-        "notDownloadedImages": retryable_total + unrecoverable_total,
+        "notDownloadedImages": retryable_total + unrecoverable_total + unavailable_total + unknown_total,
         "retryableImages": retryable_total,
         "unrecoverableImages": unrecoverable_total,
+        "unavailableImages": unavailable_total,
+        "unknownImages": unknown_total,
         "unrecoverable": unrecoverable[:30],
-        "retryable": retryable[:30],
+        "unavailable": unavailable[:30],
+        "unknown": unknown[:30],
+        "recoverable": recoverable[:30],
         "missingFiles": missing_file_total,
         "noDeclaredPosts": no_declared,
         "filesChecked": files_checkable,
         "probed": bool(probe),
         "problems": problems[:30],
         # 只有「能下到却没下」「文件缺失」「声明数不符」才算失败；
-        # 源站物理不可救（404/空文件）按文档记清单，不阻塞
+        # 源站不可救 / 源站 5xx / 网络超时 一律记清单，不阻塞（文档防线2 第4道）
         "passed": mismatch_total == 0 and retryable_total == 0 and missing_file_total == 0,
     }
 
@@ -963,3 +998,4 @@ def check_products(out_dir: Path, source: str = "dahkg") -> dict:
         "guiOnlyPresent": gui_present,
         "passed": not missing,
     }
+

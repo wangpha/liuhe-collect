@@ -625,14 +625,20 @@ def do_run(args, mode: str = "run") -> int:
     log(
         f"[防线2] 图片对账：声明 {image_check['declaredTotal']} 张 / 实际 {image_check['actualTotal']} 张"
         f" / 不符帖子 {image_check['mismatchPosts']}"
-        f" / 可重试坏图 {image_check.get('retryableImages', 0)}"
-        f" / 源站不可救 {image_check.get('unrecoverableImages', 0)}"
+        f" / **能下到却没下 {image_check.get('retryableImages', 0)}**"
+        f" / 源站404或空文件 {image_check.get('unrecoverableImages', 0)}"
+        f" / 源站5xx {image_check.get('unavailableImages', 0)}"
+        f" / 网络未确认 {image_check.get('unknownImages', 0)}"
         f" / 文件缺失 {image_check['missingFiles']}"
         f" / 无声明口径帖子 {image_check.get('noDeclaredPosts', 0)}"
         f"  ← {'通过' if image_check['passed'] else '不通过'}"
     )
-    if image_check.get("unrecoverable"):
-        log(f"[防线2] 源站物理不可救清单（如实列出，不阻塞门禁）：{[u['url'][:80] for u in image_check['unrecoverable'][:5]]}")
+    for label, key in (("源站物理不可救（404/空文件）", "unrecoverable"),
+                       ("源站 5xx 不可用", "unavailable"),
+                       ("网络未确认", "unknown")):
+        items = image_check.get(key) or []
+        if items:
+            log(f"[防线2] {label} {len(items)} 张（如实列出，不阻塞门禁）：{[u['url'][-50:] for u in items[:5]]}")
 
     # ---- 防线 3：快照 + 单调性（prev_snapshot 已在流程开头读过）----
     curr_snapshot = _guard.build_snapshot(posts)
