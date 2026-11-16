@@ -282,9 +282,61 @@ def do_plan(args) -> int:
             "byLike": scan.get("countByLike", 0),
         },
     }
+
+    # ---- 分片均衡计划（按累计图片数，而不是 id 取模）----
+    shard_n = _shard_count_for(source)
+    union_ids = [int(x) for x in (scan.get("unionIds") or [])]
+    union_meta = scan.get("unionMeta") or {}
+    if shard_n > 1 and union_ids:
+        weights = {
+            int(aid): int((meta or {}).get("imgTotal") or 0)
+            for aid, meta in union_meta.items()
+            if str(aid).isdigit()
+        }
+        groups = _balanced_groups(union_ids, weights, shard_n)
+        sizes = [len(g) for g in groups]
+        imgs = [
+            sum(max(1, weights.get(a, 0)) for a in g) for g in groups
+        ]
+        plan["shardPlan"] = {
+            "n": shard_n,
+            "mode": "balanced-by-images",
+            "groups": {str(i): g for i, g in enumerate(groups)},
+            "postsPerShard": sizes,
+            "imagesPerShard": imgs,
+            "imagesTotal": sum(imgs),
+        }
+        log(
+            f"[plan] 分片均衡（按图片数）：{shard_n} 片，总图 {sum(imgs)} 张；"
+            f"每片图片 {imgs}；每片帖子 {sizes}"
+        )
+    else:
+        log(f"[plan] 不分片（shard_n={shard_n}，帖子 {len(union_ids)}）")
+
     _guard.save_json(work / "plan" / f"plan_{source}.json", plan)
     log(f"[plan] 完成：传给模块的期号={period}（展示 {display} 期，口径 {caliber}），预期帖子={plan['counts']['expectedPosts']}")
     return 0
+
+
+def _shard_count_for(source: str) -> int:
+    """从环境变量 SHARD_MAP（形如 `dahkg:11,aocai:4,tuku:3`）取本源的片数。
+
+    为什么用环境变量而不是命令行：片数由 workflow 的 plan job 决定，
+    prepare 与 shard 两个 job 必须拿到**同一个** N，否则 plan 算出的分组与
+    分片 job 的 matrix 下标对不上。workflow 里用一个统一的 env 传下去最简单。
+    """
+    raw = os.environ.get("SHARD_MAP", "").strip()
+    if not raw:
+        return 1
+    for part in raw.split(","):
+        if ":" in part:
+            k, _, v = part.partition(":")
+            if k.strip() == source:
+                try:
+                    return max(1, int(v.strip()))
+                except ValueError:
+                    return 1
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -302,8 +354,54 @@ def _plan_item_id(item: dict) -> int:
     return 0
 
 
-def _slice_items(items, shard: int, total: int, sink: dict):
-    """把 items 按 `id % total == shard` 切片，并记录原始总数。"""
+def _item_image_weight(item: dict) -> int:
+    """一条列表行大概会带来几张图（用于分片均衡）。
+
+    实测（2026-11-17）：dahkg 列表行同时有
+      · `imgTotal`：正文图数（如 2）
+      · `img`：逗号分隔的图片 URL（与 imgTotal 一致的条数）
+    优先用 imgTotal；没有就数 img 里的逗号；都没有按 1 张算。
+    tuku/aocai 的列表行没有图片数（实测 imgTotal 恒 0）→ 退化成按帖子数均分。
+    """
+    try:
+        total = int(item.get("imgTotal") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if total > 0:
+        return total
+    raw = item.get("img") or ""
+    if isinstance(raw, str) and raw.strip():
+        return max(1, raw.count(",") + 1)
+    return 1
+
+
+def _balanced_groups(ids: list[int], weights: dict[int, int], n: int) -> list[list[int]]:
+    """按**累计图片数**把帖子切成 n 组（连续切分），让每片图片量尽量相等。
+
+    为什么不用 `id % n`：相邻 id 的图片数差异极大（0~9 张），
+    实测 dahkg 11 片耗时 3.1~20.9 分钟（差 6.7 倍），整轮被最慢那片拖死。
+    按累计权重比例归组后，边界落在「等图片量」的位置。
+
+    确定性：同一份 ids+weights+n 必然得到同一份分组 —— 这是 18 个分片 job
+    各自独立计算结果一致的前提（它们读的是同一份 plan JSON）。
+    """
+    if n <= 0:
+        return []
+    ordered = sorted(set(ids))
+    total_w = sum(max(1, int(weights.get(a, 1))) for a in ordered) or 1
+    groups: list[list[int]] = [[] for _ in range(n)]
+    cum = 0
+    for aid in ordered:
+        w = max(1, int(weights.get(aid, 1)))
+        cum += w
+        # 用「累计权重占总量比例」决定归组，最后一组收尾
+        idx = min(n - 1, int(cum / total_w * n))
+        groups[idx].append(aid)
+    return groups
+
+
+def _slice_items(items, shard: int, total: int, sink: dict, planned_ids: set[int] | None = None):
+    """把 items 切成一片：优先按 plan 里算好的均衡分组，没有就退回 id%N。"""
     if isinstance(items, tuple):
         seq, meta = items[0], items[1:]
     else:
@@ -313,12 +411,19 @@ def _slice_items(items, shard: int, total: int, sink: dict):
     except TypeError:
         return items
     sink["total"] = len(seq)
-    picked = [it for it in seq if _plan_item_id(it) % max(1, total) == shard]
+    sink["imagesTotal"] = sum(_item_image_weight(it) for it in seq)
+    if planned_ids is not None:
+        picked = [it for it in seq if _plan_item_id(it) in planned_ids]
+        sink["mode"] = "balanced"
+    else:
+        picked = [it for it in seq if _plan_item_id(it) % max(1, total) == shard]
+        sink["mode"] = "modulo"
     sink["picked"] = len(picked)
+    sink["imagesPicked"] = sum(_item_image_weight(it) for it in picked)
     return (picked, *meta) if meta else picked
 
 
-def _patch_shard(source: str, shard: int, total: int, sink: dict):
+def _patch_shard(source: str, shard: int, total: int, sink: dict, planned_ids: set[int] | None = None):
     """给该源的「列表取数函数」打补丁，只保留本片的帖子。
 
     ## 为什么用「打补丁 + 进程内跑原生 CLI」而不是重写采集流程
@@ -339,7 +444,7 @@ def _patch_shard(source: str, shard: int, total: int, sink: dict):
         if original is None:
             return
         def patched(*a, **kw):
-            return _slice_items(original(*a, **kw), shard, total, sink)
+            return _slice_items(original(*a, **kw), shard, total, sink, planned_ids=planned_ids)
         setattr(mod, name, patched)
         originals.append((mod, name, original))
 
@@ -419,8 +524,26 @@ def do_shard(args) -> int:
         raise SystemExit("[错误] plan 里没有期号，无法分片")
 
     sink: dict = {"total": 0, "picked": 0}
-    originals = _patch_shard(source, shard_index, shard_total, sink)
-    log(f"[shard] 已给 {source} 的列表取数打切片补丁（id % {shard_total} == {shard_index}）")
+    # 优先用 plan 里按「累计图片数」算好的均衡分组（18 个分片读同一份 JSON → 分配一致）
+    planned_ids: set[int] | None = None
+    shard_plan = plan.get("shardPlan") or {}
+    if shard_plan and int(shard_plan.get("n") or 0) == shard_total:
+        group = (shard_plan.get("groups") or {}).get(str(shard_index)) or []
+        planned_ids = {int(x) for x in group}
+        log(
+            f"[shard] 使用 plan 的均衡分组：本片 {len(planned_ids)} 帖，"
+            f"计划图片 {shard_plan.get('imagesPerShard', [])[shard_index] if shard_index < len(shard_plan.get('imagesPerShard') or []) else '?'} 张"
+        )
+    elif shard_plan:
+        log(
+            f"[shard] ⚠ plan 的分片数 {shard_plan.get('n')} 与本次 --shards {shard_total} 不一致，"
+            f"退回 id 取模（请检查 workflow 的 SHARD_MAP 与 matrix 是否同源）"
+        )
+    originals = _patch_shard(source, shard_index, shard_total, sink, planned_ids=planned_ids)
+    log(
+        f"[shard] 已给 {source} 的列表取数打切片补丁"
+        f"（{'plan 均衡分组' if planned_ids is not None else f'id % {shard_total} == {shard_index}'}）"
+    )
 
     argv = ["--out", str(out_root), "--period", str(period)]
     if args.workers:
@@ -443,8 +566,9 @@ def do_shard(args) -> int:
             setattr(mod, name, original)
 
     log(
-        f"[shard] {source} 本片：源站本期共 {sink.get('total', 0)} 帖，"
-        f"本片负责 {sink.get('picked', 0)} 帖；模块退出码={code}"
+        f"[shard] {source} 本片：源站本期共 {sink.get('total', 0)} 帖 / {sink.get('imagesTotal', 0)} 图，"
+        f"本片负责 {sink.get('picked', 0)} 帖 / {sink.get('imagesPicked', 0)} 图"
+        f"（模式={sink.get('mode', '?')}）；模块退出码={code}"
     )
     _guard.save_json(
         work / "shards" / f"shard_{source}_{shard_index}.json",
@@ -997,5 +1121,6 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
