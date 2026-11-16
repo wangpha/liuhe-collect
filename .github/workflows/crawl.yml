@@ -226,11 +226,14 @@ jobs:
         working-directory: repo
         run: |
           echo "=== 产物目录 ==="
-          find work/out -maxdepth 3 -type d | head -40
+          find work/out -maxdepth 3 -type d > work/_dirs.txt 2>/dev/null || true
+          sed -n '1,40p' work/_dirs.txt
           echo "=== 每期文件数与大小 ==="
-          for d in $(find work/out -maxdepth 3 -type d -name '*期'); do
+          find work/out -maxdepth 3 -type d -name '*期' > work/_periods.txt 2>/dev/null || true
+          while read -r d; do
+            [ -n "$d" ] || continue
             echo "$d : $(find "$d" -maxdepth 1 -type f | wc -l) 个文件"
-          done
+          done < work/_periods.txt
           du -sh work/out 2>/dev/null || true
 
       - name: 上传日志与审计证据

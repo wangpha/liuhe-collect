@@ -14,6 +14,7 @@ import argparse
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 #: 每一组都按「出现任何一次即不通过」处理（文档 6B.3）
@@ -53,6 +54,36 @@ ALLOW: list[tuple[str, str]] = [
     (r"No files were found", "artifact 空目录提示"),
     (r"Warning: (Node\.js|The following actions)", "Actions 平台自身版本提示"),
     (
+        r"##\[warning\]Node\.js \d+ is deprecated|The following actions target Node\.js",
+        "GitHub Actions 平台自身对内置 Node 版本的弃用提示，与本项目代码无关；"
+        "升级 actions 版本才会消失，且不影响任何采集/OCR 结果",
+    ),
+    (
+        r"\[DEP\d+\] DeprecationWarning: The `?punycode`? module is deprecated",
+        "setup-python / actions 内置 Node 的 punycode 弃用提示，来自 Actions 运行时，"
+        "不是我们的 Python 代码；同理还有 node:xxx 的 DEP 提示",
+    ),
+    (
+        r"\[自检\] ✅",
+        "自检**通过**的行。自检里本来就有一条「期号倒退必须中止」的用例，"
+        "它打印的文字含『失败/中止』属预期；未通过会显示 ❌，仍会被抓",
+    ),
+    (
+        r"##\[group\]Run ",
+        "GitHub 在步骤开始时把**脚本原文**回显出来（不是执行结果）；"
+        "脚本里含『错误』等字样的行会随之出现，真正的失败会在 ##[error] 行体现",
+    ),
+    (
+        r"云端日志零错误审计（文档 6B\.3）",
+        "本审计工具**自己的标题行**：它在 Actions 里跑，输出又被同一份 Actions 日志收录，"
+        "标题里含『错误』二字属自指，不是异常",
+    ),
+    (
+        r"find: write error",
+        "`find ... | head -N` 的 SIGPIPE 提示（head 提前关闭管道）。"
+        "已把 workflow 改成不依赖 head 的写法；此条为历史日志兜底",
+    ),
+    (
         r"DiscoverDevicesForPlatform\]\s*GPU device discovery failed",
         "无显卡 runner 上 onnxruntime 探测 GPU 的固定提示；CPU 模式已强制"
         "（QODE_OCR_DML=0），同轮 OCR 统计 失败 0 / 缓存命中 100%，非故障。"
@@ -89,16 +120,81 @@ def scan_line(line: str) -> list[dict]:
     return hits
 
 
+def analyze_gaps(path: Path, limit_seconds: float = 60.0) -> dict:
+    """按时间戳计算「连续多久没有输出」（文档 6B.3「时间问题」判据）。
+
+    只有 `gh run view --log` 导出的日志带时间戳（形如
+    `job\tstep\t2026-11-16T02:28:36.2098270Z 内容`），
+    从 artifact 里拿到的纯文本日志没有时间戳 —— 这种情况返回 checked=False，
+    并在报告里明确写"本份日志无时间戳，无法核验静默间隔"，不假装通过。
+    """
+    ts_re = re.compile(r"\t(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s")
+    stamps: list[tuple[float, str]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = ts_re.search(line)
+        if not m:
+            continue
+        text = m.group(1).replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            continue
+        stamps.append((dt.timestamp(), line.strip()[:160]))
+
+    if len(stamps) < 2:
+        return {"checked": False, "reason": "日志无时间戳（artifact 纯文本），无法核验静默间隔"}
+
+    biggest = 0.0
+    worst = None
+    violations: list[dict] = []
+    for (t0, l0), (t1, l1) in zip(stamps, stamps[1:]):
+        gap = t1 - t0
+        if gap > biggest:
+            biggest, worst = gap, l1
+        if gap > limit_seconds:
+            violations.append({"gapSeconds": round(gap, 1), "after": l0, "before": l1})
+    return {
+        "checked": True,
+        "linesWithTs": len(stamps),
+        "maxGapSeconds": round(biggest, 1),
+        "worstAfter": worst,
+        "violations": violations[:20],
+        "violationCount": len(violations),
+        "limitSeconds": limit_seconds,
+        "passed": not violations,
+    }
+
+
+def split_actions_prefix(line: str) -> tuple[str, str]:
+    """拆掉 `gh run view --log` 的行前缀：`<job>\\t<step>\\t<timestamp>Z <内容>`。
+
+    为什么必须拆（2026-11-16 实测）：本项目有个步骤叫「日志零错误审计」，
+    **步骤名里自带"错误"**，不拆前缀会把该步骤的每一行都误判成错误命中。
+    """
+    parts = line.split("\t")
+    if len(parts) >= 3:
+        head = "\t".join(parts[:2])
+        rest = "\t".join(parts[2:])
+        m = re.match(r"\ufeff?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s?(.*)$", rest)
+        if m:
+            return head, m.group(2)
+        return head, rest
+    return "", line
+
+
 def audit_file(path: Path) -> dict:
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     hits: list[dict] = []
-    for no, line in enumerate(lines, 1):
-        for hit in scan_line(line):
+    for no, raw in enumerate(lines, 1):
+        _head, body = split_actions_prefix(raw)
+        for hit in scan_line(body):
             hit["lineNo"] = no
+            hit["line"] = body.strip()[:300]
             hits.append(hit)
     exit_codes = [int(m.group(1)) for m in re.finditer(r"(?:退出码|exit[ _]?code)\s*[=: ]\s*(-?\d+)", text, re.I)]
     bad_exit = [c for c in exit_codes if c != 0]
+    gaps = analyze_gaps(path)
     return {
         "file": str(path),
         "lines": len(lines),
@@ -107,7 +203,8 @@ def audit_file(path: Path) -> dict:
         "groups": sorted({h["group"] for h in hits}),
         "exitCodes": exit_codes,
         "badExitCodes": bad_exit,
-        "passed": not hits and not bad_exit,
+        "silence": gaps,
+        "passed": not hits and not bad_exit and gaps.get("passed", True),
     }
 
 
@@ -130,16 +227,30 @@ def main(argv=None) -> int:
         res = audit_file(path)
         results.append(res)
         flag = "✅ 通过" if res["passed"] else "❌ 不通过"
-        print(f"\n{flag}  {path.name}   行数={res['lines']}  命中={res['hitCount']}  退出码={res['exitCodes'] or '无'}")
+        sil = res.get("silence") or {}
+        sil_txt = (
+            f"最长静默 {sil.get('maxGapSeconds')}s"
+            if sil.get("checked")
+            else f"静默未核验（{sil.get('reason','无时间戳')}）"
+        )
+        print(f"\n{flag}  {path.name}   行数={res['lines']}  命中={res['hitCount']}  退出码={res['exitCodes'] or '无'}  {sil_txt}")
         for hit in res["hits"][: args.max_show]:
             print(f"    L{hit['lineNo']} [{hit['group']}] {hit['matched']}  <- {hit['line']}")
         if res["badExitCodes"]:
             print(f"    非零退出码：{res['badExitCodes']}")
+        for v in sil.get("violations", [])[:5]:
+            print(f"    静默 {v['gapSeconds']}s：{v['after']}  →  {v['before']}")
 
     ok = all(r["passed"] for r in results) and bool(results)
+    empty = [r["file"] for r in results if r["lines"] == 0]
+    if empty:
+        print(f"\n[不合格] 以下日志是空文件（下载失败/未生成），不能算通过：{empty}")
+        ok = False
+    passed_n = sum(1 for r in results if r["passed"] and r["lines"] > 0)
+    failed_n = len(results) - passed_n
     print("\n" + "=" * 78)
-    print(f"总计 {len(results)} 份日志：{sum(1 for r in results if r['passed'])} 份通过，"
-          f"{sum(1 for r in results if not r['passed'])} 份不通过 -> {'全部合格 ✅' if ok else '存在不合格 ❌'}")
+    print(f"总计 {len(results)} 份日志：{passed_n} 份通过，{failed_n} 份不通过"
+          f" -> {'全部合格 ✅' if ok else '存在不合格 ❌'}")
     print("=" * 78)
 
     if args.json:
