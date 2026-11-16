@@ -203,7 +203,9 @@ def load_products(out_dir: Path) -> tuple[dict, list[dict]]:
     return {}, data
 
 
-#: 3.5 节要求的 21 个产物
+#: 文档 3.5 的 21 个产物 —— 只适用于**论坛类**源（大港澳 / 澳彩交流）。
+#: 实测 2026-11-16：49图库（tuku）走的是另一套产物名（无 论坛原帖.html / report.html，
+#: 多出 当期文字版.txt / 文字版.html / 文字版.txt），共 22 个。
 PRODUCTS_21 = [
     "users.json", "posts.json", "replies.json", "claims.json", "ocr.json",
     "全站文字版.json", "全站文字版.html", "全站文字版.txt", "六合_看板.html",
@@ -212,10 +214,26 @@ PRODUCTS_21 = [
     "run_meta.json", "manifest.json",
 ]
 
+#: 49图库实测产物（22 个，取自 output\澳门_2026_316期 的真实文件清单）
+PRODUCTS_TUKU = [
+    "users.json", "users.csv", "posts.json", "posts.csv", "replies.json", "replies.csv",
+    "claims.json", "claims.csv", "ocr.json", "ocr.csv", "全站文字版.json",
+    "全站文字版.html", "全站文字版.txt", "文字版.html", "文字版.txt", "当期文字版.txt",
+    "六合_看板.html", "六合_结构化.xlsx", "report.md", "validation.json",
+    "run_meta.json", "manifest.json",
+]
 
-def check_products(out_dir: Path) -> dict:
+PRODUCTS_BY_SOURCE = {
+    "dahkg": PRODUCTS_21,
+    "aocai": PRODUCTS_21,
+    "tuku": PRODUCTS_TUKU,
+}
+
+
+def check_products(out_dir: Path, source: str = "dahkg") -> dict:
+    expected_names = PRODUCTS_BY_SOURCE.get(source, PRODUCTS_21)
     present, missing, sizes = [], [], {}
-    for name in PRODUCTS_21:
+    for name in expected_names:
         p = out_dir / name
         if p.exists() and p.stat().st_size > 0:
             present.append(name)
@@ -223,7 +241,8 @@ def check_products(out_dir: Path) -> dict:
         else:
             missing.append(name)
     return {
-        "expected": len(PRODUCTS_21),
+        "source": source,
+        "expected": len(expected_names),
         "present": len(present),
         "missing": missing,
         "sizes": sizes,

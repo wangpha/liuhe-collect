@@ -83,7 +83,14 @@ def collect(module: str, out_root: Path, args, period: int = 0) -> tuple[int, fl
         cmd += ["--ocr-limit", str(args.ocr_limit)]
     log(f"[采集] 执行：{' '.join(cmd)}")
     t0 = time.time()
-    proc = subprocess.run(cmd, cwd=str(Path.cwd()), check=False)
+    # 子进程必须能 import core：`_compat` 只改了当前进程的 sys.path，
+    # `python -m core.xxx` 是**另一个进程**，得靠 PYTHONPATH 传下去。
+    env = dict(os.environ)
+    core_parent = str(Path(__file__).resolve().parent)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = core_parent + (os.pathsep + existing if existing else "")
+    log(f"[采集] PYTHONPATH={env['PYTHONPATH']}")
+    proc = subprocess.run(cmd, cwd=str(Path.cwd()), check=False, env=env)
     elapsed = time.time() - t0
     log(f"[采集] 退出码={proc.returncode} 耗时={elapsed:.1f}s")
     return proc.returncode, elapsed
@@ -322,8 +329,8 @@ def do_run(args, mode: str = "run") -> int:
                          {"reason": "periodMismatch", "detail": period_check})
         return 30
 
-    # ---- 产物完整性（R3：21 个文件）----
-    product_check = _reconcile.check_products(out_dir)
+    # ---- 产物完整性（R3：论坛类 21 个 / 图库 22 个）----
+    product_check = _reconcile.check_products(out_dir, source)
     log(f"[产物] {product_check['present']}/{product_check['expected']} 个文件存在"
         + ("" if product_check["passed"] else f"  缺失：{product_check['missing']}"))
 
@@ -587,13 +594,15 @@ def do_selftest(args) -> int:
         assert good["hitCount"] == 0 and good["passed"], f"正常文本被误判：{good}"
         return f"命中 1 / 干净文本 0"
 
-    # 21 产物清单自洽
+    # 产物清单自洽（论坛类 21 项 / 图库 22 项，各自不重复）
     def case_products():
         from . import _reconcile as R
 
-        assert len(R.PRODUCTS_21) == 21, f"产物清单应为 21 项，实际 {len(R.PRODUCTS_21)}"
-        assert len(set(R.PRODUCTS_21)) == 21, "产物清单有重复项"
-        return "21 项无重复"
+        assert len(R.PRODUCTS_21) == 21, f"论坛类产物清单应为 21 项，实际 {len(R.PRODUCTS_21)}"
+        assert len(set(R.PRODUCTS_21)) == 21, "论坛类产物清单有重复项"
+        assert len(R.PRODUCTS_TUKU) == 22, f"图库产物清单应为 22 项，实际 {len(R.PRODUCTS_TUKU)}"
+        assert len(set(R.PRODUCTS_TUKU)) == 22, "图库产物清单有重复项"
+        return "论坛类 21 项无重复 / 图库 22 项无重复"
 
     for name, fn in [
         ("1.5 分片分配不变式", case_shard),
