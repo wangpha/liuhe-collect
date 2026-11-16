@@ -85,31 +85,99 @@ def _find_period_dir(work: Path, out_root: Path, source: str) -> Path:
 # ---------------------------------------------------------------------------
 # 采集：只调用现有模块 CLI（与本地手工跑完全相同的入口）
 # ---------------------------------------------------------------------------
+def _patch_dahkg_multisort_union(log) -> list[tuple]:
+    """给 `dahkg.scan_period` 打「多排序并集」补丁（只在云端进程内生效，不改 core）。
+
+    ## 为什么必须这么做（2026-11-16 实测漏帖）
+    模块的 `scan_period` 只用 `fetch_list_page`（内部把 `sortType` 写死成 3 = 按赞）。
+    按赞排序的分页**不稳定**：翻页期间点赞数会变，帖子在页之间移动 → 低赞帖会整条被跳过。
+    实测证据：期号 320 一共 1101 帖，模块只扫到 1100，漏掉
+    `1534674`（createTime 11-16 01:02，远早于采集窗口；它现在在 **sortType=1 第 10 页**，
+    而按赞序列里已经滑出被扫范围）。
+
+    ## 补丁做了什么
+    先用原生 `sort_type=3` 扫一轮，再把 `fetch_list_page` 临时换成 `sort_type=1`
+    扫第二轮，按 tid 取并集。这样两个口径互为兜底 —— 正是文档防线1 第1道的要求。
+    """
+    from core import dahkg
+
+    original_scan = dahkg.scan_period
+    original_fetch = dahkg.fetch_list_page
+
+    def _fetch_by_time(page: int, page_size: int = dahkg.PAGE_SIZE) -> list[dict]:
+        data = dahkg._api_post(
+            {
+                "uri": dahkg.URI_LIST,
+                "currentPage": int(page),
+                "pageSize": int(page_size),
+                "sortType": 1,          # 1 = 按时间（原生写死的是 3）
+                "lastRefreshTime": 0,
+            }
+        )
+        if not data.get("success"):
+            return []
+        return (data.get("data") or {}).get("list") or []
+
+    def patched_scan_period(target_period: int, *args, **kwargs):
+        say = kwargs.get("progress") or (lambda message: None)
+        items_like, scan_like = original_scan(target_period, *args, **kwargs)
+        dahkg.fetch_list_page = _fetch_by_time
+        try:
+            items_time, scan_time = original_scan(target_period, *args, **kwargs)
+        finally:
+            dahkg.fetch_list_page = original_fetch
+
+        seen = {int(it.get("tid") or 0) for it in items_like}
+        extra = [it for it in items_time if int(it.get("tid") or 0) not in seen]
+        say(
+            f"[多排序并集] sortType=3 得 {len(items_like)} 帖；"
+            f"sortType=1 补 {len(extra)} 帖（并集 {len(items_like) + len(extra)}）"
+        )
+        scan = dict(scan_like)
+        scan["multiSort"] = {
+            "byLike": len(items_like),
+            "byTime": len(items_time),
+            "extraByTime": [int(it.get("tid") or 0) for it in extra][:50],
+            "extraCount": len(extra),
+        }
+        return items_like + extra, scan
+
+    dahkg.scan_period = patched_scan_period
+    log("[merge/dahkg] 已给 scan_period 打「按赞 + 按时间」并集补丁（防按赞分页竞态漏帖）")
+    return [(dahkg, "scan_period", original_scan)]
+
+
+def _collect_argv(out_root: Path, args, period: int = 0) -> list[str]:
+    """拼出模块 CLI 参数（subprocess 与进程内调用共用，避免两套参数走偏）。"""
+    argv = ["--out", str(Path(out_root).resolve())]
+    if period:
+        argv += ["--period", str(period)]
+    if args.workers:
+        argv += ["--workers", str(args.workers)]
+    if args.delay is not None:
+        argv += ["--delay", str(args.delay)]
+    if args.max_pages:
+        argv += ["--max-pages", str(args.max_pages)]
+    if args.limit:
+        argv += ["--limit", str(args.limit)]
+    if args.no_images:
+        argv.append("--no-images")
+    if args.no_ocr:
+        argv.append("--no-ocr")
+    if args.no_replies:
+        argv.append("--no-replies")
+    if args.ocr_limit:
+        argv += ["--ocr-limit", str(args.ocr_limit)]
+    return argv
+
+
 def collect(module: str, out_root: Path, args, period: int = 0) -> tuple[int, float]:
     # **必须绝对路径**：core/dahkg.py::run_dahkg_report 里用
     # `(out_dir / "论坛原帖.html").as_uri()` 生成 postUrl，
     # 相对路径会抛 `ValueError: relative path can't be expressed as a file URI`
     # （2026-11-16 Gate2 实测：dahkg/aocai 因此退出码 1）。
     out_root = Path(out_root).resolve()
-    cmd = [sys.executable, "-m", module, "--out", str(out_root)]
-    if period:
-        cmd += ["--period", str(period)]
-    if args.workers:
-        cmd += ["--workers", str(args.workers)]
-    if args.delay is not None:
-        cmd += ["--delay", str(args.delay)]
-    if args.max_pages:
-        cmd += ["--max-pages", str(args.max_pages)]
-    if args.limit:
-        cmd += ["--limit", str(args.limit)]
-    if args.no_images:
-        cmd.append("--no-images")
-    if args.no_ocr:
-        cmd.append("--no-ocr")
-    if args.no_replies:
-        cmd.append("--no-replies")
-    if args.ocr_limit:
-        cmd += ["--ocr-limit", str(args.ocr_limit)]
+    cmd = [sys.executable, "-m", module] + _collect_argv(out_root, args, period)
     log(f"[采集] 执行：{' '.join(cmd)}")
     t0 = time.time()
     # 子进程必须能 import core：`_compat` 只改了当前进程的 sys.path，
@@ -433,7 +501,21 @@ def do_run(args, mode: str = "run") -> int:
 
     # ---- 采集（现有模块，同参数入口）----
     collect_started = time.time()          # 时间对齐基准：只对账"采集前已存在"的帖子
-    rc, elapsed = collect(MODULE_OF[source], out_root, args, period=period)
+    if source == "dahkg":
+        # dahkg 走**进程内**：这样"按赞+按时间并集"的 scan_period 补丁才生效
+        # （模块的 fetch_list_page 把 sortType 写死成 3，按赞分页有竞态，实测漏过 1 帖）
+        argv = _collect_argv(out_root, args, period)
+        log(f"[采集] 进程内执行 core.dahkg {argv}")
+        originals = _patch_dahkg_multisort_union(log)
+        try:
+            rc = _run_module_main("core.dahkg", argv)
+        finally:
+            for mod, name, orig in (originals or []):
+                setattr(mod, name, orig)
+        elapsed = time.time() - collect_started
+        log(f"[采集] 退出码={rc} 耗时={elapsed:.1f}s（进程内 + 多排序并集）")
+    else:
+        rc, elapsed = collect(MODULE_OF[source], out_root, args, period=period)
     if rc != 0:
         log(f"[{mode}] 采集退出码 {rc} ≠ 0 —— 中止，不进入校验（文档 3-C 第 7 项）")
         return rc
