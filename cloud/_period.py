@@ -130,7 +130,7 @@ def detect_verified_dahkg(
             raise PeriodAbort(f"校验3失败：期号跳变过大 {last_period} -> {period_by_time}（>2）")
         say(f"[期号校验3] 单调性通过：上次 {last_period} -> 本次 {period_by_time}")
     else:
-        say("[期号校验3] 无历史期号记录，跳过单调性检查（首轮）")
+        say("[期号校验3] 无历史期号记录，本轮建立基线（首轮，无需比较）")
 
     # ---- 校验 4：开奖接口交叉验证（只 warn，不 abort —— 两套编号差 197+） ----
     draw = _draw_periods()
@@ -280,3 +280,4 @@ def check_posts_period(posts: list[dict], target: int) -> dict:
         "wrong": wrong[:20],
         "passed": len(wrong) == 0,
     }
+

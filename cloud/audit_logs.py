@@ -105,8 +105,28 @@ def is_statistic(line: str) -> bool:
     return bool(STAT_LINE.search(line))
 
 
+#: 五道防线自己的汇总行（形如 `[防线2] ... 文件缺失 0 ...  ← 通过`）。
+#: 这类行会同时包含「缺失」「不一致」等关键字和自己的**结论**，
+#: 不能按关键字判 —— 必须按它自报的结论判：
+#:   · `← 通过`   → 该行所有指标已在这行里显式给出且为 0，跳过
+#:   · `← 不通过` → 真问题，记为数据问题
+#: 2026-11-16 Gate2 实测误报：
+#:   `L86 [数据问题] 缺失 <- [防线2] ... 文件缺失 0 ... ← 通过`
+GATE_VERDICT = re.compile(r"\[防线\d+\].*←\s*(通过|不通过)")
+
+
 def scan_line(line: str) -> list[dict]:
     hits: list[dict] = []
+    verdict = GATE_VERDICT.search(line)
+    if verdict:
+        if verdict.group(1) == "通过":
+            return hits          # 防线自报通过，且计数已显式列出
+        return [{
+            "group": "数据问题",
+            "matched": "防线不通过",
+            "why": "五道防线自报不通过",
+            "line": line.strip()[:300],
+        }]
     if is_statistic(line):
         # 关键字后面跟的是 0 —— 这是在汇报"零异常"，不是异常
         return hits
