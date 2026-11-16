@@ -705,6 +705,112 @@ def _run_module_main(module: str, argv: list[str]) -> int:
     return code
 
 
+def _install_diag_probes() -> dict:
+    """给「OCR 纯识别」与「图片下载」各装一个计时探针（仅本进程、仅 cloud 侧）。
+
+    ## 为什么需要（2026-11-17 用户要求先分清 CPU 异构 / 网络异构）
+    之前我用日志里的 `[OCR] 识别进度 … 已用 Ns` 算吞吐，那是**OCR 阶段自计时**，
+    而模块的媒体流水线是「边下边识」重叠的 → 该数字混入了下载等待，不能据此断定是 CPU 慢。
+    这里直接在函数边界计时：`analyze_image` 的累计秒数就是**纯识别**，
+    `download_images` 的累计秒数就是**纯下载**。
+
+    返回的 stats 由调用方读取（shard 结束时写进 artifact）。
+    """
+    import importlib
+
+    stats = {
+        "ocr": {"calls": 0, "seconds": 0.0},
+        "download": {"calls": 0, "seconds": 0.0},
+        "patched": {"ocr": [], "download": []},
+    }
+
+    def wrap(mod_name: str, attr: str, key: str) -> None:
+        """包裹该模块**当前**持有的那个函数。
+
+        ⚠️ 踩坑记录（2026-11-17）：最初只包裹 `core.ocr.analyze_image`，
+        再要求「其它模块的属性 is 原始函数」才包裹。结果 `do_shard` 里
+        `_patch_shard` **先**导入了 core 模块（那时异常/正常已绑定原始函数），
+        之后安装探针就判断失败 → 只有 core.ocr 被包裹，dahkg 那条
+        `scraper.ocr_post_images → analyze_image` 路径实际没被测到。
+        改成「各自包裹自己的当前绑定」后与导入顺序无关，也不会重复计数
+        （每个模块的调用只会经过它自己的那层包装）。
+        """
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:  # noqa: BLE001 - 模块不存在就跳过
+            return
+        cur = getattr(mod, attr, None)
+        if cur is None or getattr(cur, "_diag_wrapped", False):
+            return
+
+        def timed(*a, **kw):
+            t0 = time.perf_counter()
+            try:
+                return cur(*a, **kw)
+            finally:
+                stats[key]["calls"] += 1
+                stats[key]["seconds"] += time.perf_counter() - t0
+
+        timed._diag_wrapped = True  # type: ignore[attr-defined]
+        setattr(mod, attr, timed)
+        stats["patched"][key].append(f"{mod_name}.{attr}")
+
+    for m in ("core.ocr", "core.scraper", "core.forum", "core.dahkg",
+              "core.history", "core.backfill", "core.ocr_samples"):
+        wrap(m, "analyze_image", "ocr")
+    for m in ("core.scraper", "core.forum", "core.history", "core.backfill"):
+        wrap(m, "download_images", "download")
+
+    return stats
+
+
+def _cpu_model() -> str:
+    """读 CPU 型号（判断是不是所有 runner 同型号）。"""
+    try:
+        out = subprocess.run(["lscpu"], capture_output=True, text=True, timeout=15)
+        for line in (out.stdout or "").splitlines():
+            if line.lower().startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return "unknown"
+
+
+def _ocr_micro_benchmark(out_root: Path, limit: int = 3) -> dict:
+    """预热后对 3 张真实图做纯 OCR，返回每张秒数（用于横向比较 runner 算力）。"""
+    import importlib
+
+    try:
+        from core import ocr as ocr_mod
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    analyze = getattr(ocr_mod, "analyze_image", None)
+    if not analyze:
+        return {"error": "core.ocr 没有 analyze_image"}
+    imgs: list[Path] = []
+    for pat in ("*.png", "*.jpg", "*.jpeg", "*.webp"):
+        imgs += list(Path(out_root).rglob(pat))
+        if len(imgs) >= limit * 4:
+            break
+    imgs = imgs[:limit]
+    if not imgs:
+        return {"error": "找不到可测的图片"}
+    seconds: list[float] = []
+    try:
+        analyze(str(imgs[0]))          # 预热：把引擎拉起来并写入缓存
+        for img in imgs:
+            t0 = time.perf_counter()
+            analyze(str(img))
+            seconds.append(round(time.perf_counter() - t0, 3))
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}", "done": seconds}
+    return {
+        "images": len(seconds),
+        "seconds": seconds,
+        "median": sorted(seconds)[len(seconds) // 2] if seconds else 0,
+    }
+
+
 def do_shard(args) -> int:
     """分片任务：**只负责把它那一份帖子的缓存（详情/回复/图片/OCR）暖起来**。
 
@@ -769,17 +875,38 @@ def do_shard(args) -> int:
     if args.no_replies:
         argv.append("--no-replies")
 
+    # ---- 诊断探针：区分「CPU 慢」与「网络慢」（用户 2026-11-17 要求）----
+    diag = _install_diag_probes()
+    log(f"[diag] OCR 探针挂载：{diag['patched']['ocr'] or '无'}")
+    log(f"[diag] 下载探针挂载：{diag['patched']['download'] or '无'}")
+    cpu_model = _cpu_model()
+    log(f"[diag] CPU = {cpu_model}")
+    run_t0 = time.perf_counter()
+
     try:
         code = _run_module_main(MODULE_OF[source], argv)
     finally:
         for mod, name, original in (originals or []):
             setattr(mod, name, original)
+    run_seconds = round(time.perf_counter() - run_t0, 1)
 
     log(
         f"[shard] {source} 本片：源站本期共 {sink.get('total', 0)} 帖 / {sink.get('imagesTotal', 0)} 图，"
         f"本片负责 {sink.get('picked', 0)} 帖 / {sink.get('imagesPicked', 0)} 图"
         f"（模式={sink.get('mode', '?')}）；模块退出码={code}"
     )
+
+    # OCR/下载 分开计时（这是"CPU 慢还是网络慢"的判据）
+    ocr_s = round(diag["ocr"]["seconds"], 1)
+    dl_s = round(diag["download"]["seconds"], 1)
+    ocr_n = diag["ocr"]["calls"]
+    log(
+        f"[diag] 本片总耗时 {run_seconds}s = OCR {ocr_s}s（{ocr_n} 次调用，"
+        f"{(ocr_s / ocr_n):.3f} 秒/次） + 下载 {dl_s}s + 其他 {round(run_seconds - ocr_s - dl_s, 1)}s"
+    )
+    bench = _ocr_micro_benchmark(out_root, limit=3) if not args.no_ocr else {"skipped": True}
+    log(f"[diag] 微型基准（预热后 3 张）: {bench}")
+
     _guard.save_json(
         work / "shards" / f"shard_{source}_{shard_index}.json",
         {
@@ -791,6 +918,17 @@ def do_shard(args) -> int:
             "pickedItems": sink.get("picked", 0),
             "exitCode": code,
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "diag": {
+                "cpuModel": cpu_model,
+                "runSeconds": run_seconds,
+                "ocrSeconds": ocr_s,
+                "ocrCalls": ocr_n,
+                "ocrSecondsPerCall": round(ocr_s / ocr_n, 4) if ocr_n else 0,
+                "downloadSeconds": dl_s,
+                "downloadCalls": diag["download"]["calls"],
+                "otherSeconds": round(run_seconds - ocr_s - dl_s, 1),
+                "benchmark": bench,
+            },
         },
     )
     return code
