@@ -28,6 +28,8 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 DATA_REPO = "https://github.com/wangpha/liuhe-data.git"
 APP_NAME = "六合采集器"
 
@@ -105,23 +107,35 @@ def local_periods(dest: Path, sub: str) -> set[str]:
 
 
 def sync_source(repo: Path, dest: Path, key: str, info: dict, dry_run: bool) -> dict:
+    """把某源缺失的期同步到本地。
+
+    支持两种数据仓布局：
+      · **新**（2026-11-16 起）：`data/<源>/<期>.tar.gz` —— 每期一个压缩包。
+        原因：大港澳一期 users.json 实测 209 MB、posts.json 191 MB，超过 GitHub 单文件 100 MB 上限，
+        平铺目录的写法 push 会被 pre-receive hook 拒绝。压缩后实测 244 MB → 17.2 MB。
+      · **旧**：`data/<源>/<期>/...` 平铺目录（仅兼容历史数据）。
+    """
+    import sys
+
+    from pack_period import unpack
+
     sub, source_id = SOURCE_MAP.get(key, (key, key))
+    entries = info.get("entries") or {}
     remote_all = set(info.get("periods") or [])
 
-    # 过滤「非正式期目录」：数据仓里可能残留中间目录（如 49图库的
-    # `历史回采/49图库/2026-11-15_第320期`，只有 5 个文件、没有 posts.json）。
-    # 判据与 publish 一致：必须有 posts.json 才算正式产物期。
+    # 过滤「非正式期」：新布局看有没有 .tar.gz；旧布局必须有 posts.json
     remote: set[str] = set()
     ignored: list[str] = []
     for name in remote_all:
-        rel = f"data/{key}/{name}/posts.json"
-        try:
-            has_posts = run(
-                ["git", "cat-file", "-e", f"origin/main:{rel}"], cwd=repo, check=False
-            ).returncode == 0
-        except Exception:  # noqa: BLE001 - 查不到就当非正式目录
-            has_posts = False
-        if has_posts:
+        entry = entries.get(name) or {}
+        archive = entry.get("archive") or f"{name}.tar.gz"
+        has_archive = run(
+            ["git", "cat-file", "-e", f"origin/main:data/{key}/{archive}"], cwd=repo, check=False
+        ).returncode == 0
+        has_dir = run(
+            ["git", "cat-file", "-e", f"origin/main:data/{key}/{name}/posts.json"], cwd=repo, check=False
+        ).returncode == 0
+        if has_archive or has_dir:
             remote.add(name)
         else:
             ignored.append(name)
@@ -131,8 +145,8 @@ def sync_source(repo: Path, dest: Path, key: str, info: dict, dry_run: bool) -> 
 
     log(f"\n[sync] 源 {key}（本地子目录 '{sub or '(根)'}' -> {dest}）")
     if ignored:
-        log(f"[sync]   忽略非正式目录 {len(ignored)} 个（无 posts.json）：{ignored[:5]}")
-    log(f"[sync]   云端 {len(remote)} 期" + (f"（另有 {len(ignored)} 个非正式目录已忽略）" if ignored else ""))
+        log(f"[sync]   忽略非正式目录 {len(ignored)} 个：{ignored[:5]}")
+    log(f"[sync]   云端 {len(remote)} 期" + (f"（另忽略 {len(ignored)} 个）" if ignored else ""))
     log(f"[sync]   本地已有 {len(have)} 期")
     log(f"[sync]   需要补齐 {len(need)} 期：{need if len(need) <= 12 else need[:12] + ['...']}")
 
@@ -142,6 +156,7 @@ def sync_source(repo: Path, dest: Path, key: str, info: dict, dry_run: bool) -> 
             log(f"[sync]   dry-run：尚有 {len(pending)} 期待补齐（未下载，不算失败）")
         return {
             "source": key,
+            "layout": "tar.gz" if entries else "legacy-dir",
             "remote": len(remote),
             "ignored": ignored,
             "local": len(have),
@@ -156,28 +171,47 @@ def sync_source(repo: Path, dest: Path, key: str, info: dict, dry_run: bool) -> 
     copied: list[str] = []
     problems: list[str] = []
     for period_name in need:
-        rel = f"data/{key}/{period_name}"
+        entry = entries.get(period_name) or {}
+        archive_name = entry.get("archive") or f"{period_name}.tar.gz"
+        rel = f"data/{key}/{archive_name}"
         log(f"[sync]   ↓ {rel}")
-        run(["git", "sparse-checkout", "set", rel], cwd=repo, check=False)
-        src = repo / rel
-        if not src.is_dir() or not any(src.rglob("*")):
-            problems.append(f"{period_name}: 稀疏检出后目录为空（{rel}）")
-            log(f"[sync]     ✗ {period_name} 检出后为空，跳过")
+        cache_dir = repo / "_sync_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        local_archive = cache_dir / archive_name
+        proc = run(["git", "show", f"origin/main:{rel}"], cwd=repo, check=False)
+        if proc.returncode != 0:
+            problems.append(f"{period_name}: 取归档失败（{proc.stderr[:120]}）")
+            log(f"[sync]     ✗ {period_name} 取归档失败，跳过")
             continue
-        dst = (dest / sub / period_name) if sub else (dest / period_name)
-        if dst.exists():
-            shutil.rmtree(dst, ignore_errors=True)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(src, dst)
+        # git show 会把二进制写进 stdout；用二进制方式重取一次，避免编码问题
+        with local_archive.open("wb") as fh:
+            p2 = subprocess.run(
+                ["git", "show", f"origin/main:{rel}"],
+                cwd=str(repo), capture_output=True, check=False,
+            )
+            if p2.returncode != 0:
+                problems.append(f"{period_name}: 取归档失败（二进制）")
+                continue
+            fh.write(p2.stdout)
 
-        # 校验：文件数 vs manifest
-        expect = (info.get("files") or {}).get(period_name)
-        actual = sum(1 for f in dst.rglob("*") if f.is_file())
-        if expect is not None and actual != expect:
-            problems.append(f"{period_name}: 文件数 {actual} != 云端 {expect}")
-        else:
-            copied.append(period_name)
-            log(f"[sync]     ✅ 已补齐 {period_name}（{actual} 个文件）")
+        target_dir = (dest / sub / period_name) if sub else (dest / period_name)
+        try:
+            res = unpack(
+                local_archive,
+                target_dir,
+                expected_sha256=str(entry.get("sha256") or ""),
+                expected_files=int(entry.get("files") or 0),
+            )
+        except SystemExit as exc:
+            problems.append(f"{period_name}: 解包失败（{exc}）")
+            log(f"[sync]     ✗ {period_name} 解包失败：{exc}")
+            continue
+        if not res["passed"]:
+            problems.append(f"{period_name}: 文件数不符 实际 {res['files']} 期望 {res['expectedFiles']}")
+            log(f"[sync]     ✗ {period_name} 文件数不符")
+            continue
+        copied.append(period_name)
+        log(f"[sync]     ✅ 已补齐 {period_name}（{res['files']} 个文件，sha256 校验通过）")
 
     after = local_periods(dest, sub)
     missing = sorted(remote - after, key=period_number)
@@ -262,3 +296,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

@@ -859,63 +859,12 @@ jobs:
         with:
           pattern: run-*-${{ github.run_id }}
           path: repo/work/incoming-logs
-      - name: 合并进数据仓 + 生成 manifest
+      - name: 写入数据仓（每期一个 tar.gz）+ 生成 manifest
         working-directory: repo
         run: |
-          python - <<'PY'
-          import json, shutil, sys
-          from pathlib import Path
-          from datetime import datetime, timezone
+          set -o pipefail
+          python cloud/publish_store.py --incoming work/incoming --store work/store 2>&1 | tee work/publish_store.log
 
-          incoming = Path("work/incoming")
-          store = Path("work/store")
-          data = store / "data"
-          data.mkdir(parents=True, exist_ok=True)
-          NAME_MAP = {"大港澳": "dahkg", "澳彩交流": "aocai", "tuku": "tuku"}
-
-          def key_for(artifact_name, period_dir):
-              parts = artifact_name.split("-")
-              if len(parts) >= 2 and parts[1] in ("dahkg", "aocai", "tuku"):
-                  return parts[1]
-              return NAME_MAP.get(period_dir.parent.name, period_dir.parent.name or "unknown")
-
-          copied = []
-          for src_root in sorted(incoming.glob("products-*")):
-              if not src_root.is_dir():
-                  continue
-              found = [p for p in src_root.rglob("*期") if p.is_dir() and (p / "posts.json").exists()]
-              skipped = [p for p in src_root.rglob("*期") if p.is_dir() and not (p / "posts.json").exists()]
-              print(f"{src_root.name}: 正式期目录 {len(found)} 个 -> {[p.name for p in found][:5]}")
-              if skipped:
-                  print(f"{src_root.name}: 跳过非产物目录 {len(skipped)} 个")
-              for period_dir in found:
-                  key = key_for(src_root.name, period_dir)
-                  dst = data / key / period_dir.name
-                  if dst.exists():
-                      shutil.rmtree(dst)
-                  dst.parent.mkdir(parents=True, exist_ok=True)
-                  shutil.copytree(period_dir, dst, ignore=shutil.ignore_patterns("images", ".cache"))
-                  copied.append(f"{key}/{period_dir.name}")
-
-          if not copied:
-              print("FATAL: 没有把任何一期的产物合并进数据仓", file=sys.stderr)
-              sys.exit(1)
-
-          manifest = {}
-          for key_dir in sorted(p for p in data.iterdir() if p.is_dir()):
-              periods = sorted((p for p in key_dir.iterdir() if p.is_dir()),
-                               key=lambda p: int(''.join(c for c in p.name.split('_')[-1] if c.isdigit()) or 0))
-              manifest[key_dir.name] = {
-                  "periods": [p.name for p in periods],
-                  "count": len(periods),
-                  "files": {p.name: sum(1 for f in p.rglob('*') if f.is_file()) for p in periods},
-              }
-          (store / "manifest.json").write_text(
-              json.dumps({"generatedAt": datetime.now(timezone.utc).isoformat(), "sources": manifest},
-                         ensure_ascii=False, indent=2), encoding="utf-8")
-          print("copied:", copied)
-          print("manifest:", {k: v["count"] for k, v in manifest.items()})
-          PY
       - name: 保存日志到数据仓（保留最近 30 份）
         working-directory: repo
         run: |
