@@ -493,16 +493,24 @@ jobs:
         with:
           pattern: cache-dahkg-*-${{ github.run_id }}
           path: repo/work/incoming-cache
-      - name: 解开所有分片缓存
+      - name: 解开各分片缓存到独立目录（不能直接解到 work/out，否则同名 JSON 互相覆盖）
         working-directory: repo
         run: |
-          mkdir -p work/out
+          rm -rf work/cache-in && mkdir -p work/cache-in work/out
           n=0
           for f in $(find work/incoming-cache -name 'cache_*.tar.gz' -type f 2>/dev/null); do
-            echo "解开 $f"; tar -xzf "$f" -C work/out; n=$((n+1))
+            name=$(basename "$f" .tar.gz)
+            mkdir -p "work/cache-in/$name"
+            tar -xzf "$f" -C "work/cache-in/$name"
+            n=$((n+1))
           done
-          echo "共解开 $n 份缓存"
-          find work/out -type d -name .cache | head -5
+          echo "共解开 $n 份分片缓存到 work/cache-in/"
+          find work/cache-in -maxdepth 1 -mindepth 1 -type d | head -20
+      - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
+        working-directory: repo
+        run: |
+          set -o pipefail
+          python cloud/merge_caches.py --target work/out --sources work/cache-in/* 2>&1 | tee work/merge_caches.log
       - name: 恢复 OCR 缓存（actions/cache 兜底）
         uses: actions/cache@v4
         with:
@@ -612,16 +620,24 @@ jobs:
         with:
           pattern: cache-aocai-*-${{ github.run_id }}
           path: repo/work/incoming-cache
-      - name: 解开所有分片缓存
+      - name: 解开各分片缓存到独立目录（不能直接解到 work/out，否则同名 JSON 互相覆盖）
         working-directory: repo
         run: |
-          mkdir -p work/out
+          rm -rf work/cache-in && mkdir -p work/cache-in work/out
           n=0
           for f in $(find work/incoming-cache -name 'cache_*.tar.gz' -type f 2>/dev/null); do
-            echo "解开 $f"; tar -xzf "$f" -C work/out; n=$((n+1))
+            name=$(basename "$f" .tar.gz)
+            mkdir -p "work/cache-in/$name"
+            tar -xzf "$f" -C "work/cache-in/$name"
+            n=$((n+1))
           done
-          echo "共解开 $n 份缓存"
-          find work/out -type d -name .cache | head -5
+          echo "共解开 $n 份分片缓存到 work/cache-in/"
+          find work/cache-in -maxdepth 1 -mindepth 1 -type d | head -20
+      - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
+        working-directory: repo
+        run: |
+          set -o pipefail
+          python cloud/merge_caches.py --target work/out --sources work/cache-in/* 2>&1 | tee work/merge_caches.log
       - name: 恢复 OCR 缓存（actions/cache 兜底）
         uses: actions/cache@v4
         with:
@@ -731,16 +747,24 @@ jobs:
         with:
           pattern: cache-tuku-*-${{ github.run_id }}
           path: repo/work/incoming-cache
-      - name: 解开所有分片缓存
+      - name: 解开各分片缓存到独立目录（不能直接解到 work/out，否则同名 JSON 互相覆盖）
         working-directory: repo
         run: |
-          mkdir -p work/out
+          rm -rf work/cache-in && mkdir -p work/cache-in work/out
           n=0
           for f in $(find work/incoming-cache -name 'cache_*.tar.gz' -type f 2>/dev/null); do
-            echo "解开 $f"; tar -xzf "$f" -C work/out; n=$((n+1))
+            name=$(basename "$f" .tar.gz)
+            mkdir -p "work/cache-in/$name"
+            tar -xzf "$f" -C "work/cache-in/$name"
+            n=$((n+1))
           done
-          echo "共解开 $n 份缓存"
-          find work/out -type d -name .cache | head -5
+          echo "共解开 $n 份分片缓存到 work/cache-in/"
+          find work/cache-in -maxdepth 1 -mindepth 1 -type d | head -20
+      - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
+        working-directory: repo
+        run: |
+          set -o pipefail
+          python cloud/merge_caches.py --target work/out --sources work/cache-in/* 2>&1 | tee work/merge_caches.log
       - name: 恢复 OCR 缓存（actions/cache 兜底）
         uses: actions/cache@v4
         with:
