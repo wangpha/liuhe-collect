@@ -51,12 +51,8 @@ on:
         default: "0"
         type: string
 
-  # ⚠️ 生产定时任务：Gate 1–5 + 最终日志审计全部通过后再解注释
-  # schedule:
-  #   - cron: '30 8 * * *'    # 16:30 北京时间
-  #   - cron: '30 10 * * *'   # 18:30
-  #   - cron: '30 12 * * *'   # 20:30
-  #   - cron: '0 15 * * *'    # 23:00 收齐当天
+  schedule:
+    - cron: '*/5 * * * *'
 
 concurrency:
   group: crawl-${{ github.ref }}
@@ -894,3 +890,4 @@ jobs:
           name: publish-${{ github.run_id }}
           path: repo/work/store/manifest.json
           if-no-files-found: warn
+
