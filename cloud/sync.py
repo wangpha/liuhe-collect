@@ -64,7 +64,7 @@ def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subproce
     return proc
 
 
-def ensure_repo(work: Path) -> Path:
+def ensure_repo(work: Path, repo_url: str = DATA_REPO) -> Path:
     """准备一个带凭据的稀疏检出仓库。"""
     repo = work / "repo"
     if not (repo / ".git").exists():
@@ -72,7 +72,7 @@ def ensure_repo(work: Path) -> Path:
         log(f"[sync] 首次克隆数据仓到 {repo}")
         if repo.exists():
             shutil.rmtree(repo)
-        run(["git", "clone", "--filter=blob:none", "--no-checkout", DATA_REPO, str(repo)])
+        run(["git", "clone", "--filter=blob:none", "--no-checkout", repo_url, str(repo)])
     run(["git", "fetch", "--depth", "1", "origin", "main"], cwd=repo)
     return repo
 
@@ -175,16 +175,18 @@ def main(argv=None) -> int:
     parser.add_argument("--sources", default="", help="只处理这些源，逗号分隔")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--rebuild", action="store_true", help="补齐后重新生成报表")
+    parser.add_argument("--repo-url", default=DATA_REPO, help="数据仓地址（测试时可指向本地仓）")
+    parser.add_argument("--work", default="", help="缓存工作目录（默认 %%LOCALAPPDATA%%\\六合采集器\\cloud-sync）")
     args = parser.parse_args(argv)
 
     dest = Path(args.dest) if args.dest else default_dest()
-    work = cache_root()
+    work = Path(args.work) if args.work else cache_root()
     log("=" * 70)
     log(f"[sync] 本地输出根: {dest}")
     log(f"[sync] 缓存仓库  : {work}")
     log("=" * 70)
 
-    repo = ensure_repo(work)
+    repo = ensure_repo(work, args.repo_url)
     manifest = read_manifest(repo)
     sources = manifest.get("sources") or {}
     if not sources:

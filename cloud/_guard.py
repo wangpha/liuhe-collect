@@ -15,8 +15,12 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
-#: 防线 5 第 5 道：乱码特征
-MOJIBAKE_MARKERS = ("\ufffd", "锟斤拷", "烫烫烫", "屯屯屯", "???")
+#: 防线 5 第 5 道：**硬**乱码特征 —— 出现即判定为编码损坏，进 abnormal_text 并失败
+HARD_MOJIBAKE = ("\ufffd", "锟斤拷", "烫烫烫", "屯屯屯")
+#: **软**特征：连续问号。2026-11-16 实测证明它会被正常用户输入命中
+#: （原文："别要求那么多 OK????" —— 4 个问号，中文正常），所以只记录供人工复核，
+#: 不直接判失败，避免把正常内容当故障、逼着后续把真问题也一起放宽。
+SOFT_MOJIBAKE = ("???",)
 
 
 def _sha(text: str) -> str:
@@ -106,25 +110,40 @@ def _iter_strings(node: Any, path: str = ""):
 
 
 def scan_mojibake(payload: Any, limit: int = 50, min_len: int = 2) -> dict:
-    """扫描所有识别文本里的编码错误特征。命中即记入报告，人工复核（文档 3-C 第 6 项）。"""
-    hits: list[dict] = []
+    """扫描识别文本里的编码错误特征。
+
+    分两级（实测依据见 SOFT/HARD_MOJIBAKE 注释）：
+      * 硬命中（U+FFFD / 锟斤拷 / 烫烫烫 / 屯屯屯）→ `passed=False`，进 abnormal_text
+      * 软命中（连续问号）→ 只记录，供人工复核，不算失败
+    """
+    hard: list[dict] = []
+    soft: list[dict] = []
     scanned = 0
     for path, text in _iter_strings(payload):
         if not text:
             continue
         scanned += 1
-        for marker in MOJIBAKE_MARKERS:
+        for marker in HARD_MOJIBAKE:
             if marker in text:
-                hits.append({"path": path[:160], "marker": marker, "sample": text[:80]})
+                hard.append({"path": path[:160], "marker": repr(marker), "level": "hard", "sample": text[:80]})
                 break
-        if len(hits) >= limit:
+        else:
+            for marker in SOFT_MOJIBAKE:
+                if marker in text:
+                    soft.append({"path": path[:160], "marker": repr(marker), "level": "soft", "sample": text[:120]})
+                    break
+        if len(hard) + len(soft) >= limit:
             break
-    # 单独统计 OCR 文本里连续问号（??? 已在 markers 里，这里给出总量）
     return {
         "stringsScanned": scanned,
-        "hitCount": len(hits),
-        "hits": hits,
-        "passed": not hits,
+        "hardCount": len(hard),
+        "softCount": len(soft),
+        "hitCount": len(hard) + len(soft),
+        "hits": hard + soft,
+        "hard": hard,
+        "soft": soft,
+        "passed": not hard,
+        "note": "软命中=连续问号，实测可由正常用户输入产生，需人工复核（文档 3-C 第 6 项）",
     }
 
 

@@ -26,6 +26,17 @@ PATTERNS: list[tuple[str, str, str]] = [
     ("时间问题", r"连续\s*\d+\s*秒无输出|超时\s*\d+\s*秒", "长时间无输出"),
 ]
 
+#: 「统计型」句子：关键字后面紧跟 0，是在汇报"没有异常"，不是异常本身。
+#: 例：`[列表] 完成：980 条本期帖子，扫描 490 页，跳过其他期 0 条`
+#:     `[防线4] 逐帖期号校验：检查 984 帖，错误 0 个`
+#:     `[OCR] 完成 107 张：... 失败 0，未下载 0`
+#: 注意：只放过 **数值为 0** 的情况；`失败 3` 依然判不通过（不放宽阈值）。
+STAT_LINE = re.compile(
+    r"(失败|错误|跳过|命中|缺口|差异|差值|不一致|未下载|超时|重试)"
+    r"[^0-9\n]{0,10}?"          # 关键字与数字之间允许少量中文（如「跳过其他期 0 条」）
+    r"0(?=\s*(?:个|条|张|次|期|，|,|$|\s))"
+)
+
 #: 允许白名单：某些行是**采集结果的正常描述**，不是故障。
 #: 每一条都必须写明理由（红线：不许为了让检查通过而放宽）。
 ALLOW: list[tuple[str, str]] = [
@@ -41,16 +52,38 @@ ALLOW: list[tuple[str, str]] = [
     (r"Cache (restored|saved|not found|hit)", "缓存状态提示"),
     (r"No files were found", "artifact 空目录提示"),
     (r"Warning: (Node\.js|The following actions)", "Actions 平台自身版本提示"),
+    (
+        r"DiscoverDevicesForPlatform\]\s*GPU device discovery failed",
+        "无显卡 runner 上 onnxruntime 探测 GPU 的固定提示；CPU 模式已强制"
+        "（QODE_OCR_DML=0），同轮 OCR 统计 失败 0 / 缓存命中 100%，非故障。"
+        "已由 cloud/sitecustomize.py 把 ORT 日志级别降到 ERROR，此行属兜底白名单",
+    ),
+    (
+        r"乱码扫描：检查 \d+ 个字符串，硬乱码 \d+ / 连续问号 \d+",
+        "这是**审计汇报行**本身，不是异常；软命中(连续问号)已记录待人工复核",
+    ),
+    (
+        r"乱码扫描：检查 \d+ 个字符串，命中 \d+",
+        "旧格式的**审计汇报行**本身（新版本已拆成 硬乱码/连续问号），不是异常",
+    ),
 ]
+
+
+def is_statistic(line: str) -> bool:
+    """该行是否属于「关键字 + 0」的统计汇报（0 表示无异常）。"""
+    return bool(STAT_LINE.search(line))
 
 
 def scan_line(line: str) -> list[dict]:
     hits: list[dict] = []
+    if is_statistic(line):
+        # 关键字后面跟的是 0 —— 这是在汇报"零异常"，不是异常
+        return hits
+    if any(re.search(allow, line) for allow, _ in ALLOW):
+        return hits
     for group, pattern, why in PATTERNS:
         m = re.search(pattern, line)
         if not m:
-            continue
-        if any(re.search(allow, line) for allow, _ in ALLOW):
             continue
         hits.append({"group": group, "matched": m.group(0), "why": why, "line": line.strip()[:300]})
     return hits

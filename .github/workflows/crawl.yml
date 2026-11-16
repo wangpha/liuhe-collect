@@ -318,8 +318,20 @@ jobs:
                   continue
               # **关键修复**：artifact 解包后的层级不固定（upload-artifact 会剥掉公共前缀），
               # 所以按内容递归找 `*期` 目录，而不是假设固定的 work/out。
-              found = [p for p in src_root.rglob("*期") if p.is_dir()]
-              print(f"{src_root.name}: 找到期目录 {len(found)} 个 -> {[p.name for p in found][:5]}")
+              # 还必须排除中间目录：49图库会写 `历史回采/49图库/2026-11-15_第320期`
+              # （只有 5 个文件），它和正式产物 `澳门_2026_320期` 期号相同，
+              # 判据 = 必须有 posts.json（正式产物必有，中间目录没有）。
+              found = [
+                  p for p in src_root.rglob("*期")
+                  if p.is_dir() and (p / "posts.json").exists()
+              ]
+              skipped = [
+                  p for p in src_root.rglob("*期")
+                  if p.is_dir() and not (p / "posts.json").exists()
+              ]
+              print(f"{src_root.name}: 正式期目录 {len(found)} 个 -> {[p.name for p in found][:5]}")
+              if skipped:
+                  print(f"{src_root.name}: 跳过非产物目录 {len(skipped)} 个 -> {[str(p.relative_to(src_root)) for p in skipped][:5]}")
               for period_dir in found:
                   key = key_for(src_root.name, period_dir)
                   dst = data / key / period_dir.name

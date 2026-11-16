@@ -48,14 +48,25 @@ def _state_path(work: Path, source: str, name: str) -> Path:
 
 
 def _find_period_dir(work: Path, out_root: Path, source: str) -> Path:
-    """产物目录：out_root/<源子目录>/澳门_YYYY_XXX期（取最新一期）。"""
+    """产物目录：out 下**真正含产物**的那一期目录。
+
+    实测坑（2026-11-16 Gate1）：49图库除了 `澳门_2026_320期`，还会写一个
+    `历史回采/49图库/2026-11-15_第320期` 的中间目录（只有 5 个文件），
+    两个目录名解析出来的期号都是 320 —— 只按期号取最大会取错。
+    判据：优先 posts.json 存在，其次文件数最多。
+    """
     sub = SOURCE_SUBDIR[source]
     base = out_root / sub if sub else out_root
     candidates = [p for p in base.glob("*期") if p.is_dir()]
     if not candidates:
         raise SystemExit(f"[错误] 产物目录不存在：{base}/*期")
-    candidates.sort(key=lambda p: int("".join(c for c in p.name.split("_")[-1] if c.isdigit()) or 0))
-    return candidates[-1]
+    candidates.sort(key=lambda p: (int("".join(c for c in p.name.split("_")[-1] if c.isdigit()) or 0)), reverse=True)
+    with_posts = [p for p in candidates if (p / "posts.json").exists()]
+    pool = with_posts or candidates
+    pool.sort(key=lambda p: (len(list(p.glob("*"))), str(p)), reverse=True)
+    chosen = pool[0]
+    log(f"[产物] 候选期目录 {[p.name for p in candidates]} → 选中 {chosen.name}")
+    return chosen
 
 
 # ---------------------------------------------------------------------------
@@ -334,26 +345,32 @@ def do_run(args, mode: str = "run") -> int:
     log(f"[产物] {product_check['present']}/{product_check['expected']} 个文件存在"
         + ("" if product_check["passed"] else f"  缺失：{product_check['missing']}"))
 
-    # ---- 防线 1 / 2：独立对账 ----
+    # ---- 防线 1 / 2：独立对账（三源都做）----
     scan = {}
     post_check = {"passed": None}
     image_check = {"passed": None}
-    if source == "dahkg":
-        scan = _reconcile.independent_scan_dahkg(period, max_pages=args.max_pages, log=log)
-        post_check = _reconcile.reconcile_posts(posts, scan)
-        log(
-            f"[防线1] 帖子对账：源站独立扫描 {post_check['expected']} 帖 / 实际 {post_check['actual']} 帖"
-            f" / 缺 {post_check['missingCount']} / 多 {post_check['extraCount']}"
-            f"  ← {'通过' if post_check['passed'] else '不通过'}"
-        )
-        image_roots = [p for p in out_dir.rglob("images") if p.is_dir()]
-        require_files = image_roots[0] if image_roots else None
-        image_check = _reconcile.reconcile_images(posts, scan, require_files=require_files.parent if require_files else None)
-        log(
-            f"[防线2] 图片对账：声明 {image_check['declaredTotal']} 张 / 实际 {image_check['actualTotal']} 张"
-            f" / 不符帖子 {image_check['mismatchPosts']} / 未下载 {image_check['notDownloadedImages']}"
-            f" / 文件缺失 {image_check['missingFiles']}  ← {'通过' if image_check['passed'] else '不通过'}"
-        )
+    scan = _reconcile.independent_scan(source, period, max_pages=args.max_pages, log=log)
+    post_check = _reconcile.reconcile_posts(posts, scan)
+    log(
+        f"[防线1] 帖子对账：源站独立扫描 {post_check['expected']} 帖 / 实际 {post_check['actual']} 帖"
+        f" / 缺 {post_check['missingCount']} / 多 {post_check['extraCount']}"
+        f"  ← {'通过' if post_check['passed'] else '不通过'}"
+    )
+    if post_check["missingCount"]:
+        log(f"[防线1] 缺失样本（前 20）：{post_check['missing'][:20]}")
+    if post_check["extraCount"]:
+        log(f"[防线1] 多出样本（前 20）：{post_check['extra'][:20]}")
+
+    image_roots = [p for p in out_dir.rglob("images") if p.is_dir()]
+    require_files = image_roots[0].parent if image_roots else None
+    image_check = _reconcile.reconcile_images(posts, scan, require_files=require_files)
+    log(
+        f"[防线2] 图片对账：声明 {image_check['declaredTotal']} 张 / 实际 {image_check['actualTotal']} 张"
+        f" / 不符帖子 {image_check['mismatchPosts']} / 未下载 {image_check['notDownloadedImages']}"
+        f" / 文件缺失 {image_check['missingFiles']}"
+        f" / 无声明口径帖子 {image_check.get('noDeclaredPosts', 0)}"
+        f"  ← {'通过' if image_check['passed'] else '不通过'}"
+    )
 
     # ---- 防线 3：快照 + 单调性 ----
     snapshot_file = _state_path(work, source, "snapshot")
@@ -380,9 +397,16 @@ def do_run(args, mode: str = "run") -> int:
     # ---- 防线 5 第 5 道：乱码扫描 ----
     mojibake = _guard.scan_mojibake({"meta": meta, "posts": posts})
     log(
-        f"[防线5] 乱码扫描：检查 {mojibake['stringsScanned']} 个字符串，命中 {mojibake['hitCount']}"
-        + ("" if mojibake["passed"] else " → 已记入报告，需人工复核")
+        f"[防线5] 乱码扫描：检查 {mojibake['stringsScanned']} 个字符串，"
+        f"硬乱码 {mojibake['hardCount']} / 连续问号 {mojibake['softCount']}"
+        + ("" if mojibake["passed"] else f" → 硬乱码样本 {mojibake['hard'][:3]}，中止")
+        + ("" if not mojibake["softCount"] else "（连续问号已记录，人工复核）")
     )
+    if not mojibake["passed"]:
+        _guard.save_json(
+            work / "audit" / f"abnormal_text_{source}_{time.strftime('%Y%m%d_%H%M%S')}.json",
+            mojibake,
+        )
 
     # ---- 审计报告 ----
     passed = (

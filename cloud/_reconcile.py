@@ -109,6 +109,195 @@ def independent_scan_dahkg(
 
 
 # ---------------------------------------------------------------------------
+# 防线 1：49图库（tuku）独立扫描
+# ---------------------------------------------------------------------------
+def independent_scan_tuku(
+    period: int,
+    max_pages: int = 60,
+    empty_streak_stop: int = 2,
+    include_pinned: bool = False,
+    log: Callable[[str], None] | None = None,
+) -> dict:
+    """49图库独立扫描。
+
+    实测约束（2026-11-16）：站点对**单个排序窗口**只给前 1000 行，
+    所以要按 `core.scraper.period_sorts("full")` 的 10 种排序各翻一遍再取并集
+    （`(1, 0, 2, 4, 5, 6, 7, 8, 9, 15)`）。
+    列表行字段实测：`articleId` / `period` / `pictureList`（图片数 = len(pictureList)）/ `top`。
+
+    与采集链路的差异（保证"独立"）：
+      * 不复用 `fetch_period_posts`（它还做标题过滤、缓存、编号去重等）；
+      * 停止条件用「连续 N 页 0 条本期」而不是复用它的窗口合并逻辑。
+    """
+    from core import scraper
+
+    say = log or (lambda message: None)
+    want = normalize_period(period)
+    sorts = scraper.period_sorts("full")
+    say(f"[独立扫描/tuku] 期号 {want}，排序窗口 {sorts}")
+
+    ids: dict[int, dict] = {}
+    per_sort: dict[str, dict] = {}
+    pinned_skipped = 0
+    for sort_value in sorts:
+        t0 = time.time()
+        streak = 0
+        pages = 0
+        for page in range(1, max_pages + 1):
+            try:
+                rows = scraper.search_page(
+                    2,                       # lotteryType：2 = 澳门
+                    page,
+                    sort_value,
+                    0.05,
+                    number=want,
+                    user_id=scraper.PERIOD_QUERY_USER_ID,
+                )
+            except Exception as exc:  # noqa: BLE001 - 单页失败如实记录
+                say(f"[独立扫描/tuku] sort={sort_value} 第{page}页失败：{exc}")
+                streak += 1
+                if streak >= empty_streak_stop:
+                    break
+                continue
+            if not rows:
+                break
+            pages = page
+            hit = 0
+            for raw in rows:
+                if not isinstance(raw, dict):
+                    continue
+                if normalize_period(raw.get("period")) != want:
+                    continue
+                hit += 1
+                # 采集链路默认排除置顶帖（scraper.fetch_period_posts: top and not include_pinned）
+                # 对账必须用同一口径，否则会把置顶帖误判成"漏帖"
+                if raw.get("top") and not include_pinned:
+                    pinned_skipped += 1
+                    continue
+                aid = int(raw.get("articleId") or 0)
+                if not aid:
+                    continue
+                pics = raw.get("pictureList") or []
+                ids.setdefault(
+                    aid,
+                    {
+                        "imgTotal": len(pics) if isinstance(pics, list) else 0,
+                        "commentCount": int(raw.get("commentCount") or 0),
+                        "thumbUpCount": int(raw.get("thumbUpCount") or 0),
+                    },
+                )
+            streak = 0 if hit else streak + 1
+            if streak >= empty_streak_stop:
+                break
+        per_sort[f"sort{sort_value}"] = {
+            "pages": pages,
+            "elapsed": round(time.time() - t0, 2),
+        }
+        say(f"[独立扫描/tuku] sort={sort_value}: {pages} 页，累计本期 {len(ids)} 帖")
+
+    if pinned_skipped:
+        say(f"[独立扫描/tuku] 按采集口径排除置顶帖 {pinned_skipped} 次命中")
+    return {
+        "period": want,
+        "source": "tuku",
+        "unionIds": sorted(ids),
+        "unionMeta": {str(k): v for k, v in ids.items()},
+        "countUnion": len(ids),
+        "pinnedSkipped": pinned_skipped,
+        "perSort": per_sort,
+        "agree": True,          # 图库只有一套列表口径，无第二条判据
+    }
+
+
+# ---------------------------------------------------------------------------
+# 防线 1：澳彩交流（aocai）独立扫描
+# ---------------------------------------------------------------------------
+def independent_scan_aocai(
+    period: int,
+    max_pages: int = 200,
+    empty_streak_stop: int = 3,
+    log: Callable[[str], None] | None = None,
+) -> dict:
+    """澳彩交流独立扫描。
+
+    实测（2026-11-16）：列表接口 `/getLuntan`，
+    参数 `{fid: 20, topLv: 0, began: <偏移>, paixu: <排序>}`，
+    偏移步长 = `core.forum.PAGE_SIZE`；行内期号用 `core.forum.infer_item_period(raw, target)`
+    （`qs` 徽标优先，缺失时按标题期号标记推断）。
+    """
+    from core import forum as forum_mod
+
+    say = log or (lambda message: None)
+    want = normalize_period(period)
+    ids: dict[int, dict] = {}
+    per_sort: dict[str, dict] = {}
+
+    for paixu in (1, 2):
+        t0 = time.time()
+        streak = 0
+        pages = 0
+        step = int(forum_mod.PAGE_SIZE)
+        for index in range(max_pages):
+            began = index * step
+            try:
+                payload = forum_mod.fetch_luntan_page(began, delay=0.05, paixu=paixu)
+                listing = forum_mod.parse_list_payload(payload)
+            except Exception as exc:  # noqa: BLE001
+                say(f"[独立扫描/aocai] paixu={paixu} began={began} 失败：{exc}")
+                streak += 1
+                if streak >= empty_streak_stop:
+                    break
+                continue
+            if not listing:
+                break
+            pages += 1
+            hit = 0
+            for raw in listing:
+                if not isinstance(raw, dict):
+                    continue
+                got = normalize_period(forum_mod.infer_item_period(raw, want))
+                if got != want:
+                    continue
+                tid = int(forum_mod.as_int(raw.get("tid")) or 0)
+                if not tid:
+                    continue
+                hit += 1
+                ids.setdefault(
+                    tid,
+                    {
+                        "imgTotal": 0,     # 澳彩列表行没有图片总数，图片在详情里
+                        "huifushu": int(forum_mod.as_int(raw.get("huifushu")) or 0),
+                    },
+                )
+            streak = 0 if hit else streak + 1
+            if streak >= empty_streak_stop:
+                break
+        per_sort[f"paixu{paixu}"] = {"pages": pages, "elapsed": round(time.time() - t0, 2)}
+        say(f"[独立扫描/aocai] paixu={paixu}: {pages} 页，累计本期 {len(ids)} 帖")
+
+    return {
+        "period": want,
+        "source": "aocai",
+        "unionIds": sorted(ids),
+        "unionMeta": {str(k): v for k, v in ids.items()},
+        "countUnion": len(ids),
+        "perSort": per_sort,
+        "agree": True,
+    }
+
+
+def independent_scan(source: str, period: int, max_pages: int = 200, log=None) -> dict:
+    """按源分派独立扫描。"""
+    if source == "dahkg":
+        return independent_scan_dahkg(period, max_pages=max_pages, log=log)
+    if source == "tuku":
+        return independent_scan_tuku(period, max_pages=max_pages, log=log)
+    if source == "aocai":
+        return independent_scan_aocai(period, max_pages=max_pages, log=log)
+    raise ValueError(f"未知源：{source}")
+
+
+# ---------------------------------------------------------------------------
 # 防线 1 第 2 道：帖子数对账
 # ---------------------------------------------------------------------------
 def reconcile_posts(posts: list[dict], scan: dict) -> dict:
@@ -142,6 +331,7 @@ def reconcile_images(posts: list[dict], scan: dict, require_files: Path | None =
     mismatch_total = 0
     not_downloaded_total = 0
     missing_file_total = 0
+    no_declared = 0
 
     for post in posts:
         aid = int(post.get("articleId") or 0)
@@ -159,9 +349,14 @@ def reconcile_images(posts: list[dict], scan: dict, require_files: Path | None =
                 lp = img.get("localPath")
                 if lp and not (require_files / str(lp)).exists():
                     missing_files.append(str(lp))
-        delta = got - declared
-        if delta != 0:
-            mismatch_total += 1
+        # 源站行里没有图片数字段（如澳彩）→ 无法逐帖比声明，只统计不判定
+        if declared == 0:
+            no_declared += 1
+            delta = 0 if not body_imgs else 0
+        else:
+            delta = got - declared
+            if delta != 0:
+                mismatch_total += 1
         not_downloaded_total += len(bad_status)
         missing_file_total += len(missing_files)
         rows.append(
@@ -185,6 +380,7 @@ def reconcile_images(posts: list[dict], scan: dict, require_files: Path | None =
         "mismatchPosts": mismatch_total,
         "notDownloadedImages": not_downloaded_total,
         "missingFiles": missing_file_total,
+        "noDeclaredPosts": no_declared,
         "problems": problems[:30],
         "passed": mismatch_total == 0 and not_downloaded_total == 0 and missing_file_total == 0,
     }
