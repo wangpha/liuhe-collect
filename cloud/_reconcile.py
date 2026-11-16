@@ -828,6 +828,22 @@ def reconcile_posts(
 # ---------------------------------------------------------------------------
 # 防线 2：逐帖图片数对账
 # ---------------------------------------------------------------------------
+#: 源站删帖后在正文里留下的标记（2026-11-17 实测：post 1535644 的 detail.content
+#: 就是「该帖子已被删除」，但 `img` 字段仍返回 1 个残留 URL，而列表行 `imgTotal` 还是 2）。
+DELETED_MARKERS = ("该帖子已被删除", "帖子已被删除", "内容已被删除", "该帖已删除", "此帖已删除")
+
+
+def _is_deleted_post(post: dict) -> bool:
+    """判断产物里这帖是不是「源站已删帖」的占位内容。
+
+    为什么需要：删帖后源站**列表行仍声明 imgTotal**，而详情只剩残留字段，
+    于是「声明 N 张 / 实际 M 张」必然不等。这属于源站删帖（防线3 第3道：如实记录、不判失败），
+    不是我们漏图。不区分就会把源站删帖误判成图片缺失。
+    """
+    text = str(post.get("text") or post.get("content") or "")
+    return any(m in text for m in DELETED_MARKERS)
+
+
 def reconcile_images(
     posts: list[dict],
     scan: dict,
@@ -847,6 +863,7 @@ def reconcile_images(
     union_meta = scan.get("unionMeta") or {}
     rows: list[dict] = []
     mismatch_total = 0
+    deleted_posts: list[dict] = []
     retryable_total = 0
     unrecoverable_total = 0
     unavailable_total = 0
@@ -885,7 +902,11 @@ def reconcile_images(
         else:
             delta = got - declared
             if delta != 0:
-                mismatch_total += 1
+                if _is_deleted_post(post):
+                    # 源站已删帖：列表行仍声明 imgTotal，详情只剩残留 → 记清单，不判失败
+                    deleted_posts.append({"articleId": aid, "declared": declared, "actual": got})
+                else:
+                    mismatch_total += 1
         missing_file_total += len(missing_files)
         rows.append(
             {
@@ -930,6 +951,8 @@ def reconcile_images(
         "actualTotal": sum(r["actual"] for r in rows),
         "replyImagesTotal": sum(r["replyImages"] for r in rows),
         "mismatchPosts": mismatch_total,
+        "deletedPosts": deleted_posts[:30],
+        "deletedPostsCount": len(deleted_posts),
         "notDownloadedImages": retryable_total + unrecoverable_total + unavailable_total + unknown_total,
         "retryableImages": retryable_total,
         "unrecoverableImages": unrecoverable_total,
@@ -1036,6 +1059,7 @@ def check_products(out_dir: Path, source: str = "dahkg") -> dict:
         "guiOnlyPresent": gui_present,
         "passed": not missing,
     }
+
 
 
 

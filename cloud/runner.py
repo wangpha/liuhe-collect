@@ -630,6 +630,7 @@ def do_run(args, mode: str = "run") -> int:
     log(
         f"[防线2] 图片对账：声明 {image_check['declaredTotal']} 张 / 实际 {image_check['actualTotal']} 张"
         f" / 不符帖子 {image_check['mismatchPosts']}"
+        f" / 源站删帖(列表口径滞后) {image_check.get('deletedPostsCount', 0)}"
         f" / **能下到却没下 {image_check.get('retryableImages', 0)}**"
         f" / 源站404或空文件 {image_check.get('unrecoverableImages', 0)}"
         f" / 源站5xx {image_check.get('unavailableImages', 0)}"
