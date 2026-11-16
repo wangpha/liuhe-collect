@@ -172,6 +172,26 @@ def _ts_tuku(raw: dict) -> float:
     return max(cands) if cands else 0.0
 
 
+def _ts_aocai(raw: dict) -> float:
+    """澳彩列表行的时间戳（unix 秒）。实测字段：`time` 形如 `2026-11-16 12:01`。
+
+    为什么必须补（2026-11-16 实测）：aocai 之前没有时间对齐，`lateIds` 恒为空，
+    于是「采集结束后才发布的帖子」被算成漏帖 —— Gate2 里就报成「缺 61 帖」。
+    本地复现证明采集路径与独立扫描在同一时刻完全一致（473 = 473，差集 0），
+    那 61 帖纯粹是涨期时间差。
+    """
+    for key in ("time", "createTime", "createTimeStr", "postTime"):
+        text = str(raw.get(key) or "").strip()
+        if not text:
+            continue
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return time.mktime(time.strptime(text, fmt))
+            except ValueError:
+                continue
+    return 0.0
+
+
 def _ts_dahkg(raw: dict) -> float:
     """大港澳列表行时间戳（unix 秒）。实测字段：`createTime`(毫秒)。"""
     try:
@@ -322,6 +342,7 @@ def independent_scan_aocai(
     ids: dict[int, dict] = {}
     per_sort: dict[str, dict] = {}
     page_errors: list[dict] = []
+    late_ids: dict[int, float] = {}
 
     for paixu in (1, 2):
         t0 = time.time()
@@ -351,10 +372,15 @@ def independent_scan_aocai(
                 got = normalize_period(forum_mod.infer_item_period(raw, want))
                 if got != want:
                     continue
+                hit += 1
                 tid = int(forum_mod.as_int(raw.get("tid")) or 0)
                 if not tid:
                     continue
-                hit += 1
+                # 时间对齐：采集开始之后才发布的帖子不计入「应有集合」（当期还在长）
+                ts = _ts_aocai(raw)
+                if created_before and ts and ts > created_before:
+                    late_ids[tid] = ts
+                    continue
                 ids.setdefault(
                     tid,
                     {
@@ -368,12 +394,17 @@ def independent_scan_aocai(
         per_sort[f"paixu{paixu}"] = {"pages": pages, "elapsed": round(time.time() - t0, 2)}
         say(f"[独立扫描/aocai] paixu={paixu}: {pages} 页，累计本期 {len(ids)} 帖")
 
+    if late_ids:
+        say(f"[独立扫描/aocai] 采集开始后新发 {len(late_ids)} 帖，不计入漏帖判定（时间对齐）")
     return {
         "period": want,
         "source": "aocai",
         "unionIds": sorted(ids),
         "unionMeta": {str(k): v for k, v in ids.items()},
         "countUnion": len(ids),
+        "lateIds": sorted(late_ids),
+        "lateCount": len(late_ids),
+        "timeAligned": bool(created_before),
         "pageErrors": page_errors,
         "pageErrorCount": len(page_errors),
         "complete": not page_errors,
