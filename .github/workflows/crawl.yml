@@ -45,6 +45,11 @@ on:
         required: false
         default: false
         type: boolean
+      cache_buster:
+        description: "缓存隔离标记：填新值 = 强制冷启动（Gate3 计时判据用）"
+        required: false
+        default: "0"
+        type: string
 
   # ⚠️ 生产定时任务：Gate 1–5 + 最终日志审计全部通过后再解注释
   # schedule:
@@ -232,10 +237,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: repo/work/out
-          key: ocr-v3-dahkg-${{ github.run_id }}-${{ matrix.shard }}
+          key: ocr-v3-dahkg-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}-${{ matrix.shard }}
           restore-keys: |
-            ocr-v3-dahkg-
-            ocr-v1-dahkg-
+            ocr-v3-dahkg-${{ github.event.inputs.cache_buster || '0' }}-
       - name: 分片预热（只处理本片：详情+回复+图片+OCR）
         id: shard
         working-directory: repo
@@ -322,10 +326,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: repo/work/out
-          key: ocr-v3-aocai-${{ github.run_id }}-${{ matrix.shard }}
+          key: ocr-v3-aocai-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}-${{ matrix.shard }}
           restore-keys: |
-            ocr-v3-aocai-
-            ocr-v1-aocai-
+            ocr-v3-aocai-${{ github.event.inputs.cache_buster || '0' }}-
       - name: 分片预热（只处理本片：详情+回复+图片+OCR）
         id: shard
         working-directory: repo
@@ -412,10 +415,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: repo/work/out
-          key: ocr-v3-tuku-${{ github.run_id }}-${{ matrix.shard }}
+          key: ocr-v3-tuku-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}-${{ matrix.shard }}
           restore-keys: |
-            ocr-v3-tuku-
-            ocr-v1-tuku-
+            ocr-v3-tuku-${{ github.event.inputs.cache_buster || '0' }}-
       - name: 分片预热（只处理本片：详情+回复+图片+OCR）
         id: shard
         working-directory: repo
@@ -510,10 +512,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: repo/work/out
-          key: ocr-v3-dahkg-${{ github.run_id }}-merge
+          key: ocr-v3-dahkg-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}-merge
           restore-keys: |
-            ocr-v3-dahkg-
-            ocr-v1-dahkg-
+            ocr-v3-dahkg-${{ github.event.inputs.cache_buster || '0' }}-
       - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
         working-directory: repo
         run: |
@@ -637,10 +638,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: repo/work/out
-          key: ocr-v3-aocai-${{ github.run_id }}-merge
+          key: ocr-v3-aocai-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}-merge
           restore-keys: |
-            ocr-v3-aocai-
-            ocr-v1-aocai-
+            ocr-v3-aocai-${{ github.event.inputs.cache_buster || '0' }}-
       - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
         working-directory: repo
         run: |
@@ -764,10 +764,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: repo/work/out
-          key: ocr-v3-tuku-${{ github.run_id }}-merge
+          key: ocr-v3-tuku-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}-merge
           restore-keys: |
-            ocr-v3-tuku-
-            ocr-v1-tuku-
+            ocr-v3-tuku-${{ github.event.inputs.cache_buster || '0' }}-
       - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
         working-directory: repo
         run: |
