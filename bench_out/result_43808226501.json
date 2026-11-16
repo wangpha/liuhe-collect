@@ -1,0 +1,55 @@
+{
+  "machine": {
+    "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "cpu_count_logical": 4,
+    "python": "3.13.18",
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "mem_total_gb": 15.6,
+    "cpu_affinity": 4
+  },
+  "results": [
+    {
+      "threads": 1,
+      "images": 12,
+      "wall_sec": 10.64,
+      "sec_per_image": 0.886
+    },
+    {
+      "threads": 2,
+      "images": 12,
+      "wall_sec": 11.67,
+      "sec_per_image": 0.973
+    },
+    {
+      "threads": 4,
+      "images": 12,
+      "wall_sec": 10.4,
+      "sec_per_image": 0.866
+    },
+    {
+      "threads": 6,
+      "images": 12,
+      "wall_sec": 9.82,
+      "sec_per_image": 0.819
+    },
+    {
+      "threads": 8,
+      "images": 12,
+      "wall_sec": 9.32,
+      "sec_per_image": 0.776
+    },
+    {
+      "threads": 12,
+      "images": 12,
+      "wall_sec": 8.36,
+      "sec_per_image": 0.697
+    },
+    {
+      "threads": 16,
+      "images": 12,
+      "wall_sec": 8.33,
+      "sec_per_image": 0.694
+    }
+  ]
+}
