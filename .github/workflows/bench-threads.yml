@@ -37,7 +37,10 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          # 必须与 cloud/core/*.pyc 的编译版本一致。
+          # .pyc 的 magic 是 f30d0d0a → Python 3.13（本机 3.13.12 编译的）。
+          # 用 3.11 会报 "bad magic number in 'core.ocr'"。
+          python-version: '3.13'
 
       - name: 安装依赖
         run: |
