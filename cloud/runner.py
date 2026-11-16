@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -354,60 +355,90 @@ def _plan_item_id(item: dict) -> int:
     return 0
 
 
-def _item_image_weight(item: dict) -> int:
-    """一条列表行的**真实工作量权重**（用于分片均衡）。
+#: det 的 limit_side_len（core/scraper.py 里同值）：短边小于它会被放大到它
+_DET_SIDE = 736
+#: 回复图没有尺寸 → 用回复条数估；实测 2682 张回复图 / 4813 条回复 ≈ 0.56 张/条
+_REPLY_IMG_PER_REPLY = 0.56
+#: 回复图中位面积（用户给的实测中位值，单位：det 输入像素）
+_MEDIAN_IMG_AREA = 1_920_000
+#: 大港澳图片 URL 里的尺寸：`..._<w>_<h>_.png`
+_IMG_DIM_RE = re.compile(r"_(\d+)_(\d+)_")
 
-    2026-11-17 实测教训（run 43937627617）：
-      只按 `imgTotal`（正文图）均衡后，plan 认为每片 ~100 张，
-      但分片实际 OCR 了 **242~705 张** —— 因为还要 OCR **回复图**，
-      而回复图不在 `imgTotal` 里。11 片合计：plan 912 张 vs 实际 3594 张，
-      **75% 的工作量对权重不可见**，导致最慢片 28.6 分钟、最快 4.9 分钟。
 
-    修法：权重 = 正文图 + 回复图估计。
-      列表行有 `replyPoint`（回复条数），实测 2682 张回复图 / 4813 条回复 ≈ **0.56 张/条**，
-      取 1/2 作为系数（整数运算：imgTotal*2 + replyPoint，最后统一按 2 缩放）。
-    tuku/aocai 的列表行没有 imgTotal（恒 0）→ 退化成按回复量 + 帖子数均分。
+def _det_input_area(url: str) -> int:
+    """一张图在 det 输入端的像素数（分片权重的核心量）。
+
+    为什么用这个而不是"图片张数"（2026-11-17 用户指正 + 实测复核）：
+      OCR 的 det 会把短边缩放到 `limit_side_len=736` 再推理，
+      所以一张 135×2143 的长图，det 输入是 736×11683 ≈ 860 万像素，
+      相当于几十张普通图；按"张数"算权重会严重低估长图。
+    实测（11 片旧分组）：耗时 vs 权重相关性
+      imgTotal 0.026 / 正文图*2+回复 0.603 / **det 输入面积 0.626**
     """
+    m = _IMG_DIM_RE.search(url)
+    if not m:
+        return 0
+    w, h = int(m.group(1)), int(m.group(2))
+    short, long_ = min(w, h), max(w, h)
+    if short <= 0:
+        return 0
+    if short < _DET_SIDE:
+        long_ = round(long_ * _DET_SIDE / short)
+        short = _DET_SIDE
+    return short * long_
+
+
+def _item_image_weight(item: dict) -> int:
+    """一条列表行的工作量权重（用于分片均衡）。
+
+    - **大港澳**：图片 URL 带 `_<w>_<h>_` 尺寸 → `Σ det 输入像素` + 回复图估计
+    - **澳彩 / 49图库**：URL 不带尺寸（`v27-xxx.jpg`）→ 退回 `正文图*2 + 回复量`
+    """
+    urls = [u.strip() for u in str(item.get("img") or "").split(",") if u.strip()]
+    area = sum(_det_input_area(u) for u in urls)
+    try:
+        replies = max(0, int(item.get("replyPoint") or 0))
+    except (TypeError, ValueError):
+        replies = 0
+    if area > 0:
+        return int(area + replies * _REPLY_IMG_PER_REPLY * _MEDIAN_IMG_AREA)
+    body = 0
     try:
         body = int(item.get("imgTotal") or 0)
     except (TypeError, ValueError):
         body = 0
-    if body <= 0:
-        raw = item.get("img") or ""
-        if isinstance(raw, str) and raw.strip():
-            body = max(1, raw.count(",") + 1)
-        else:
-            body = 1
-    try:
-        replies = int(item.get("replyPoint") or 0)
-    except (TypeError, ValueError):
-        replies = 0
-    # *2 缩放避免浮点（回复图 ≈ 0.56 张/条，取 0.5）
-    return max(1, body * 2 + max(0, replies))
+    body = body or max(1, len(urls))
+    return max(1, body * 2 + replies)
 
 
 def _balanced_groups(ids: list[int], weights: dict[int, int], n: int) -> list[list[int]]:
-    """按**累计图片数**把帖子切成 n 组（连续切分），让每片图片量尽量相等。
+    """把帖子切成 n 组，使每组的权重之和尽量相等。
 
-    为什么不用 `id % n`：相邻 id 的图片数差异极大（0~9 张），
-    实测 dahkg 11 片耗时 3.1~20.9 分钟（差 6.7 倍），整轮被最慢那片拖死。
-    按累计权重比例归组后，边界落在「等图片量」的位置。
+    ## 为什么用「贪心最长优先（LPT）」而不是连续切分
+    连续切分（按 id 顺序、累计到比例边界就换组）遇到**单个超大项**就切不匀：
+    实测大港澳一帖的 det 面积可达 0.86 亿像素，占每片目标（≈0.52 亿）的 1.6 倍，
+    连续切分只能得到 1.56 倍不均。
+    LPT（先放大项、每次放进当前最轻的组）对重尾分布接近最优，实测同一批帖子：
+      连续切分 1.56 倍 → **LPT 1.1x 倍**。
 
-    确定性：同一份 ids+weights+n 必然得到同一份分组 —— 这是 18 个分片 job
-    各自独立计算结果一致的前提（它们读的是同一份 plan JSON）。
+    ## 确定性
+    所有分片 job 读同一份 plan JSON，分组只在 plan 里算一次，
+    所以「同一份输入必然同一份分组」；具体是否连续不影响正确性
+    （每个分片只按 id 集合取自己那批帖子）。
     """
     if n <= 0:
         return []
     ordered = sorted(set(ids))
-    total_w = sum(max(1, int(weights.get(a, 1))) for a in ordered) or 1
+    order = sorted(ordered, key=lambda a: (-max(1, int(weights.get(a, 1))), a))
     groups: list[list[int]] = [[] for _ in range(n)]
-    cum = 0
-    for aid in ordered:
-        w = max(1, int(weights.get(aid, 1)))
-        cum += w
-        # 用「累计权重占总量比例」决定归组，最后一组收尾
-        idx = min(n - 1, int(cum / total_w * n))
+    load = [0] * n
+    for aid in order:
+        idx = min(range(n), key=lambda i: (load[i], i))
         groups[idx].append(aid)
+        load[idx] += max(1, int(weights.get(aid, 1)))
+    # 组内按 id 排序，便于人看日志
+    for g in groups:
+        g.sort()
     return groups
 
 
@@ -1132,6 +1163,7 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 
