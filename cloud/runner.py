@@ -179,33 +179,35 @@ def do_plan(args) -> int:
     last_period = int(state.get("lastPeriod") or 0)
     learned_offset = int(state.get("learnedOffset") or 0)
 
-    evidence: dict = {}
-    if source == "dahkg":
-        period, evidence = _period.detect_verified_dahkg(
-            last_period=last_period, learned_offset=learned_offset, log=log
-        )
-    else:
-        # 图库/澳彩：沿用其模块自身的期号识别（后续在 4.x 验收里与源站核对）
-        period = 0
-        log(f"[plan] {source}：不在此处探测期号，交由模块自身识别后在 --run 中回读核对")
+    # ---- 期号：三源口径不同，各自用自己源头的探测方式（见 _period.detect_period 注释）----
+    info = _period.detect_period(
+        source, last_period=last_period, learned_offset=learned_offset, log=log
+    )
+    period = int(info["period"])
+    display = int(info["display"])
+    evidence = info["evidence"]
+    caliber = info.get("caliber", "short")
 
     scan = {}
-    if source == "dahkg" and period:
-        scan = _reconcile.independent_scan_dahkg(period, max_pages=args.max_pages, log=log)
+    if source == "dahkg":
+        scan = _reconcile.independent_scan_dahkg(display, max_pages=args.max_pages, log=log)
         if not scan["agree"]:
             log(
                 f"[plan] 警告：两种排序的帖子集合不一致 —— "
-                f"按时间 {scan['countByTime']} 帖 / 按赞 {scan['countByLike']} 帖；"
-                f"仅按时间才有的 {len(scan['onlyByTime'])} 个，仅按赞才有的 {len(scan['onlyByLike'])} 个"
+                f"按时间 {scan['countByTime']} 帖 / 按赞 {scan['countByLike']} 帖"
             )
+    else:
+        scan = _reconcile.independent_scan(source, display, max_pages=args.max_pages, log=log)
 
     plan = {
         "source": source,
         "module": MODULE_OF[source],
-        "period": period,
+        "period": period,               # 传给该源模块的值（dahkg=短期号，aocai/tuku=整期号）
+        "periodDisplay": display,       # 目录/报告用的短期号
+        "periodCaliber": caliber,
         "createdAt": time.strftime("%Y-%m-%d %H:%M:%S"),
         "periodEvidence": evidence,
-        "scan": scan,
+        "scan": {k: v for k, v in scan.items() if k != "unionMeta"},
         "counts": {
             "expectedPosts": scan.get("countUnion", 0),
             "byTime": scan.get("countByTime", 0),
@@ -213,19 +215,122 @@ def do_plan(args) -> int:
         },
     }
     _guard.save_json(work / "plan" / f"plan_{source}.json", plan)
-    log(f"[plan] 完成：期号={period or '待模块识别'} 预期帖子={plan['counts']['expectedPosts']}")
+    log(f"[plan] 完成：传给模块的期号={period}（展示 {display} 期，口径 {caliber}），预期帖子={plan['counts']['expectedPosts']}")
     return 0
 
 
 # ---------------------------------------------------------------------------
-# 模式：--shard（预热缓存）
+# 模式：--shard（三源通用：给模块的列表取数打切片补丁，进程内跑它自己的 CLI）
 # ---------------------------------------------------------------------------
-def do_shard(args) -> int:
-    """分片任务只做一件事：**把它负责的那批帖子的图片下载 + OCR 结果写进缓存**。
+def _plan_item_id(item: dict) -> int:
+    """列表行的主键（三源字段名不同）。"""
+    for key in ("singaporeId", "tid", "articleId"):
+        value = item.get(key)
+        if value:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    return 0
 
-    为什么要分片：冷缓存下一期 1.4 万张图在 4 核 CPU 上要 ~10 小时，超过
-    Actions 单 job 6 小时上限。10 个 job 并行后每片约 1 小时。
-    分片产物只是 OCR 缓存（`merge` 阶段复用），不生成最终产物。
+
+def _slice_items(items, shard: int, total: int, sink: dict):
+    """把 items 按 `id % total == shard` 切片，并记录原始总数。"""
+    if isinstance(items, tuple):
+        seq, meta = items[0], items[1:]
+    else:
+        seq, meta = items, ()
+    try:
+        seq = list(seq)
+    except TypeError:
+        return items
+    sink["total"] = len(seq)
+    picked = [it for it in seq if _plan_item_id(it) % max(1, total) == shard]
+    sink["picked"] = len(picked)
+    return (picked, *meta) if meta else picked
+
+
+def _patch_shard(source: str, shard: int, total: int, sink: dict):
+    """给该源的「列表取数函数」打补丁，只保留本片的帖子。
+
+    ## 为什么用「打补丁 + 进程内跑原生 CLI」而不是重写采集流程
+    三源的采集流程差异极大（tuku 有 details/replies/ocr 三段独立缓存；
+    aocai 走 collect_forum_posts；dahkg 自带 collect_posts）。
+    如果我按文档逐个复刻，任何一处顺序/参数不同都会让 merge 产物与串行版**不一致**，
+    而这正是分片要证明的东西。这里改成：**只切列表结果**，下游全部走模块自己的代码，
+    语义天然一致。
+
+    补丁只影响本进程（分片 job）；merge job 用 subprocess 跑完整流程，不受影响。
+    """
+    if shard < 0 or total <= 1:
+        return None
+    originals = []
+
+    def wrap(mod, name: str):
+        original = getattr(mod, name, None)
+        if original is None:
+            return
+        def patched(*a, **kw):
+            return _slice_items(original(*a, **kw), shard, total, sink)
+        setattr(mod, name, patched)
+        originals.append((mod, name, original))
+
+    if source == "dahkg":
+        from core import dahkg
+        wrap(dahkg, "scan_period")
+    elif source == "aocai":
+        from core import forum as forum_mod
+        wrap(forum_mod, "scan_period")
+    elif source == "tuku":
+        from core import scraper
+        wrap(scraper, "fetch_period_posts")
+        wrap(scraper, "fetch_latest_posts")
+    return originals
+
+
+def _run_module_main(module: str, argv: list[str]) -> int:
+    """在**当前进程**里调用模块自己的 `main()`（这样打上去的补丁才生效）。
+
+    踩坑记录（2026-11-16 实测）：先用 `runpy.run_module(module, run_name="__main__")`，
+    结果切片补丁完全没生效 —— 因为 runpy 把模块代码执行在**独立的 `__main__` 命名空间**里，
+    而我的补丁打在 `core.scraper` 这个模块对象上，两者不是同一个 globals。
+    改成 `import_module(...).main()` 后，`main()` 内部的非限定名（如 `fetch_period_posts`）
+    正是从被补丁的模块 globals 里取，切片才生效。
+    """
+    import importlib
+
+    mod = importlib.import_module(module)
+    entry = getattr(mod, "main", None)
+    if entry is None:
+        raise SystemExit(f"[错误] {module} 没有 main()，无法在进程内调用")
+
+    old_argv = sys.argv
+    sys.argv = [module, *argv]
+    code = 0
+    try:
+        result = entry()
+        if isinstance(result, int):
+            code = result
+    except SystemExit as exc:
+        if isinstance(exc.code, str):
+            log(f"[shard] 模块退出：{exc.code}")
+            code = 1
+        else:
+            code = int(exc.code or 0)
+    finally:
+        sys.argv = old_argv
+    return code
+
+
+def do_shard(args) -> int:
+    """分片任务：**只负责把它那一份帖子的缓存（详情/回复/图片/OCR）暖起来**。
+
+    三源通用（2026-11-16 用户撤回「不动 runner.py」约束后实现）：
+      1. 读 plan 拿期号（dahkg=短期号，aocai/tuku=整期号）
+      2. 给该源的列表取数函数打切片补丁（只切列表，不碰下游）
+      3. 进程内跑该模块自己的 CLI → 详情/回复/图片/OCR 全走原生代码，只处理本片
+      4. 缓存落在 work/out 里，由 workflow 打包给 merge
+    merge 阶段再跑一次**未打补丁**的完整流程（subprocess），产出最终产物。
     """
     from . import _guard
 
@@ -238,75 +343,60 @@ def do_shard(args) -> int:
     log(f"[shard] {shard_index}/{shard_total} source={source}")
     log("=" * 70)
 
-    plan_path = work / "plan" / f"plan_{source}.json"
-    plan = _guard.load_json(plan_path, {})
+    plan = _guard.load_json(work / "plan" / f"plan_{source}.json", {})
     if not plan:
-        raise SystemExit(f"[错误] 没有 plan 文件：{plan_path}")
+        raise SystemExit(f"[错误] 没有 plan 文件：{work / 'plan' / f'plan_{source}.json'}")
     period = int(plan.get("period") or 0)
     if not period:
         raise SystemExit("[错误] plan 里没有期号，无法分片")
-    if source != "dahkg":
-        raise SystemExit(f"[错误] 分片目前只对大港澳实现（source={source}）")
 
-    # 重新取列表拿到 item（plan 只存 id，避免 plan 文件过大）
-    from core import dahkg, forum as forum_mod
+    sink: dict = {"total": 0, "picked": 0}
+    originals = _patch_shard(source, shard_index, shard_total, sink)
+    log(f"[shard] 已给 {source} 的列表取数打切片补丁（id % {shard_total} == {shard_index}）")
 
-    items, _scan = dahkg.scan_period(period, max_pages=args.max_pages, progress=log)
-    mine = [it for it in items if int(it.get("tid") or 0) % shard_total == shard_index]
-    log(f"[shard] 全期 {len(items)} 帖，本片负责 {len(mine)} 帖（tid % {shard_total} == {shard_index}）")
-    if not mine:
-        log("[shard] 本片无帖子，直接成功返回")
-        _guard.save_json(
-            work / "shards" / f"shard_{source}_{shard_index}.json",
-            {"source": source, "shard": shard_index, "posts": 0, "period": period},
-        )
-        return 0
+    argv = ["--out", str(out_root), "--period", str(period)]
+    if args.workers:
+        argv += ["--workers", str(args.workers)]
+    if args.delay is not None:
+        argv += ["--delay", str(args.delay)]
+    if args.max_pages:
+        argv += ["--max-pages", str(args.max_pages)]
+    if args.no_images:
+        argv.append("--no-images")
+    if args.no_ocr:
+        argv.append("--no-ocr")
+    if args.no_replies:
+        argv.append("--no-replies")
 
-    out_dir = out_root / SOURCE_SUBDIR[source] / f"澳门_2026_{period}期"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        code = _run_module_main(MODULE_OF[source], argv)
+    finally:
+        for mod, name, original in (originals or []):
+            setattr(mod, name, original)
 
-    posts, stats = dahkg.collect_posts(
-        mine,
-        period,
-        workers=max(1, int(args.workers or 4)),
-        progress=log,
-        filter_replies=True,
-    )
-    log(f"[shard] 详情完成：{len(posts)} 帖，失败 {stats.get('failed')}")
-
-    media = forum_mod.process_media(
-        posts,
-        out_dir,
-        out_dir / ".cache",
-        period,
-        download_workers=forum_mod.forum_download_workers(args.workers or 4),
-        delay=args.delay if args.delay is not None else 0.05,
-        referer=None,
-        download_enabled=not args.no_images,
-        ocr_enabled=not args.no_ocr,
-        force_ocr=False,
-        max_images=0,
-        capture_text=True,
-    )
-    ocr_stats = media["ocr"]
     log(
-        f"[shard] OCR 完成：总 {ocr_stats.get('total')} 张 / 缓存命中 {ocr_stats.get('cache_hit')}"
-        f" / 新识别 {ocr_stats.get('cache_miss')} / 失败 {ocr_stats.get('error')}"
+        f"[shard] {source} 本片：源站本期共 {sink.get('total', 0)} 帖，"
+        f"本片负责 {sink.get('picked', 0)} 帖；模块退出码={code}"
     )
     _guard.save_json(
         work / "shards" / f"shard_{source}_{shard_index}.json",
         {
             "source": source,
             "shard": shard_index,
+            "shards": shard_total,
             "period": period,
-            "posts": len(posts),
-            "images": media["images"],
-            "ocr": ocr_stats,
-            "detailStats": stats,
+            "totalItems": sink.get("total", 0),
+            "pickedItems": sink.get("picked", 0),
+            "exitCode": code,
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         },
     )
-    return 0
+    return code
+
+
+# ---------------------------------------------------------------------------
+# 模式：--shard（预热缓存）
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -809,3 +899,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

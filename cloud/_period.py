@@ -166,6 +166,97 @@ def detect_verified_dahkg(
     return period_by_time, ev
 
 
+def detect_period_tuku(delay: float = 0.05, log: Callable[[str], None] | None = None) -> dict:
+    """49图库当期期号。
+
+    口径（读了 `core/scraper.py::resolve_target` 与 `main()` 确认）：
+      `resolve_target(2, delay, 0)` 返回 `(latest, year, last, page1, manual)`，
+      `latest` 是**整期号**（如 2026320）；`main()` 里随后会 `short_period(latest)` 得到 320。
+      `--period` 帮助文本写明「可写 316 或 2026316」，两种都收。
+    → 这里统一把**整期号**作为 pass 值，展示用短期号。
+    """
+    say = log or (lambda message: None)
+    from core import scraper, source
+
+    latest, year, last, _page1, manual = scraper.resolve_target(2, delay, 0)
+    if not latest:
+        raise PeriodAbort("49图库 resolve_target 返回空期号")
+    short = int(source.display_period(latest)) or int(latest)
+    ev = {
+        "source": "tuku",
+        "caliber": "full",
+        "periodFull": int(latest),
+        "periodShort": short,
+        "year": int(year or 0),
+        "manual": bool(manual),
+        "lastPeriod": last.get("period") if isinstance(last, dict) else None,
+        "checkedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    say(f"[期号/tuku] resolve_target -> 整期号 {latest}（展示 {short} 期，year={year}）")
+    return {"period": int(latest), "display": short, "evidence": ev}
+
+
+def detect_period_aocai(delay: float = 0.05, log: Callable[[str], None] | None = None) -> dict:
+    """澳彩交流当期期号。
+
+    口径（读了 `core/forum.py` 主流程 1763-1769 行确认）：
+      `first_items = parse_list_payload(fetch_luntan_page(0))`
+      `latest = max(as_int(item["qs"]) for item in first_items)` —— **整期号**（2026320）
+      目录名用 `display_period(target)` 得到 320。
+    ⚠️ aocai 的 `scan_period`/`infer_item_period` 拿 target 与行内 `qs` 直接比，
+       所以传**整期号**才是对的；传 320 会让所有行判成"非本期"。
+    """
+    say = log or (lambda message: None)
+    from core import forum as forum_mod, source
+
+    payload = forum_mod.fetch_luntan_page(0, delay=delay)
+    items = forum_mod.parse_list_payload(payload)
+    if not items:
+        raise PeriodAbort("澳彩交流版块首页无帖子，无法确定当期")
+    periods = [forum_mod.as_int(it.get("qs")) for it in items if forum_mod.as_int(it.get("qs")) > 0]
+    if not periods:
+        raise PeriodAbort("澳彩交流首页行内 qs 全为 0，无法确定当期")
+    latest = max(periods)
+    short = int(source.display_period(latest)) or int(latest)
+    ev = {
+        "source": "aocai",
+        "caliber": "full",
+        "periodFull": int(latest),
+        "periodShort": short,
+        "rows": len(items),
+        "distinct": sorted({forum_mod.as_int(it.get("qs")) for it in items if forum_mod.as_int(it.get("qs")) > 0}, reverse=True)[:5],
+        "checkedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    say(f"[期号/aocai] 首页 max(qs) -> 整期号 {latest}（展示 {short} 期）")
+    return {"period": int(latest), "display": short, "evidence": ev}
+
+
+def detect_period(
+    source_id: str,
+    last_period: int = 0,
+    learned_offset: int = 0,
+    log: Callable[[str], None] | None = None,
+) -> dict:
+    """统一入口：返回 {period(传给模块的值), display(短期号), evidence, caliber}。
+
+    三源口径**不同**，不能照抄：
+      · dahkg（大港澳）：列表口径是**短期号**（320）；四重校验；传短期号。
+      · aocai（澳彩）  ：`qs` 是**整期号**（2026320）；传整期号。
+      · tuku （49图库）：`--period` 两种都收；为一致性传整期号，展示用短期号。
+    """
+    if source_id == "dahkg":
+        period, ev = detect_verified_dahkg(
+            last_period=last_period, learned_offset=learned_offset, log=log
+        )
+        return {"period": period, "display": normalize_period(period), "evidence": ev,
+                "caliber": "short" if period < 1000000 else "full"}
+    if source_id == "aocai":
+        return detect_period_aocai(log=log)
+    if source_id == "tuku":
+        return detect_period_tuku(log=log)
+    raise ValueError(f"未知源：{source_id}")
+
+
 def check_posts_period(posts: list[dict], target: int) -> dict:
     """防线 4 第 5 道：内容期号逐帖校验（错误数必须 = 0）。"""
     want = normalize_period(target)
