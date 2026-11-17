@@ -50,6 +50,11 @@ on:
         required: false
         default: "0"
         type: string
+      no_shard:
+        description: "跳过所有分片，只让 merge 全量跑（第5道：分片版 vs 不分片版对照）"
+        required: false
+        default: false
+        type: boolean
 
   # ⚠️ 生产定时任务：Gate 1–5 + 最终日志审计全部通过后再解注释
   # 每天五轮（北京时间）= UTC 时区；按 317 期真实发布节奏定的档位：
@@ -197,7 +202,7 @@ jobs:
   shard_dahkg:
     name: "分片 dahkg#${{ matrix.shard }}"
     needs: [plan, prepare]
-    if: contains(needs.plan.outputs.sources, 'dahkg')
+    if: contains(needs.plan.outputs.sources, 'dahkg') && github.event.inputs.no_shard != 'true'
     runs-on: ubuntu-24.04
     # 硬超时保护：实测 runner CPU 异构（AMD EPYC 0.37s/图 vs Intel 6975P 1.95s/图，
     # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 20 分钟；
@@ -291,7 +296,7 @@ jobs:
   shard_aocai:
     name: "分片 aocai#${{ matrix.shard }}"
     needs: [plan, prepare]
-    if: contains(needs.plan.outputs.sources, 'aocai')
+    if: contains(needs.plan.outputs.sources, 'aocai') && github.event.inputs.no_shard != 'true'
     runs-on: ubuntu-24.04
     # 硬超时保护：实测 runner CPU 异构（AMD EPYC 0.37s/图 vs Intel 6975P 1.95s/图，
     # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 20 分钟；
@@ -385,7 +390,7 @@ jobs:
   shard_tuku:
     name: "分片 tuku#${{ matrix.shard }}"
     needs: [plan, prepare]
-    if: contains(needs.plan.outputs.sources, 'tuku')
+    if: contains(needs.plan.outputs.sources, 'tuku') && github.event.inputs.no_shard != 'true'
     runs-on: ubuntu-24.04
     # 硬超时保护：实测 runner CPU 异构（AMD EPYC 0.37s/图 vs Intel 6975P 1.95s/图，
     # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 20 分钟；
