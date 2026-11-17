@@ -310,6 +310,7 @@ jobs:
           name: cache-dahkg-${{ matrix.shard }}-${{ github.run_id }}
           path: |
             repo/work/cacheout
+            repo/work/shards
             repo/work/shard_dahkg_${{ matrix.shard }}.log
             repo/work/unfinished
           if-no-files-found: warn
@@ -426,6 +427,7 @@ jobs:
           name: cache-aocai-${{ matrix.shard }}-${{ github.run_id }}
           path: |
             repo/work/cacheout
+            repo/work/shards
             repo/work/shard_aocai_${{ matrix.shard }}.log
             repo/work/unfinished
           if-no-files-found: warn
@@ -542,6 +544,7 @@ jobs:
           name: cache-tuku-${{ matrix.shard }}-${{ github.run_id }}
           path: |
             repo/work/cacheout
+            repo/work/shards
             repo/work/shard_tuku_${{ matrix.shard }}.log
             repo/work/unfinished
           if-no-files-found: warn

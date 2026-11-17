@@ -623,6 +623,15 @@ def do_plan(args) -> int:
         sender_of_aid = {
             aid: str((union_meta.get(str(aid)) or {}).get("senderId") or "") for aid in union_ids
         }
+        # 作者字段取不到 → **硬失败**，不许静默归到空用户（2026-11-17 aocai 事故的教训：
+        # aocai 真实字段是 `userid`，取错时 409 帖全归空用户 → 其余分片拿到 0 帖 → 空片 → 分片全挂）
+        no_user = [aid for aid, uid in sender_of_aid.items() if not uid]
+        if no_user:
+            raise SystemExit(
+                f"[plan] ❌ 作者字段缺失：{len(no_user)}/{len(union_ids)} 帖取不到作者"
+                f"（字段名应为 {SOURCE_USER_KEY.get(source)!r}）。"
+                f"样本 {no_user[:5]}。拒绝按「空用户」分组（会制造空片）。"
+            )
         user_weights: dict[str, int] = {}
         aid_by_user: dict[str, list[int]] = {}
         for aid in union_ids:
@@ -655,6 +664,21 @@ def do_plan(args) -> int:
             f"[plan] ✅ 用户分组三条断言通过：{len(user_weights)} 个作者 → {shard_n} 片，"
             f"{len(union_ids)} 帖全部覆盖、无重复"
         )
+        # 断言④：不允许空片（空片会让模块报「没有该期帖子」→ 分片失败）
+        empty = [i for i, g in enumerate(user_groups) if not g]
+        if empty:
+            raise SystemExit(
+                f"[plan] ❌ 断言④失败：分片 {empty} 是空片（0 个作者）。"
+                f"作者数 {len(user_weights)} < 片数 {shard_n}，请减少分片数或检查作者字段。"
+            )
+        # 断言⑤：各片权重极差（>2 倍只告警，不失败 —— 墙钟还受 CPU 型号影响）
+        shard_w = [sum(max(1, weights.get(a, 1)) for a in g) for g in groups]
+        if shard_w and min(shard_w) > 0:
+            ratio = max(shard_w) / min(shard_w)
+            (log if ratio > 2.0 else log)(
+                f"[plan] 断言⑤ 权重极差：{ratio:.2f} 倍"
+                + ("  ← ⚠️ 超过 2 倍，建议检查分组" if ratio > 2.0 else "  ✅")
+            )
         _save_user_shard(state_dir, source, user_to_shard, period, shard_n)
         plan["shards"] = user_groups
         plan["userToShard"] = user_to_shard
@@ -790,13 +814,35 @@ def _item_image_weight(item: dict) -> int:
     return max(1, body * 2 + replies)
 
 
-def _sender_of(item: dict) -> str:
-    """列表行里的作者标识（三源字段名不同，统一成字符串）。
+#: 三源列表行里的**作者字段名**（2026-11-17 实测）
+#:   dahkg：`senderId`（驼峰）
+#:   aocai：`userid`  （全小写！实测字段表只有 userid，没有 senderId/userId）
+#:   tuku ：`userid`  （同 aocai 的通行写法；缺失会硬失败，不会静默归 None）
+SOURCE_USER_KEY: dict[str, str] = {
+    "dahkg": "senderId",
+    "aocai": "userid",
+    "tuku": "userid",
+}
 
-    用户 2026-11-17 方案 3 要求「按用户分片」：一个作者的所有帖子必须落在同一片，
-    否则同一个人每轮可能换片 → 缓存命中率低、且新帖会漂移。
+
+def _sender_of(item: dict, source: str | None = None) -> str:
+    """列表行里的作者标识（按源取字段，统一成字符串）。
+
+    ⚠️ 2026-11-17 事故：原来用一个「通用 keys 列表」兜底，aocai 的真实字段是
+    **`userid`（全小写）**，不在列表里 → 所有 aocai 帖子的作者都取成空串 →
+    按用户分组时它们全归到同一个空用户 → 其余分片拿到 0 帖 → 空片 →
+    模块报「澳彩交流版块没有 XXX 期的帖子」→ 分片失败。
+    现在改成**按源声明字段名**，取不到就返回空串，由调用方硬失败（不静默）。
     """
-    for key in ("senderId", "userId", "authorId", "uid", "nickname", "userName"):
+    if source:
+        key = SOURCE_USER_KEY.get(source)
+        if key:
+            value = (item or {}).get(key)
+            if value not in (None, "", 0):
+                return str(value)
+            return ""
+    # 未指定源时（比如通用工具）才退回候选列表
+    for key in ("senderId", "userid", "userId", "authorId", "uid"):
         value = (item or {}).get(key)
         if value not in (None, "", 0):
             return str(value)
@@ -872,7 +918,7 @@ def _save_user_shard(state_dir: Path, source: str, mapping: dict[str, int], peri
 
 
 def _slice_items(items, shard: int, total: int, sink: dict, planned_ids: set[int] | None = None,
-                 mine_users: set[str] | None = None):
+                 mine_users: set[str] | None = None, source: str | None = None):
     """把 items 切成一片：优先按 plan 里算好的均衡分组，没有就退回 id%N。"""
     if isinstance(items, tuple):
         seq, meta = items[0], items[1:]
@@ -886,7 +932,7 @@ def _slice_items(items, shard: int, total: int, sink: dict, planned_ids: set[int
     sink["imagesTotal"] = sum(_item_image_weight(it) for it in seq)
     if mine_users is not None:
         # 按用户分片（方案 3）：一个作者的所有帖子都进同一片；新帖因作者已在本片而自动跟随。
-        picked = [it for it in seq if _sender_of(it) in mine_users]
+        picked = [it for it in seq if _sender_of(it, source) in mine_users]
         sink["mode"] = "by-user"
         if not picked and seq and planned_ids:
             # 兜底（2026-11-17 事故）：按用户取到空片时，若 plan 里有本片的帖子 id 列表，就退回按 id 取。
@@ -938,7 +984,7 @@ def _patch_shard(source: str, shard: int, total: int, sink: dict, planned_ids: s
             return
         def patched(*a, **kw):
             return _slice_items(original(*a, **kw), shard, total, sink, planned_ids=planned_ids,
-                                 mine_users=mine_users)
+                                 mine_users=mine_users, source=source)
         setattr(mod, name, patched)
         originals.append((mod, name, original))
 
@@ -984,6 +1030,13 @@ def _run_module_main(module: str, argv: list[str]) -> int:
             code = 1
         else:
             code = int(exc.code or 0)
+    except Exception as exc:  # noqa: BLE001
+        # ⚠️ 2026-11-17 事故：模块可能抛 RuntimeError（如「澳彩交流版块没有 XXX 期的帖子」），
+        # 原来只 catch SystemExit，异常会**直接冲出 do_shard**，导致后面
+        # 「空片不计失败」的判断完全没机会执行、整个分片 job 变 failure。
+        # 这里统一收敛成非 0 退出码，交给调用方按「空片/失败」判断。
+        log(f"[shard] 模块抛异常：{type(exc).__name__}: {exc}")
+        code = 1
     finally:
         sys.argv = old_argv
     return code
@@ -1385,6 +1438,59 @@ def _check_low_confidence(out_dir: Path, threshold: float = 0.7) -> dict:
     }
 
 
+def _summarize_shards(work: Path, source: str, log) -> dict:
+    """汇总本轮各分片的状态，并**把失败暴露出来**（用户 2026-11-17 要求）。
+
+    ## 为什么必须做
+    给分片加了 `continue-on-error: true` 之后，分片失败不会再阻塞 publish，
+    这是对的（分片只预热缓存，正确性由 merge 保证）。
+    但**不能让失败变成静默**：如果某天 20 个分片全失败，run 仍显示 success，
+    就没人知道分片已失效、merge 在裸跑全量。所以这里统计并告警。
+
+    判据（用户定的三条）：
+      1. 分片失败数写进报告
+      2. 失败数 > 50% 告警
+      3. merge 耗时 > 15 分钟 ⇒ 说明分片没起作用，记下来
+    """
+    import json as _json
+
+    stats = {"total": 0, "withItems": 0, "empty": 0, "failed": 0, "details": []}
+    for path in Path(work).rglob(f"shard_{source}_*.json"):
+        try:
+            data = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        stats["total"] += 1
+        picked = int(data.get("pickedItems") or 0)
+        code = int(data.get("exitCode") or 0)
+        if code != 0:
+            stats["failed"] += 1
+            kind = "failed"
+        elif picked == 0:
+            stats["empty"] += 1
+            kind = "empty"
+        else:
+            stats["withItems"] += 1
+            kind = "ok"
+        stats["details"].append({"shard": data.get("shard"), "picked": picked, "exitCode": code, "kind": kind})
+
+    if stats["total"]:
+        rate = stats["failed"] / stats["total"]
+        log(
+            f"[分片汇总] {source}：共 {stats['total']} 片 —— 有帖 {stats['withItems']} / "
+            f"空片 {stats['empty']} / 失败 {stats['failed']}（失败率 {rate * 100:.0f}%）"
+        )
+        if rate > 0.5:
+            log(
+                f"[分片汇总] ⚠️⚠️ 告警：{source} 分片失败率 {rate * 100:.0f}% > 50% —— "
+                f"分片基本没起作用，本轮 merge 在裸跑全量（产物仍正确，但耗时会长）"
+            )
+        if stats["failed"]:
+            bad = [d for d in stats["details"] if d["kind"] == "failed"]
+            log(f"[分片汇总] 失败分片明细：{bad[:10]}")
+    return stats
+
+
 def do_shard(args) -> int:
     """分片任务：**只负责把它那一份帖子的缓存（详情/回复/图片/OCR）暖起来**。
 
@@ -1619,6 +1725,10 @@ def do_run(args, mode: str = "run") -> int:
 
     # ---- 采集（现有模块，同参数入口）----
     collect_started = time.time()          # 时间对齐基准：只对账"采集前已存在"的帖子
+
+    # ---- 分片状态汇总 + 告警（continue-on-error 之后必须让失败可见）----
+    if mode == "merge":
+        _summarize_shards(work, source, log)
 
     # ---- merge 侧补抓：分片因 CPU 慢/预算到点而留下的 unfinished 清单 ----
     if mode == "merge":
