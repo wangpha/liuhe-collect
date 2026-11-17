@@ -254,9 +254,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: repo/work/out
-          key: ocr-v3-dahkg-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}-${{ matrix.shard }}
+          key: ocr-v3-${{ matrix.shard }}-dahkg-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
-            ocr-v3-dahkg-${{ github.event.inputs.cache_buster || '0' }}-
+            ocr-v3-${{ matrix.shard }}-dahkg-${{ github.event.inputs.cache_buster || '0' }}-
       - name: 分片预热（只处理本片：详情+回复+图片+OCR）
         id: shard
         working-directory: repo
@@ -360,9 +360,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: repo/work/out
-          key: ocr-v3-aocai-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}-${{ matrix.shard }}
+          key: ocr-v3-${{ matrix.shard }}-aocai-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
-            ocr-v3-aocai-${{ github.event.inputs.cache_buster || '0' }}-
+            ocr-v3-${{ matrix.shard }}-aocai-${{ github.event.inputs.cache_buster || '0' }}-
       - name: 分片预热（只处理本片：详情+回复+图片+OCR）
         id: shard
         working-directory: repo
@@ -466,9 +466,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: repo/work/out
-          key: ocr-v3-tuku-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}-${{ matrix.shard }}
+          key: ocr-v3-${{ matrix.shard }}-tuku-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
-            ocr-v3-tuku-${{ github.event.inputs.cache_buster || '0' }}-
+            ocr-v3-${{ matrix.shard }}-tuku-${{ github.event.inputs.cache_buster || '0' }}-
       - name: 分片预热（只处理本片：详情+回复+图片+OCR）
         id: shard
         working-directory: repo
