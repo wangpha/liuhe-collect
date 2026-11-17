@@ -1471,6 +1471,24 @@ def do_run(args, mode: str = "run") -> int:
         if product_check.get("guiOnlyPresent"):
             log(f"[产物] 另有 GUI 侧产物存在：{product_check['guiOnlyPresent']}（云端不判定）")
 
+    # ---- 产物指纹（第5道：分片版 vs 不分片版对照用；日志里就能取，不依赖 artifact 下载）----
+    try:
+        import hashlib
+
+        stamped = {"run_meta.json", "manifest.json", "validation.json"}
+        fingerprints: dict[str, str] = {}
+        for fpath in sorted(out_dir.iterdir()):
+            if not fpath.is_file() or fpath.name in stamped:
+                continue
+            h = hashlib.sha256(fpath.read_bytes()).hexdigest()
+            fingerprints[fpath.name] = h
+            log(f"[产物指纹] {fpath.name} {h}")
+        log(f"[产物指纹] 合计 {len(fingerprints)} 个文件（已排除 {sorted(stamped)}）")
+        _guard.save_json(work / "audit" / f"fingerprints_{source}.json",
+                         {"period": period, "files": fingerprints})
+    except Exception as exc:  # noqa: BLE001 - 指纹失败不该影响产物
+        log(f"[产物指纹] ⚠ 计算失败（不影响本轮）：{type(exc).__name__}: {exc}")
+
     # ---- 第 2 道 + 回复对账 + 楼中楼对账（用户第三节：每轮自动跑）----
     plan_data = _guard.load_json(work / "plan" / f"plan_{source}.json", {})
     declared_map = plan_data.get("postHashes") or {}
