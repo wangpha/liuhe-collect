@@ -1948,6 +1948,27 @@ def do_run(args, mode: str = "run") -> int:
             },
         }
         _guard.save_json(state_file.parent / f"imagecost_{source}.json", image_cost)
+        # ---- 用户分片台账：merge 成功时再写一次 ----
+        # 为什么要在这里写：plan job 里也写了一份（用于当轮分组），
+        # 但**plan job 不提交数据仓**（只有 cleanup 与 publish 会 commit/push），
+        # 所以 plan 写的台账会随 job 结束丢失 → 下一轮又从头分组 → 跨轮不稳定。
+        # merge 跑在 publish 之前、且 publish 会 `git add -A` 提交 state，
+        # 因此在这里补写才能真正确保「老用户归属不变」（审查项·一致性测试 8）。
+        try:
+            plan_for_map = _guard.load_json(_work_dir(args.work) / "plan" / f"plan_{source}.json", {})
+            user_map = plan_for_map.get("userToShard") or {}
+            if user_map:
+                mapping = {str(k): int(v) for k, v in user_map.items()}
+                n_shards = len(plan_for_map.get("shards") or []) or 0
+                _save_user_shard(state_file.parent, source, mapping, period, n_shards)
+                log(
+                    f"[{mode}] 已落盘用户分片台账 user_shard_{source}.json："
+                    f"{len(mapping)} 个作者 → {n_shards} 片（供下一轮沿用，保证归属稳定）"
+                )
+            else:
+                log(f"[{mode}] ⚠ plan 里没有 userToShard（可能未走按用户分组），本轮不更新台账")
+        except Exception as exc:  # noqa: BLE001 - 台账失败不该让整轮失败
+            log(f"[{mode}] ⚠ 写用户分片台账失败（不影响产物）：{type(exc).__name__}: {exc}")
         # ---- 内容指纹快照：只在**本轮全部通过**时写（用户第四节），供下一轮 plan 比对 ----
         try:
             plan_path = _work_dir(args.work) / "plan" / f"plan_{source}.json"
