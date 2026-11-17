@@ -475,14 +475,22 @@ def do_plan(args) -> int:
     last_period = int(state.get("lastPeriod") or 0)
     learned_offset = int(state.get("learnedOffset") or 0)
 
-    # ---- 期号：三源口径不同，各自用自己源头的探测方式（见 _period.detect_period 注释）----
-    info = _period.detect_period(
-        source, last_period=last_period, learned_offset=learned_offset, log=log
-    )
-    period = int(info["period"])
-    display = int(info["display"])
-    evidence = info["evidence"]
-    caliber = info.get("caliber", "short")
+    # ---- 期号：指定则覆盖，否则三源各用自己的探测方式（见 _period.detect_period 注释）----
+    period_override = int(getattr(args, "period", 0) or 0)
+    if period_override:
+        log(f"[plan] 指定期号 {period_override}，跳过自动探测")
+        period = period_override
+        display = int(_period.normalize_period(period))
+        caliber = "short" if period < 1_000_000 else "full"
+        evidence = {"override": True, "requested": period_override, "note": "用户指定期号，跳过四重校验"}
+    else:
+        info = _period.detect_period(
+            source, last_period=last_period, learned_offset=learned_offset, log=log
+        )
+        period = int(info["period"])
+        display = int(info["display"])
+        evidence = info["evidence"]
+        caliber = info.get("caliber", "short")
 
     scan = {}
     if source == "dahkg":
@@ -1729,10 +1737,15 @@ def do_run(args, mode: str = "run") -> int:
     prev_snapshot = _guard.load_json(snapshot_file, {})
     log(f"[state] 期号状态={state_file.name} 上轮期号={last_period or '无'} 上轮快照={len(prev_snapshot)} 帖")
 
-    # ---- 期号（R6/M2：每次重新探测，绝不沿用上次）----
+    # ---- 期号（R6/M2：每次重新探测，绝不沿用上次；但允许用户显式指定覆盖）----
     period = 0
     evidence: dict = {}
-    if source == "dahkg":
+    period_override = int(getattr(args, "period", 0) or 0)
+    if period_override:
+        period = period_override
+        evidence = {"override": True, "requested": period_override}
+        log(f"[{mode}] 指定期号 {period}，跳过自动探测与期号四重校验")
+    elif source == "dahkg":
         period, evidence = _period.detect_verified_dahkg(
             last_period=last_period, learned_offset=learned_offset, log=log
         )
@@ -1993,13 +2006,19 @@ def do_run(args, mode: str = "run") -> int:
     curr_snapshot = _guard.build_snapshot(posts)
     reply_total = sum(len(p.get("replies") or []) for p in posts)
     snap_diff = _guard.diff_snapshots(prev_snapshot, curr_snapshot) if prev_snapshot else {"firstRun": True}
-    monotonic = (
-        _guard.check_monotonic(
-            prev_snapshot, curr_snapshot, int(state.get("replyTotal") or 0), reply_total
+    if period_override:
+        # 指定期号（补跑/压测历史期）时**豁免单调性**：
+        # 否则拿 321 期的产物去和 322 期的快照比，会误报"丢帖"。
+        monotonic = {"passed": True, "firstRun": True, "skippedByOverride": True}
+        log(f"[防线3] 指定期号 {period_override}，跳过单调性检查（不与历史快照比较）")
+    else:
+        monotonic = (
+            _guard.check_monotonic(
+                prev_snapshot, curr_snapshot, int(state.get("replyTotal") or 0), reply_total
+            )
+            if prev_snapshot
+            else {"passed": True, "firstRun": True}
         )
-        if prev_snapshot
-        else {"passed": True, "firstRun": True}
-    )
     if not snap_diff.get("firstRun"):
         log(
             f"[防线3] 快照对比：上轮 {snap_diff['prevCount']} 帖 → 本轮 {snap_diff['currCount']} 帖"
@@ -2075,7 +2094,11 @@ def do_run(args, mode: str = "run") -> int:
     _guard.save_json(work / "audit" / f"audit_{source}_{time.strftime('%Y%m%d_%H%M%S')}.json", audit)
 
     # ---- 状态写回（仅全部通过才写，避免污染下一轮单调性基线）----
-    if passed:
+    # 指定期号时**一律不写**：否则下一轮自动探测会以为"上轮是 321"，
+    # 造成期号单调性误报，也会把 321 的快照当成 322 的基线。
+    if passed and period_override:
+        log(f"[{mode}] 指定期号 {period_override}：跳过 state 写回（不污染自动探测的 lastPeriod/快照）")
+    elif passed:
         new_state = {
             "lastPeriod": period,
             "replyTotal": reply_total,
@@ -2371,6 +2394,11 @@ def parse_args(argv=None):
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--delay", type=float, default=0.05)
     parser.add_argument("--max-pages", type=int, default=200)
+    parser.add_argument(
+        "--period", type=int, default=0,
+        help="指定期号（0=自动探测）。用于补跑/压测历史期；"
+             "指定时不会写回 state 的 lastPeriod/快照，也不会做单调性检查",
+    )
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--ocr-limit", type=int, default=0)
     parser.add_argument("--no-images", action="store_true")
