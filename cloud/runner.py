@@ -61,19 +61,39 @@ def _resolve_state_dir(args, work: Path) -> Path:
     return work / "state"
 
 
-def _find_period_dir(work: Path, out_root: Path, source: str) -> Path:
+def _find_period_dir(work: Path, out_root: Path, source: str, period: int = 0) -> Path:
     """产物目录：out 下**真正含产物**的那一期目录。
 
     实测坑（2026-11-16 Gate1）：49图库除了 `澳门_2026_320期`，还会写一个
     `历史回采/49图库/2026-11-15_第320期` 的中间目录（只有 5 个文件），
     两个目录名解析出来的期号都是 320 —— 只按期号取最大会取错。
     判据：优先 posts.json 存在，其次文件数最多。
+
+    ## period 参数（2026-11-18 阶段 0 修，失败模式 6）
+    指定期号时必须**直接选那一期**，否则会出现：
+        merge 采完 321 期，却拿 322 期的目录去校验
+        → [防线4] 检查 1080 帖、错误 1080 个 → exit 30 → 整轮失败
+    （实证：run 44139439359 smoke test）
     """
     sub = SOURCE_SUBDIR[source]
     base = out_root / sub if sub else out_root
     candidates = [p for p in base.glob("*期") if p.is_dir()]
     if not candidates:
         raise SystemExit(f"[错误] 产物目录不存在：{base}/*期")
+
+    if period:
+        from core import source as src_mod
+
+        want = str(int(src_mod.display_period(period)))
+        for p in candidates:
+            if f"_{want}期" in p.name:
+                log(f"[产物] 指定期号 {period} → 直接选中 {p.name}")
+                return p
+        log(
+            f"[产物] ⚠ 指定期号 {period} 的目录不存在"
+            f"（候选 {[p.name for p in candidates]}），退回自动选择"
+        )
+
     candidates.sort(key=lambda p: (int("".join(c for c in p.name.split("_")[-1] if c.isdigit()) or 0)), reverse=True)
     with_posts = [p for p in candidates if (p / "posts.json").exists()]
     pool = with_posts or candidates
@@ -1794,7 +1814,7 @@ def do_run(args, mode: str = "run") -> int:
         log(f"[{mode}] 采集退出码 {rc} ≠ 0 —— 中止，不进入校验（文档 3-C 第 7 项）")
         return rc
 
-    out_dir = _find_period_dir(work, out_root, source)
+    out_dir = _find_period_dir(work, out_root, source, period=period)
     log(f"[{mode}] 产物目录：{out_dir}")
     meta, posts = _reconcile.load_products(out_dir)
     got_period = int(meta.get("period") or 0)
