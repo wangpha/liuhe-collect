@@ -329,14 +329,19 @@ def _fetch_first_page(source: str) -> list[dict]:
         latest, _year, _last, _page1, _manual = scraper.resolve_target(2, 0.05, 0)
         if not latest:
             return []
-        posts, _meta = scraper.fetch_period_posts(49, int(latest), 1, 0.0)
-        out = []
+        # resolve_target 是该源的权威期号来源 → **先把它作为一条种子行**。
+        # 否则「该期还没有帖子 / 源站 502」会被误判成「第1页无期号」→ 无台账时直接中止。
+        seeds = [{"periods": int(latest)}]
+        try:
+            posts, _meta = scraper.fetch_period_posts(49, int(latest), 1, 0.0)
+        except Exception:  # noqa: BLE001 - 抓帖子失败不影响期号结论
+            posts = []
         for row in posts or []:
             try:
-                out.append({"periods": int(str(row.get("periods") or row.get("period") or latest))})
+                seeds.append({"periods": int(str(row.get("periods") or row.get("period") or latest))})
             except (TypeError, ValueError):
-                out.append({"periods": int(latest)})
-        return out
+                seeds.append({"periods": int(latest)})
+        return seeds
     raise ValueError(f"未知源：{source}")
 
 
