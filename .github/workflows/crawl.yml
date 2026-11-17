@@ -209,6 +209,11 @@ jobs:
     # runner 内部还有 16 分钟「软超时」：到点把剩余帖子写 unfinished_*.json 后正常退出，
     # 剩余工作交给 merge 补抓（见 runner.py 的 watchdog）。
     timeout-minutes: 20
+    # 分片只是「预热缓存」，**正确性由 merge 的全量重采 + 五道防线保证**。
+    # 2026-11-17 事故：跨期时若干分片报「没有 X 期的帖子」→ 整个 run 变 failure → publish 被跳过，
+    # 当天数据没进数据仓。所以这里让分片失败**不连累整轮**：
+    # 分片失败 = 那部分缓存没预热（merge 多花点时间重采），不影响产物正确性。
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -320,6 +325,11 @@ jobs:
     # runner 内部还有 16 分钟「软超时」：到点把剩余帖子写 unfinished_*.json 后正常退出，
     # 剩余工作交给 merge 补抓（见 runner.py 的 watchdog）。
     timeout-minutes: 20
+    # 分片只是「预热缓存」，**正确性由 merge 的全量重采 + 五道防线保证**。
+    # 2026-11-17 事故：跨期时若干分片报「没有 X 期的帖子」→ 整个 run 变 failure → publish 被跳过，
+    # 当天数据没进数据仓。所以这里让分片失败**不连累整轮**：
+    # 分片失败 = 那部分缓存没预热（merge 多花点时间重采），不影响产物正确性。
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -431,6 +441,11 @@ jobs:
     # runner 内部还有 16 分钟「软超时」：到点把剩余帖子写 unfinished_*.json 后正常退出，
     # 剩余工作交给 merge 补抓（见 runner.py 的 watchdog）。
     timeout-minutes: 20
+    # 分片只是「预热缓存」，**正确性由 merge 的全量重采 + 五道防线保证**。
+    # 2026-11-17 事故：跨期时若干分片报「没有 X 期的帖子」→ 整个 run 变 failure → publish 被跳过，
+    # 当天数据没进数据仓。所以这里让分片失败**不连累整轮**：
+    # 分片失败 = 那部分缓存没预热（merge 多花点时间重采），不影响产物正确性。
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
