@@ -1,4 +1,4 @@
-# Python 缓存目录（注意：core/ 下的 .pyc 是**交付物**，不能忽略）
+# Python 缓存目录（注意：cloud/core/ 下的 20 个 .pyc 是**交付物**，绝不能忽略）
 __pycache__/
 cloud/__pycache__/
 work/shards/__pycache__/
@@ -10,3 +10,4 @@ _sync_cache/
 work/
 *.log
 !docs/**/*.log
+
