@@ -648,7 +648,7 @@ jobs:
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
           [ "$LIMIT" != "0" ] && EXTRA="$EXTRA --limit $LIMIT"
           python -m cloud.runner --merge --source "dahkg" --work work --out work/out \
-            --state work/store/state --workers 4 $EXTRA 2>&1 | tee "work/run_dahkg.log"
+            --state work/store/state --workers 8 $EXTRA 2>&1 | tee "work/run_dahkg.log"
       - name: 日志零错误审计（文档 6B.3 方式 1）
         if: always()
         working-directory: repo
@@ -800,7 +800,7 @@ jobs:
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
           [ "$LIMIT" != "0" ] && EXTRA="$EXTRA --limit $LIMIT"
           python -m cloud.runner --merge --source "aocai" --work work --out work/out \
-            --state work/store/state --workers 4 $EXTRA 2>&1 | tee "work/run_aocai.log"
+            --state work/store/state --workers 8 $EXTRA 2>&1 | tee "work/run_aocai.log"
       - name: 日志零错误审计（文档 6B.3 方式 1）
         if: always()
         working-directory: repo
@@ -952,7 +952,7 @@ jobs:
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
           [ "$LIMIT" != "0" ] && EXTRA="$EXTRA --limit $LIMIT"
           python -m cloud.runner --merge --source "tuku" --work work --out work/out \
-            --state work/store/state --workers 4 $EXTRA 2>&1 | tee "work/run_tuku.log"
+            --state work/store/state --workers 8 $EXTRA 2>&1 | tee "work/run_tuku.log"
       - name: 日志零错误审计（文档 6B.3 方式 1）
         if: always()
         working-directory: repo
