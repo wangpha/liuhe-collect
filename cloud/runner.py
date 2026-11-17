@@ -1512,9 +1512,19 @@ def do_shard(args) -> int:
     ocr_s = round(diag["ocr"]["seconds"], 1)
     dl_s = round(diag["download"]["seconds"], 1)
     ocr_n = diag["ocr"]["calls"]
+    # ⚠️ 2026-11-17 实测事故：按用户分片 + 缓存隔离后，分片缓存命中率提高，
+    # 有的分片 `ocr_n == 0`（一次新 OCR 都没做，全部命中缓存），
+    # 这里直接 `ocr_s / ocr_n` 会 **ZeroDivisionError 让整个分片 job 失败**（20 片全挂）。
+    # 正确写法：先判断次数，为 0 时显式说明"全部命中缓存"。
+    per_call = (ocr_s / ocr_n) if ocr_n else 0.0
+    ocr_desc = (
+        f"OCR {ocr_s}s（{ocr_n} 次调用，{per_call:.3f} 秒/次）"
+        if ocr_n
+        else f"OCR {ocr_s}s（0 次新识别 = 全部命中缓存）"
+    )
     log(
-        f"[diag] 本片总耗时 {run_seconds}s = OCR {ocr_s}s（{ocr_n} 次调用，"
-        f"{(ocr_s / ocr_n):.3f} 秒/次） + 下载 {dl_s}s + 其他 {round(run_seconds - ocr_s - dl_s, 1)}s"
+        f"[diag] 本片总耗时 {run_seconds}s = {ocr_desc}"
+        f" + 下载 {dl_s}s + 其他 {round(run_seconds - ocr_s - dl_s, 1)}s"
     )
     bench = _ocr_micro_benchmark(out_root, limit=3) if not args.no_ocr else {"skipped": True}
     log(f"[diag] 微型基准（预热后 3 张）: {bench}")
