@@ -888,6 +888,17 @@ def _slice_items(items, shard: int, total: int, sink: dict, planned_ids: set[int
         # 按用户分片（方案 3）：一个作者的所有帖子都进同一片；新帖因作者已在本片而自动跟随。
         picked = [it for it in seq if _sender_of(it) in mine_users]
         sink["mode"] = "by-user"
+        if not picked and seq and planned_ids:
+            # 兜底（2026-11-17 事故）：按用户取到空片时，若 plan 里有本片的帖子 id 列表，就退回按 id 取。
+            # 否则空列表会让模块直接报「列表里没有 X 期的帖子」并让整个分片 job 失败。
+            fallback = [it for it in seq if _plan_item_id(it) in planned_ids]
+            if fallback:
+                sink["mode"] = "by-user(empty)->planned-ids"
+                picked = fallback
+                log(
+                    f"[shard] ⚠ 按用户切片为空（{len(mine_users)} 个作者都不在列表里），"
+                    f"已退回按 plan 的帖子 id 取到 {len(fallback)} 帖，避免空片失败"
+                )
     elif planned_ids is not None:
         picked = [it for it in seq if _plan_item_id(it) in planned_ids]
         sink["mode"] = "planned-ids"
@@ -1414,7 +1425,9 @@ def do_shard(args) -> int:
             f"（台账 user_shard_{source}.json 保证跨轮稳定）"
         )
     shard_plan = plan.get("shardPlan") or {}
-    if mine_users is None and shard_plan and int(shard_plan.get("n") or 0) == shard_total:
+    # 注意：即使已按用户分组，也要把 plan 的帖子 id 列表准备好 ——
+    # `_slice_items` 在「按用户取到空片」时会退回用它兜底（2026-11-17 空片事故）。
+    if shard_plan and int(shard_plan.get("n") or 0) == shard_total:
         group = (shard_plan.get("groups") or {}).get(str(shard_index)) or []
         planned_ids = {int(x) for x in group}
         log(
@@ -1501,6 +1514,17 @@ def do_shard(args) -> int:
         for mod, name, original in (originals or []):
             setattr(mod, name, original)
     run_seconds = round(time.perf_counter() - run_t0, 1)
+    # 空片不算失败（2026-11-17 跨期事故）：如果本片一帖都没分到，
+    # 模块会报「列表里没有 X 期的帖子」并以非 0 退出。
+    # 但空片本身是合法状态（尤其期号正在切换、新期还没进榜时），
+    # 完整性由 merge 保证（merge 会全量重采并跑五道防线），
+    # 所以这里显式转成成功 + 警告，而不是让整个 run 失败、连带 publish 被跳过。
+    if code != 0 and int(sink.get('picked') or 0) == 0:
+        log(
+            f"[shard] ⚠ 本片未分到任何帖子（模块退出码={code}），按**空片**处理、不计失败；"
+            f"完整性由 merge 全量重采保证"
+        )
+        code = 0
 
     log(
         f"[shard] {source} 本片：源站本期共 {sink.get('total', 0)} 帖 / {sink.get('imagesTotal', 0)} 图，"
