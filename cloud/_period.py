@@ -281,3 +281,117 @@ def check_posts_period(posts: list[dict], target: int) -> dict:
         "passed": len(wrong) == 0,
     }
 
+
+
+# ---------------------------------------------------------------------------
+# 阶段 1（v5 任务书）：安全期号判定 =「第 1 页唯一性 + 台账锁定」
+# ---------------------------------------------------------------------------
+
+#: 各档位的换期策略（20:50 那轮锁台账，避免当晚数据被拆成两期）
+PERIOD_LOCK_POLICY: dict[str, str] = {
+    "12:00": "allow_switch",
+    "15:00": "allow_switch",
+    "18:00": "allow_switch",
+    "20:15": "allow_switch",
+    "20:50": "keep_ledger",
+}
+
+
+def _display(period: int) -> int:
+    """展示口径：整期号 2026322 -> 322。"""
+    return int(normalize_period(period)) or int(period)
+
+
+def _caliber(period: int) -> str:
+    return "full" if int(period) >= 1_000_000 else "short"
+
+
+def _fetch_first_page(source: str) -> list[dict]:
+    """抓各源**第 1 页**列表行，统一成 [{"periods": <int>}, ...]。
+
+    · dahkg：直接打 URI_LIST，sortType=1（按时间；`fetch_list_page` 写死 3，不能用）
+    · aocai：论坛首页，行内 `qs` 就是整期号
+    · tuku ：其列表接口必须带期号 → 先用 resolve_target 拿当期，再抓该期第 1 页；
+             拿不到就返回空列表（交给「空页」分支处理）
+    """
+    if source == "dahkg":
+        rows = _list_page(1, 1)
+        return [{"periods": int(r.get("periods") or 0)} for r in (rows or [])]
+    if source == "aocai":
+        from core import forum as forum_mod
+
+        payload = forum_mod.fetch_luntan_page(0, delay=0.05)
+        items = forum_mod.parse_list_payload(payload)
+        return [{"periods": int(forum_mod.as_int(it.get("qs")) or 0)} for it in (items or [])]
+    if source == "tuku":
+        from core import scraper
+
+        latest, _year, _last, _page1, _manual = scraper.resolve_target(2, 0.05, 0)
+        if not latest:
+            return []
+        posts, _meta = scraper.fetch_period_posts(49, int(latest), 1, 0.0)
+        out = []
+        for row in posts or []:
+            try:
+                out.append({"periods": int(str(row.get("periods") or row.get("period") or latest))})
+            except (TypeError, ValueError):
+                out.append({"periods": int(latest)})
+        return out
+    raise ValueError(f"未知源：{source}")
+
+
+def detect_period_safe(
+    source: str,
+    ledger_path,
+    log: Callable[[str], None] | None = None,
+    first_page_rows: list[dict] | None = None,
+) -> dict:
+    """安全期号判定：第 1 页唯一性 + 台账锁定（8 种情况，见 v5 任务书阶段 1）。
+
+    与现有 `detect_period` 的关系：**并存**，不改旧函数。
+    `first_page_rows` 只为单测注入；生产传 None 时走 `_fetch_first_page(source)`。
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    say = log or (lambda message: None)
+    path = _Path(ledger_path)
+    ledger = {}
+    if path.exists():
+        try:
+            ledger = _json.loads(path.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001 - 台账坏了按「无台账」处理，但要明说
+            say(f"[期号] ⚠ 台账 {path.name} 解析失败，按无台账处理")
+            ledger = {}
+    ledger_period = int(ledger.get("period") or 0)
+
+    rows = first_page_rows if first_page_rows is not None else _fetch_first_page(source)
+    periods = {int(r["periods"]) for r in (rows or []) if int(r.get("periods") or 0) > 0}
+
+    def _result(period: int, reason: str, **extra) -> dict:
+        ev = {"reason": reason, "firstPage": sorted(periods), "ledger": ledger_period,
+              "source": source, "code": extra.pop("code", "")}
+        ev.update(extra)
+        say(f"[期号/{source}] {reason} → 采用 {period}（展示 {_display(period)} 期）")
+        return {"period": int(period), "display": _display(period),
+                "caliber": _caliber(period), "evidence": ev}
+
+    if len(periods) == 1:                                  # 情况 1/2/3/4
+        p = periods.pop()
+        if not ledger_period:
+            return _result(p, "首轮建立基线", code="single_no_ledger")
+        if p == ledger_period:
+            return _result(p, "与台账一致", code="single_consistent")
+        if p > ledger_period:
+            return _result(p, f"换期 {ledger_period}→{p}", code="single_greater")
+        raise PeriodAbort(
+            f"[期号/{source}] 源站期号回退：台账 {ledger_period} > 当前 {p}（第1页 {sorted(periods | {p})}）"
+        )
+    if len(periods) > 1:                                   # 情况 5/6
+        if ledger_period:
+            return _result(ledger_period, "过渡期混期，用台账", code="mixed_ledger")
+        pmax = max(periods)
+        return _result(pmax, "过渡期无台账取最大", code="mixed_max")
+    if ledger_period:                                      # 情况 7
+        return _result(ledger_period, "第1页无期号，用台账", code="empty_ledger")
+    raise PeriodAbort(f"[期号/{source}] 第1页无期号且无台账，拒绝猜期号")   # 情况 8
