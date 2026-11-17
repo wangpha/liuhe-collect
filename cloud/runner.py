@@ -616,8 +616,50 @@ def do_plan(args) -> int:
             weights = {aid: _item_image_weight(union_meta.get(str(aid)) or {}) for aid in union_ids}
             mode = "det-area-estimated"
             weight_src = "det 输入像素面积 + 回复图估计（无预抓、无历史）"
-        groups = _balanced_groups(union_ids, weights, shard_n)
-        # ---- 第 1 道：分片分配不重不漏（用户第三节；不满足直接失败，不启动 shard）----
+        # ---- 按**用户**做 LPT 分组（用户 2026-11-17 方案 3）----
+        # 为什么改成按用户：按帖子分片时，同一个作者的不同帖子会被分到不同片，
+        # 他的详情/回复/图片缓存被切碎、跨轮命中率低，新帖还会让归属漂移。
+        # 按用户分片后：一个作者的所有帖子恒在同一片，新帖自动跟随。
+        sender_of_aid = {
+            aid: str((union_meta.get(str(aid)) or {}).get("senderId") or "") for aid in union_ids
+        }
+        user_weights: dict[str, int] = {}
+        aid_by_user: dict[str, list[int]] = {}
+        for aid in union_ids:
+            uid = sender_of_aid.get(aid) or ""
+            user_weights[uid] = user_weights.get(uid, 0) + max(1, weights.get(aid, 1))
+            aid_by_user.setdefault(uid, []).append(aid)
+
+        prev_map = _load_user_shard(state_dir, source)
+        prev_period = int((_guard.load_json(_user_shard_path(state_dir, source), {}) or {}).get("period") or 0)
+        if prev_period not in (0, period, display):
+            log(f"[plan] 上轮台账期号 {prev_period} ≠ 本轮 {period}，按新期重新建台账")
+            prev_map = {}
+        user_groups, user_to_shard = _group_by_user(user_weights, shard_n, prev=prev_map)
+
+        # 5.1 三条断言（用户 2026-11-17 方案 3 第 5.1 条）——不通过直接失败，不启动 shard
+        flat_users = [u for g in user_groups for u in g]
+        if set(flat_users) != set(user_weights):
+            raise SystemExit(
+                f"[plan] ❌ 断言①失败：分组后用户数 {len(set(flat_users))} != 实际 {len(user_weights)}"
+            )
+        if len(flat_users) != len(set(flat_users)):
+            raise SystemExit(f"[plan] ❌ 断言②失败：有用户被分配到多个分片")
+        groups = [[aid for uid in g for aid in aid_by_user.get(uid, [])] for g in user_groups]
+        total_posts_in_groups = sum(len(g) for g in groups)
+        if total_posts_in_groups != len(union_ids):
+            raise SystemExit(
+                f"[plan] ❌ 断言③失败：分组后帖子数 {total_posts_in_groups} != 实际 {len(union_ids)}"
+            )
+        log(
+            f"[plan] ✅ 用户分组三条断言通过：{len(user_weights)} 个作者 → {shard_n} 片，"
+            f"{len(union_ids)} 帖全部覆盖、无重复"
+        )
+        _save_user_shard(state_dir, source, user_to_shard, period, shard_n)
+        plan["shards"] = user_groups
+        plan["userToShard"] = user_to_shard
+
+        # ---- 第 1 道：分片分配不重不漏（帖子维度，保留原有校验）----
         flat = [a for g in groups for a in g]
         dup = len(flat) - len(set(flat))
         missing_ids = sorted(set(union_ids) - set(flat))
@@ -779,7 +821,89 @@ def _balanced_groups(ids: list[int], weights: dict[int, int], n: int) -> list[li
     return groups
 
 
-def _slice_items(items, shard: int, total: int, sink: dict, planned_ids: set[int] | None = None):
+def _sender_of(item: dict) -> str:
+    """列表行里的作者标识（三源字段名不同，统一成字符串）。
+
+    用户 2026-11-17 方案 3 要求「按用户分片」：一个作者的所有帖子必须落在同一片，
+    否则同一个人每轮可能换片 → 缓存命中率低、且新帖会漂移。
+    """
+    for key in ("senderId", "userId", "authorId", "uid", "nickname", "userName"):
+        value = (item or {}).get(key)
+        if value not in (None, "", 0):
+            return str(value)
+    return ""
+
+
+def _group_by_user(user_weights: dict[str, int], n: int, prev: dict[str, int] | None = None):
+    """按**用户**做 LPT 分组，并尽量保持上一轮的归属（跨轮稳定）。
+
+    - 老用户：沿用 `prev` 里的分片号（保证跨轮一致，缓存才命得中）
+    - 新用户：放进当前负载最轻的那片
+    返回 (groups_by_user, user_to_shard)。
+    """
+    prev = prev or {}
+    n = max(1, n)
+    groups: list[list[str]] = [[] for _ in range(n)]
+    loads = [0] * n
+    mapping: dict[str, int] = {}
+
+    # 1) 老用户先就位（保持稳定）
+    for uid, w in user_weights.items():
+        idx = prev.get(uid)
+        if isinstance(idx, int) and 0 <= idx < n:
+            groups[idx].append(uid)
+            loads[idx] += max(1, int(w))
+            mapping[uid] = idx
+
+    # 2) 新用户按权重从大到小，塞进最轻的片
+    rest = [(uid, max(1, int(w))) for uid, w in user_weights.items() if uid not in mapping]
+    rest.sort(key=lambda x: -x[1])
+    for uid, w in rest:
+        idx = min(range(n), key=lambda i: (loads[i], i))
+        groups[idx].append(uid)
+        loads[idx] += w
+        mapping[uid] = idx
+
+    return groups, mapping
+
+
+def _user_shard_path(state_dir: Path, source: str) -> Path:
+    return Path(state_dir) / f"user_shard_{source}.json"
+
+
+def _load_user_shard(state_dir: Path, source: str) -> dict:
+    """读「用户 → 分片」台账（跨轮稳定的依据）。"""
+    from . import _guard
+
+    data = _guard.load_json(_user_shard_path(state_dir, source), {})
+    mapping = (data or {}).get("userToShard") or {}
+    out: dict[str, int] = {}
+    for k, v in mapping.items():
+        try:
+            out[str(k)] = int(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _save_user_shard(state_dir: Path, source: str, mapping: dict[str, int], period: int, n: int) -> None:
+    """保存「用户 → 分片」台账。"""
+    from . import _guard
+
+    _guard.save_json(
+        _user_shard_path(state_dir, source),
+        {
+            "period": period,
+            "shards": n,
+            "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "_note": "按用户分片：同一作者固定落同一片，跨轮稳定；新用户进入当前最轻的片",
+            "userToShard": mapping,
+        },
+    )
+
+
+def _slice_items(items, shard: int, total: int, sink: dict, planned_ids: set[int] | None = None,
+                 mine_users: set[str] | None = None):
     """把 items 切成一片：优先按 plan 里算好的均衡分组，没有就退回 id%N。"""
     if isinstance(items, tuple):
         seq, meta = items[0], items[1:]
@@ -791,7 +915,11 @@ def _slice_items(items, shard: int, total: int, sink: dict, planned_ids: set[int
         return items
     sink["total"] = len(seq)
     sink["imagesTotal"] = sum(_item_image_weight(it) for it in seq)
-    if planned_ids is not None:
+    if mine_users is not None:
+        # 按用户分片（方案 3）：一个作者的所有帖子都进同一片；新帖因作者已在本片而自动跟随。
+        picked = [it for it in seq if _sender_of(it) in mine_users]
+        sink["mode"] = "by-user"
+    elif planned_ids is not None:
         picked = [it for it in seq if _plan_item_id(it) in planned_ids]
         sink["mode"] = "balanced"
     else:
@@ -802,7 +930,8 @@ def _slice_items(items, shard: int, total: int, sink: dict, planned_ids: set[int
     return (picked, *meta) if meta else picked
 
 
-def _patch_shard(source: str, shard: int, total: int, sink: dict, planned_ids: set[int] | None = None):
+def _patch_shard(source: str, shard: int, total: int, sink: dict, planned_ids: set[int] | None = None,
+                 mine_users: set[str] | None = None):
     """给该源的「列表取数函数」打补丁，只保留本片的帖子。
 
     ## 为什么用「打补丁 + 进程内跑原生 CLI」而不是重写采集流程
@@ -823,7 +952,8 @@ def _patch_shard(source: str, shard: int, total: int, sink: dict, planned_ids: s
         if original is None:
             return
         def patched(*a, **kw):
-            return _slice_items(original(*a, **kw), shard, total, sink, planned_ids=planned_ids)
+            return _slice_items(original(*a, **kw), shard, total, sink, planned_ids=planned_ids,
+                                 mine_users=mine_users)
         setattr(mod, name, patched)
         originals.append((mod, name, original))
 
@@ -1299,10 +1429,18 @@ def do_shard(args) -> int:
         raise SystemExit("[错误] plan 里没有期号，无法分片")
 
     sink: dict = {"total": 0, "picked": 0}
-    # 优先用 plan 里按「累计图片数」算好的均衡分组（18 个分片读同一份 JSON → 分配一致）
+    # 优先按**用户**分组（方案 3）：一个作者的所有帖子恒在同一片，新帖自动跟随
     planned_ids: set[int] | None = None
+    mine_users: set[str] | None = None
+    plan_users = plan.get("shards") or []
+    if plan_users and len(plan_users) == shard_total and shard_index < len(plan_users):
+        mine_users = {str(u) for u in (plan_users[shard_index] or [])}
+        log(
+            f"[shard] 使用 plan 的**按用户**分组：本片 {len(mine_users)} 个作者"
+            f"（台账 user_shard_{source}.json 保证跨轮稳定）"
+        )
     shard_plan = plan.get("shardPlan") or {}
-    if shard_plan and int(shard_plan.get("n") or 0) == shard_total:
+    if mine_users is None and shard_plan and int(shard_plan.get("n") or 0) == shard_total:
         group = (shard_plan.get("groups") or {}).get(str(shard_index)) or []
         planned_ids = {int(x) for x in group}
         log(
@@ -1314,7 +1452,7 @@ def do_shard(args) -> int:
             f"[shard] ⚠ plan 的分片数 {shard_plan.get('n')} 与本次 --shards {shard_total} 不一致，"
             f"退回 id 取模（请检查 workflow 的 SHARD_MAP 与 matrix 是否同源）"
         )
-    originals = _patch_shard(source, shard_index, shard_total, sink, planned_ids=planned_ids)
+    originals = _patch_shard(source, shard_index, shard_total, sink, planned_ids=planned_ids, mine_users=mine_users)
     log(
         f"[shard] 已给 {source} 的列表取数打切片补丁"
         f"（{'plan 均衡分组' if planned_ids is not None else f'id % {shard_total} == {shard_index}'}）"
@@ -1357,7 +1495,7 @@ def do_shard(args) -> int:
                 # 重新打补丁（用缩小后的集合）
                 for mod, name, original in (originals or []):
                     setattr(mod, name, original)
-                originals = _patch_shard(source, shard_index, shard_total, sink, planned_ids=planned_ids)
+                originals = _patch_shard(source, shard_index, shard_total, sink, planned_ids=planned_ids, mine_users=mine_users)
             else:
                 log(f"[shard] 本片工作量在预算内，全部自己处理")
 
@@ -2120,6 +2258,8 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
 
 
 

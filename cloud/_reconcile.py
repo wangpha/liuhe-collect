@@ -16,6 +16,18 @@ from ._period import normalize_period
 # ---------------------------------------------------------------------------
 # 防线 1：独立扫描源站列表
 # ---------------------------------------------------------------------------
+def _sender_of(row: dict) -> str:
+    """列表行里的作者标识（三源字段名不同，统一成字符串）。
+
+    大港澳实测是 `senderId` + `nickname`；aocai/tuku 用别的键名，这里按优先级兜底。
+    取不到就返回空串 —— 调用方会把它归到"无主"桶，不会静默丢帖。
+    """
+    for key in ("senderId", "userId", "authorId", "uid", "nickname", "userName"):
+        value = (row or {}).get(key)
+        if value not in (None, "", 0):
+            return str(value)
+    return ""
+
 def independent_scan_dahkg(
     period: int,
     max_pages: int = 200,
@@ -81,6 +93,7 @@ def independent_scan_dahkg(
                 if aid:
                     ids[aid] = {
                         "imgTotal": int(row.get("imgTotal") or 0),
+                        "senderId": _sender_of(row),
                         "replyPoint": int(row.get("replyPoint") or 0),
                         "nicePoint": int(row.get("nicePoint") or 0),
                         "isCurrPeriods": row.get("isCurrPeriods"),
@@ -283,6 +296,7 @@ def independent_scan_tuku(
                     aid,
                     {
                         "imgTotal": len(pics) if isinstance(pics, list) else 0,
+                        "senderId": _sender_of(raw),
                         "commentCount": int(raw.get("commentCount") or 0),
                         "thumbUpCount": int(raw.get("thumbUpCount") or 0),
                     },
@@ -385,6 +399,7 @@ def independent_scan_aocai(
                     tid,
                     {
                         "imgTotal": 0,     # 澳彩列表行没有图片总数，图片在详情里
+                        "senderId": _sender_of(raw),
                         "huifushu": int(forum_mod.as_int(raw.get("huifushu")) or 0),
                     },
                 )
@@ -1059,6 +1074,7 @@ def check_products(out_dir: Path, source: str = "dahkg") -> dict:
         "guiOnlyPresent": gui_present,
         "passed": not missing,
     }
+
 
 
 
