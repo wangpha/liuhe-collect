@@ -818,11 +818,18 @@ def _item_image_weight(item: dict) -> int:
 #:   dahkg：`senderId`（驼峰）
 #:   aocai：`userid`  （全小写！实测字段表只有 userid，没有 senderId/userId）
 #:   tuku ：`userid`  （同 aocai 的通行写法；缺失会硬失败，不会静默归 None）
-SOURCE_USER_KEY: dict[str, str] = {
-    "dahkg": "senderId",
-    "aocai": "userid",
-    "tuku": "userid",
+#: 每源的「作者字段候选序列」——按顺序取第一个存在的。
+#:   dahkg：`senderId`（驼峰，实测确认）
+#:   aocai：`userid`（**全小写**，实测确认；没有 senderId/userId）
+#:   tuku ：列行字段尚未实测确认（源站 502），先给多候选，
+#:          取不到任何一个仍然**硬失败**（不会静默归到空用户）
+SOURCE_USER_KEYS: dict[str, tuple[str, ...]] = {
+    "dahkg": ("senderId",),
+    "aocai": ("userid",),
+    "tuku": ("userid", "userId", "senderId", "username", "nickname"),
 }
+#: 兼容旧名字（plan 的报错文案会引用）
+SOURCE_USER_KEY = {k: v[0] for k, v in SOURCE_USER_KEYS.items()}
 
 
 def _sender_of(item: dict, source: str | None = None) -> str:
@@ -835,12 +842,11 @@ def _sender_of(item: dict, source: str | None = None) -> str:
     现在改成**按源声明字段名**，取不到就返回空串，由调用方硬失败（不静默）。
     """
     if source:
-        key = SOURCE_USER_KEY.get(source)
-        if key:
+        for key in SOURCE_USER_KEYS.get(source, ()):
             value = (item or {}).get(key)
             if value not in (None, "", 0):
                 return str(value)
-            return ""
+        return ""
     # 未指定源时（比如通用工具）才退回候选列表
     for key in ("senderId", "userid", "userId", "authorId", "uid"):
         value = (item or {}).get(key)
@@ -1638,6 +1644,12 @@ def do_shard(args) -> int:
         f"（模式={sink.get('mode', '?')}）；模块退出码={code}"
     )
 
+    # 诊断一行（用户 2026-11-18 要求）：查清「空片兜底为什么没拦住」
+    try:
+        log(f"[shard] 诊断：code={code}, picked={sink.get('picked')}, total={sink.get('total')}, mode={sink.get('mode')}")
+    except Exception:  # noqa: BLE001 - 诊断日志绝不该阻断主流程
+        pass
+
     # OCR/下载 分开计时（这是"CPU 慢还是网络慢"的判据）
     ocr_s = round(diag["ocr"]["seconds"], 1)
     dl_s = round(diag["download"]["seconds"], 1)
@@ -1646,7 +1658,10 @@ def do_shard(args) -> int:
     # 有的分片 `ocr_n == 0`（一次新 OCR 都没做，全部命中缓存），
     # 这里直接 `ocr_s / ocr_n` 会 **ZeroDivisionError 让整个分片 job 失败**（20 片全挂）。
     # 正确写法：先判断次数，为 0 时显式说明"全部命中缓存"。
-    per_call = (ocr_s / ocr_n) if ocr_n else 0.0
+    try:
+        per_call = (ocr_s / ocr_n) if ocr_n else 0.0
+    except Exception:  # noqa: BLE001 - 诊断统计异常不该崩
+        per_call = 0.0
     ocr_desc = (
         f"OCR {ocr_s}s（{ocr_n} 次调用，{per_call:.3f} 秒/次）"
         if ocr_n

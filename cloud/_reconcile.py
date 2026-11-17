@@ -17,15 +17,21 @@ from ._period import normalize_period
 # 防线 1：独立扫描源站列表
 # ---------------------------------------------------------------------------
 #: 三源列表行的作者字段（2026-11-17 实测）：dahkg=senderId，aocai/tuku=userid（全小写）
-_SOURCE_USER_KEY = {"dahkg": "senderId", "aocai": "userid", "tuku": "userid"}
+_SOURCE_USER_KEYS = {
+    "dahkg": ("senderId",),
+    "aocai": ("userid",),
+    "tuku": ("userid", "userId", "senderId", "username", "nickname"),
+}
 
 
 def _sender_of(row: dict, source: str = "") -> str:
     """按源取列表行的作者标识；取不到返回空串（由调用方硬失败，不静默归桶）。"""
-    key = _SOURCE_USER_KEY.get(source)
-    if key:
+    for key in _SOURCE_USER_KEYS.get(source, ()):
         value = (row or {}).get(key)
-        return str(value) if value not in (None, "", 0) else ""
+        if value not in (None, "", 0):
+            return str(value)
+    if source:
+        return ""
     for key in ("senderId", "userid", "userId", "authorId", "uid"):
         value = (row or {}).get(key)
         if value not in (None, "", 0):
