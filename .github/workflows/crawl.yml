@@ -272,6 +272,18 @@ jobs:
             --shards "${{ needs.plan.outputs.count_dahkg }}" \
             --source "dahkg" --work work --out work/out --workers 8 \
             $EXTRA 2>&1 | tee "work/shard_dahkg_${{ matrix.shard }}.log"
+      - name: 精简缓存体积（删图片，只留 .cache）
+        if: always()
+        working-directory: repo
+        run: |
+          # actions/cache 的 path 是 repo/work/out，图片占 99%：
+          # 实测单片缓存 ~900MB，12 片 10.8GB > GitHub 的 10GB 上限 → 互相驱逐、越跑越冷。
+          # 真正值得缓存的是 .cache（详情/回复/OCR 结果，压缩后 ~0.3MB），
+          # 图片每轮重新下载即可（并行、每片几百张，远小于缓存打爆的代价）。
+          before=$(du -sm work/out 2>/dev/null | cut -f1 || echo 0)
+          find work/out -type f \( -name '*.png' -o -name '*.jpg' -o -name '*.jpeg' -o -name '*.webp' \) -delete 2>/dev/null || true
+          after=$(du -sm work/out 2>/dev/null | cut -f1 || echo 0)
+          echo "分片缓存瘦身：${before}MB -> ${after}MB（图片不进缓存，.cache 保留）"
       - name: 打包本片缓存
         if: always()
         working-directory: repo
@@ -366,6 +378,18 @@ jobs:
             --shards "${{ needs.plan.outputs.count_aocai }}" \
             --source "aocai" --work work --out work/out --workers 8 \
             $EXTRA 2>&1 | tee "work/shard_aocai_${{ matrix.shard }}.log"
+      - name: 精简缓存体积（删图片，只留 .cache）
+        if: always()
+        working-directory: repo
+        run: |
+          # actions/cache 的 path 是 repo/work/out，图片占 99%：
+          # 实测单片缓存 ~900MB，12 片 10.8GB > GitHub 的 10GB 上限 → 互相驱逐、越跑越冷。
+          # 真正值得缓存的是 .cache（详情/回复/OCR 结果，压缩后 ~0.3MB），
+          # 图片每轮重新下载即可（并行、每片几百张，远小于缓存打爆的代价）。
+          before=$(du -sm work/out 2>/dev/null | cut -f1 || echo 0)
+          find work/out -type f \( -name '*.png' -o -name '*.jpg' -o -name '*.jpeg' -o -name '*.webp' \) -delete 2>/dev/null || true
+          after=$(du -sm work/out 2>/dev/null | cut -f1 || echo 0)
+          echo "分片缓存瘦身：${before}MB -> ${after}MB（图片不进缓存，.cache 保留）"
       - name: 打包本片缓存
         if: always()
         working-directory: repo
@@ -460,6 +484,18 @@ jobs:
             --shards "${{ needs.plan.outputs.count_tuku }}" \
             --source "tuku" --work work --out work/out --workers 8 \
             $EXTRA 2>&1 | tee "work/shard_tuku_${{ matrix.shard }}.log"
+      - name: 精简缓存体积（删图片，只留 .cache）
+        if: always()
+        working-directory: repo
+        run: |
+          # actions/cache 的 path 是 repo/work/out，图片占 99%：
+          # 实测单片缓存 ~900MB，12 片 10.8GB > GitHub 的 10GB 上限 → 互相驱逐、越跑越冷。
+          # 真正值得缓存的是 .cache（详情/回复/OCR 结果，压缩后 ~0.3MB），
+          # 图片每轮重新下载即可（并行、每片几百张，远小于缓存打爆的代价）。
+          before=$(du -sm work/out 2>/dev/null | cut -f1 || echo 0)
+          find work/out -type f \( -name '*.png' -o -name '*.jpg' -o -name '*.jpeg' -o -name '*.webp' \) -delete 2>/dev/null || true
+          after=$(du -sm work/out 2>/dev/null | cut -f1 || echo 0)
+          echo "分片缓存瘦身：${before}MB -> ${after}MB（图片不进缓存，.cache 保留）"
       - name: 打包本片缓存
         if: always()
         working-directory: repo
