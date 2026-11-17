@@ -504,13 +504,43 @@ def do_plan(args) -> int:
         caliber = "short" if period < 1_000_000 else "full"
         evidence = {"override": True, "requested": period_override, "note": "用户指定期号，跳过四重校验"}
     else:
-        info = _period.detect_period(
-            source, last_period=last_period, learned_offset=learned_offset, log=log
-        )
+        # 阶段1 接线（2026-11-18）：期号判定改用「第 1 页唯一性 + 台账锁定」，
+        # 替代原来的 detect_period。台账 = state/current_period_<源>.json（随数据仓提交）。
+        ledger_path = _resolve_state_dir(args, work) / f"current_period_{source}.json"
+        # 档位锁定（PERIOD_LOCK_POLICY）：20:50 那轮强制用台账期号，不换期
+        slot = str(getattr(args, "slot", "") or "")
+        policy = _period.PERIOD_LOCK_POLICY.get(slot, "allow_switch")
+        lock_ledger = (policy == "keep_ledger")
+        if slot:
+            log(f"[plan] 档位={slot} 策略={policy}" + ("（本轮锁定台账期号）" if lock_ledger else ""))
+        info = _period.detect_period_safe(source, ledger_path, log=log, lock_ledger=lock_ledger)
         period = int(info["period"])
         display = int(info["display"])
         evidence = info["evidence"]
         caliber = info.get("caliber", "short")
+        log(
+            f"[plan] 期号判定：{evidence.get('reason', '?')}"
+            f"（第1页 {evidence.get('firstPage')} / 台账 {evidence.get('ledger')}）"
+        )
+        # 台账写回（只在自动判定时写；用户指定期号不污染台账）
+        try:
+            _guard.save_json(
+                ledger_path,
+                {
+                    "period": period,
+                    "displayPeriod": display,
+                    "caliber": caliber,
+                    "source": source,
+                    "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "evidence": {
+                        "firstPagePeriods": evidence.get("firstPage"),
+                        "reason": evidence.get("reason"),
+                    },
+                },
+            )
+            log(f"[plan] 台账已写：{ledger_path.name}（period={period} / 展示 {display} 期）")
+        except Exception as exc:  # noqa: BLE001 - 台账写失败不该阻断本轮，但必须明说
+            log(f"[plan] ⚠ 台账写入失败（不影响本轮）：{type(exc).__name__}: {exc}")
 
     scan = {}
     if source == "dahkg":
@@ -2417,6 +2447,10 @@ def parse_args(argv=None):
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--delay", type=float, default=0.05)
     parser.add_argument("--max-pages", type=int, default=200)
+    parser.add_argument(
+        "--slot", default="",
+        help="档位（12:00/15:00/18:00/20:15/20:50），用于 PERIOD_LOCK_POLICY；空=不锁",
+    )
     parser.add_argument(
         "--period", type=int, default=0,
         help="指定期号（0=自动探测）。用于补跑/压测历史期；"

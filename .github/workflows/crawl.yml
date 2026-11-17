@@ -60,6 +60,11 @@ on:
         required: false
         default: "0"
         type: string
+      slot:
+        description: "档位（12:00/15:00/18:00/20:15/20:50）。20:50 会锁定台账期号不换期；空=不锁"
+        required: false
+        default: ""
+        type: string
 
   # ⚠️ 生产定时任务：Gate 1–5 + 最终日志审计全部通过后再解注释
   # 每天五轮（北京时间）= UTC 时区；按 317 期真实发布节奏定的档位：
@@ -193,7 +198,7 @@ jobs:
         run: |
           set -o pipefail
           python -m cloud.runner --plan --source "${{ matrix.source }}" \
-            --work work --state work/store/state --period "${{ github.event.inputs.period || '0' }}" 2>&1 | tee "work/plan_${{ matrix.source }}.log"
+            --work work --state work/store/state --period "${{ github.event.inputs.period || '0' }}" --slot "${{ github.event.inputs.slot || '' }}" 2>&1 | tee "work/plan_${{ matrix.source }}.log"
       - name: 上传 plan
         uses: actions/upload-artifact@v4
         with:

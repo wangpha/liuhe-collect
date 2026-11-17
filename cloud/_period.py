@@ -345,6 +345,7 @@ def detect_period_safe(
     ledger_path,
     log: Callable[[str], None] | None = None,
     first_page_rows: list[dict] | None = None,
+    lock_ledger: bool = False,
 ) -> dict:
     """安全期号判定：第 1 页唯一性 + 台账锁定（8 种情况，见 v5 任务书阶段 1）。
 
@@ -367,6 +368,14 @@ def detect_period_safe(
 
     rows = first_page_rows if first_page_rows is not None else _fetch_first_page(source)
     periods = {int(r["periods"]) for r in (rows or []) if int(r.get("periods") or 0) > 0}
+
+    # 台账锁定（20:50 那轮）：不换期，直接用台账期号 —— 避免当晚数据被拆成两期
+    if lock_ledger and ledger_period:
+        say(f"[期号/{source}] 锁定档位：强制使用台账期号 {ledger_period}（第1页 {sorted(periods)} 忽略）")
+        return {"period": int(ledger_period), "display": _display(ledger_period),
+                "caliber": _caliber(ledger_period),
+                "evidence": {"reason": "锁定档位，强制用台账期号", "firstPage": sorted(periods),
+                             "ledger": ledger_period, "source": source, "code": "locked_ledger"}}
 
     def _result(period: int, reason: str, **extra) -> dict:
         ev = {"reason": reason, "firstPage": sorted(periods), "ledger": ledger_period,
