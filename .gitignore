@@ -1,8 +1,12 @@
+# Python 缓存目录（注意：core/ 下的 .pyc 是**交付物**，不能忽略）
 __pycache__/
-*.pyc
-!*.pyc
-recovered/
-_sync_cache/
-*.log
-!work/**/*.log
+cloud/__pycache__/
+work/shards/__pycache__/
 
+# sync 的临时缓存
+_sync_cache/
+
+# 本地产物/临时目录
+work/
+*.log
+!docs/**/*.log
