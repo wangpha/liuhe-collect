@@ -386,7 +386,10 @@ def detect_period_safe(
                 "caliber": _caliber(period), "evidence": ev}
 
     if len(periods) == 1:                                  # 情况 1/2/3/4
-        p = periods.pop()
+        # 用 next(iter(...)) 而**不是** pop()：pop 会把唯一元素从集合里删掉，
+        # 导致 _result 里的 firstPage=sorted(periods) 变成 []（日志显示「第1页 []」，
+        # 实际抓到了数据），abort 消息也会丢掉原始集合。2026-11-18 用户审查发现。
+        p = next(iter(periods))
         if not ledger_period:
             return _result(p, "首轮建立基线", code="single_no_ledger")
         if p == ledger_period:
