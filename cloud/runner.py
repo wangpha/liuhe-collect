@@ -1094,21 +1094,32 @@ def _collect_unfinished(work: Path, source: str, log) -> list[int]:
     return sorted(ids)
 
 
-#: 每帖必须包含的字段（用户第三节「第 2 道：分片输出字段完整」；用实际产物字段名）
-REQUIRED_POST_FIELDS = (
-    "articleId", "title", "text", "createTime", "userId", "username",
-    "images", "commentsAll", "nicePoint", "period",
+#: 每帖必须包含的字段（用户第三节「第 2 道：分片输出字段完整」）。
+#: ⚠️ 三源字段名不同（2026-11-17 实测）：
+#:   dahkg 用 `nicePoint` / `browsePoint`；tuku 用 `likes` / `views`。
+#:   第一次实现只按 dahkg 取名 → tuku 1284 帖全被判"缺 nicePoint"而硬失败。
+#:   改成**别名组**：每组只要有任意一个存在即算通过。
+REQUIRED_FIELD_ALIASES: tuple[tuple[str, ...], ...] = (
+    ("articleId",),
+    ("title",),
+    ("text", "content"),
+    ("createTime",),
+    ("userId",),
+    ("username", "nickname"),
+    ("images",),
+    ("commentsAll", "replies", "comments"),
+    ("nicePoint", "likes"),
+    ("period",),
+    ("browsePoint", "views"),
 )
 
 
 def _check_post_fields(posts: list[dict]) -> dict:
-    """第 2 道：每帖字段完整性（缺任何字段 → 硬失败）。"""
+    """第 2 道：每帖字段完整性（缺任何一组 → 硬失败）。"""
     bad: list[dict] = []
     for p in posts:
-        miss = [f for f in REQUIRED_POST_FIELDS if f not in p]
-        # browsePoint 在 dahkg 里叫 views，两者有其一即可
-        if "browsePoint" not in p and "views" not in p:
-            miss.append("browsePoint|views")
+        miss = [grp[0] if len(grp) == 1 else "|".join(grp) for grp in REQUIRED_FIELD_ALIASES
+                if not any(f in p for f in grp)]
         if miss:
             bad.append({"articleId": p.get("articleId"), "missing": miss})
     return {"checked": len(posts), "bad": bad[:20], "badCount": len(bad), "passed": not bad}
