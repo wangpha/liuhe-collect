@@ -260,6 +260,95 @@ def _load_image_cost(state_dir: Path, source: str) -> dict:
     return cost if isinstance(cost, dict) else {}
 
 
+def _sha256_text(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _post_content_hashes(detail: dict, replies: list[dict]) -> dict:
+    """算一帖的**内容指纹**（2026-11-17 用户需求：识别"12点发的、20点被改"）。
+
+    ## 为什么必须抓完整详情才算得准
+    列表接口只给 `content` 的**前 100 字符摘要**，且**没有 updateTime**（改内容它不变）。
+    实测 321 期：帖 1535722 列表 content 长 100、详情 content 长 283 ——
+    改动发生在第 101 字符之后时，只比对列表快照完全检测不到。
+    而 prepare 的 `_prefetch_post_costs` **本来就抓了完整详情和全部回复**，
+    所以这四个 hash 是**零额外请求**。
+
+    返回：titleHash / contentHash / imagesHash / repliesHash + 便于人看的长度与计数。
+    """
+    title = str((detail or {}).get("title") or "")
+    content = str((detail or {}).get("content") or "")
+    img_raw = str((detail or {}).get("img") or "")
+    urls = [u.strip() for u in img_raw.split(",") if u.strip()]
+    # 正文图：用户要求「URL 列表保持原顺序」，所以不排序（排序会让"换图但集合相同"漏判）
+    images_hash = _sha256_text("\n".join(urls))
+
+    # 回复：按 (createTime, commentId) 稳定排序后拼 content+senderId+createTime
+    # + 每条回复的楼中楼（subList / secondLevelComments）内容
+    def _reply_key(r: dict):
+        return (str(r.get("createTime") or ""), str(r.get("commentId") or r.get("singaporeReplyId") or ""))
+
+    parts: list[str] = []
+    for r in sorted(replies or [], key=_reply_key):
+        parts.append(
+            "|".join(
+                [
+                    str(r.get("content") or ""),
+                    str(r.get("senderId") or (r.get("user") or {}).get("id") or ""),
+                    str(r.get("createTime") or ""),
+                ]
+            )
+        )
+        for sub in (r.get("subList") or r.get("secondLevelComments") or []):
+            parts.append(
+                "  sub:" + "|".join(
+                    [
+                        str(sub.get("content") or ""),
+                        str(sub.get("senderId") or ""),
+                        str(sub.get("createTime") or ""),
+                    ]
+                )
+            )
+    replies_text = "\n".join(parts)
+
+    return {
+        "titleHash": _sha256_text(title),
+        "contentHash": _sha256_text(content),
+        "imagesHash": images_hash,
+        "repliesHash": _sha256_text(replies_text),
+        "contentLen": len(content),
+        "replyPoint": int((detail or {}).get("replyPoint") or 0),
+        "imgTotal": int((detail or {}).get("imgTotal") or 0),
+        "replyFetched": len(replies or []),
+    }
+
+
+def _diff_content_hashes(prev: dict, cur: dict) -> dict:
+    """比对上一轮快照与本轮 hash，返回变化明细（用户第四节表格要求）。"""
+    prev = prev or {}
+    cur = cur or {}
+    kinds: list[str] = []
+    if prev.get("titleHash") != cur.get("titleHash"):
+        kinds.append("title")
+    if prev.get("contentHash") != cur.get("contentHash"):
+        kinds.append("content")
+    if prev.get("imagesHash") != cur.get("imagesHash"):
+        kinds.append("images")
+    if prev.get("repliesHash") != cur.get("repliesHash"):
+        kinds.append("replies")
+    return {
+        "changed": kinds,
+        "oldContentLen": prev.get("contentLen"),
+        "newContentLen": cur.get("contentLen"),
+        "oldReplyPoint": prev.get("replyPoint"),
+        "newReplyPoint": cur.get("replyPoint"),
+        "oldReplyFetched": prev.get("replyFetched"),
+        "newReplyFetched": cur.get("replyFetched"),
+    }
+
+
 def _prefetch_post_costs(
     source: str,
     ids: list[int],
@@ -309,25 +398,39 @@ def _prefetch_post_costs(
                     "detArea": sum(_det_input_area(u) for u in urls),
                     "bodyCount": body_count,
                     "replyCount": len(urls) - body_count,
+                    # 【内容指纹】零额外请求：详情和回复都已经抓在手里了（用户第四节）
+                    **_post_content_hashes(detail, reps),
                 }
             if source == "aocai":
                 from core import forum as forum_mod
 
                 detail = forum_mod.fetch_thread_detail(aid, 0, include_replies=True, delay=0.0, max_pages=50)
                 tiezi = (detail or {}).get("tiezi") or {}
+                reps = (detail or {}).get("replies") or []
                 urls += [u.strip() for u in str(tiezi.get("img") or "").split(",") if u.strip()]
                 body_count = len(urls)
-                for rep in (detail or {}).get("replies") or []:
+                for rep in reps:
                     urls += [u.strip() for u in str(rep.get("img") or "").split(",") if u.strip()]
-                return aid, {"count": len(urls), "detArea": 0,
-                             "bodyCount": body_count, "replyCount": len(urls) - body_count}
+                return aid, {
+                    "count": len(urls),
+                    "detArea": 0,
+                    "bodyCount": body_count,
+                    "replyCount": len(urls) - body_count,
+                    **_post_content_hashes(tiezi, reps),
+                }
             if source == "tuku":
                 from core import scraper
 
                 raw = scraper.api_get("/unite49/h5/article/detail", {"articleId": aid}, delay=0)
                 pics = (raw or {}).get("pictureList") or []
                 urls += [str((pic or {}).get("url") or "") for pic in pics if (pic or {}).get("url")]
-                return aid, {"count": len(urls), "detArea": 0, "bodyCount": len(urls), "replyCount": 0}
+                return aid, {
+                    "count": len(urls),
+                    "detArea": 0,
+                    "bodyCount": len(urls),
+                    "replyCount": 0,
+                    **_post_content_hashes(raw or {}, []),
+                }
         except Exception:  # noqa: BLE001 - 预抓失败不算致命，后面有兜底
             return aid, None
         return aid, None
@@ -432,6 +535,58 @@ def do_plan(args) -> int:
                 str(aid): {"count": int(v.get("count") or 0), "detArea": int(v.get("detArea") or 0)}
                 for aid, v in prefetched.items()
             }
+            # ---- 内容变更识别（用户第四节）：与上一轮快照比对 ----
+            hash_fields = ("titleHash", "contentHash", "imagesHash", "repliesHash",
+                           "contentLen", "replyPoint", "imgTotal", "replyFetched")
+            plan["postHashes"] = {
+                str(aid): {k: v.get(k) for k in hash_fields}
+                for aid, v in prefetched.items()
+            }
+            prev = _guard.load_json(state_dir / f"hashsnapshot_{source}.json", {})
+            prev_map = (prev or {}).get("hashes") or {}
+            prev_period = int((prev or {}).get("period") or 0)
+            changed: list[dict] = []
+            new_posts = 0
+            if prev_map and prev_period in (0, period, display):
+                for aid, cur in plan["postHashes"].items():
+                    old = prev_map.get(str(aid))
+                    if not old:
+                        new_posts += 1
+                        continue
+                    diff = _diff_content_hashes(old, cur)
+                    if diff["changed"]:
+                        changed.append({"articleId": int(aid), **diff})
+            plan["contentChanged"] = changed
+            plan["contentChangedCount"] = len(changed)
+            _guard.save_json(
+                work / "audit" / f"content_changed_{source}.json",
+                {
+                    "source": source,
+                    "period": period,
+                    "detectedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "count": len(changed),
+                    "newPosts": new_posts,
+                    "comparedAgainst": f"hashsnapshot_{source}.json@period={prev_period}",
+                    "changes": changed,
+                },
+            )
+            if changed:
+                kinds = {}
+                for c in changed:
+                    for k in c["changed"]:
+                        kinds[k] = kinds.get(k, 0) + 1
+                log(
+                    f"[plan] 内容变更识别：{len(changed)} 帖发生变化（新帖 {new_posts}）"
+                    f"；按类型 {kinds}；明细见 work/audit/content_changed_{source}.json"
+                )
+                for c in changed[:5]:
+                    log(
+                        f"[plan]   帖 {c['articleId']} 变化={c['changed']} "
+                        f"正文长度 {c['oldContentLen']}→{c['newContentLen']} "
+                        f"回复 {c['oldReplyPoint']}→{c['newReplyPoint']}"
+                    )
+            else:
+                log(f"[plan] 内容变更识别：本轮无内容变化（比对 {len(prev_map)} 帖快照，新帖 {new_posts}）")
 
     hist_cost = _load_image_cost(state_dir, source)
     hist_period = int((hist_cost.get("_period") or 0)) if isinstance(hist_cost, dict) else 0
@@ -462,6 +617,20 @@ def do_plan(args) -> int:
             mode = "det-area-estimated"
             weight_src = "det 输入像素面积 + 回复图估计（无预抓、无历史）"
         groups = _balanced_groups(union_ids, weights, shard_n)
+        # ---- 第 1 道：分片分配不重不漏（用户第三节；不满足直接失败，不启动 shard）----
+        flat = [a for g in groups for a in g]
+        dup = len(flat) - len(set(flat))
+        missing_ids = sorted(set(union_ids) - set(flat))
+        extra_ids = sorted(set(flat) - set(union_ids))
+        if dup or missing_ids or extra_ids:
+            raise SystemExit(
+                f"[plan] ❌ 第1道校验失败：分片分配不重不漏被破坏 —— "
+                f"重复 {dup} 个，遗漏 {len(missing_ids)} 个（前5 {missing_ids[:5]}），"
+                f"多出 {len(extra_ids)} 个（前5 {extra_ids[:5]}）"
+            )
+        log(
+            f"[plan] ✅ 第1道校验通过：{shard_n} 片并集 {len(set(flat))} 帖 = 清单 {len(set(union_ids))} 帖，无重复无遗漏"
+        )
         sizes = [len(g) for g in groups]
         imgs = [sum(max(1, weights.get(a, 0)) for a in g) for g in groups]
         plan["shardPlan"] = {
@@ -925,6 +1094,95 @@ def _collect_unfinished(work: Path, source: str, log) -> list[int]:
     return sorted(ids)
 
 
+#: 每帖必须包含的字段（用户第三节「第 2 道：分片输出字段完整」；用实际产物字段名）
+REQUIRED_POST_FIELDS = (
+    "articleId", "title", "text", "createTime", "userId", "username",
+    "images", "commentsAll", "nicePoint", "period",
+)
+
+
+def _check_post_fields(posts: list[dict]) -> dict:
+    """第 2 道：每帖字段完整性（缺任何字段 → 硬失败）。"""
+    bad: list[dict] = []
+    for p in posts:
+        miss = [f for f in REQUIRED_POST_FIELDS if f not in p]
+        # browsePoint 在 dahkg 里叫 views，两者有其一即可
+        if "browsePoint" not in p and "views" not in p:
+            miss.append("browsePoint|views")
+        if miss:
+            bad.append({"articleId": p.get("articleId"), "missing": miss})
+    return {"checked": len(posts), "bad": bad[:20], "badCount": len(bad), "passed": not bad}
+
+
+def _check_images_fields(posts: list[dict]) -> dict:
+    """第 2 道（图片部分）：每张图必须有 url/localPath/downloadStatus/ocr 相关字段。"""
+    bad: list[dict] = []
+    total = 0
+    for p in posts:
+        for img in p.get("images") or []:
+            total += 1
+            if not isinstance(img, dict):
+                bad.append({"articleId": p.get("articleId"), "why": "image 不是 dict"})
+                continue
+            miss = [f for f in ("url", "localPath", "downloadStatus") if f not in img]
+            if miss:
+                bad.append({"articleId": p.get("articleId"), "missing": miss, "url": str(img.get("url"))[:80]})
+    return {"imagesChecked": total, "bad": bad[:20], "badCount": len(bad), "passed": not bad}
+
+
+def _check_reply_counts(posts: list[dict], declared_map: dict) -> dict:
+    """补 1：回复数对账（声明 vs 实抓，允许 5% 缺口，超了明示）。
+
+    declared 来自列表接口的 `replyPoint`（plan 的 postHashes 里带着）；
+    fetched 用 `commentsAll`（过滤前的全量）。
+    """
+    shortfall: list[dict] = []
+    compared = 0
+    for p in posts:
+        aid = int(p.get("articleId") or 0)
+        declared = int((declared_map.get(str(aid)) or {}).get("replyPoint") or 0)
+        if declared <= 0:
+            continue
+        fetched = len(p.get("commentsAll") or p.get("replies") or [])
+        compared += 1
+        if fetched < declared * 0.95:
+            shortfall.append({
+                "articleId": aid, "declared": declared, "fetched": fetched,
+                "ratio": round(fetched / declared, 3),
+            })
+    return {
+        "compared": compared,
+        "shortfallCount": len(shortfall),
+        "shortfall": shortfall[:20],
+        "passed": True,  # 用户口径：允许 5% 缺口，只要求"明示"
+    }
+
+
+def _check_second_level(posts: list[dict]) -> dict:
+    """补 2：楼中楼对账（secondLevelCount vs 实际 secondLevelComments，允许 5% 缺口）。"""
+    checked = 0
+    shortfall: list[dict] = []
+    for p in posts:
+        for r in p.get("commentsAll") or p.get("replies") or []:
+            declared = int((r or {}).get("secondLevelCount") or 0)
+            if declared <= 0:
+                continue
+            fetched = len((r or {}).get("secondLevelComments") or [])
+            checked += 1
+            if fetched < declared * 0.95:
+                shortfall.append({
+                    "articleId": p.get("articleId"),
+                    "commentId": (r or {}).get("commentId"),
+                    "declared": declared, "fetched": fetched,
+                })
+    return {
+        "commentsChecked": checked,
+        "shortfallCount": len(shortfall),
+        "shortfall": shortfall[:20],
+        "passed": True,  # 同上：允许 5%，只要求明示
+    }
+
+
 def do_shard(args) -> int:
     """分片任务：**只负责把它那一份帖子的缓存（详情/回复/图片/OCR）暖起来**。
 
@@ -1202,6 +1460,52 @@ def do_run(args, mode: str = "run") -> int:
         if product_check.get("guiOnlyPresent"):
             log(f"[产物] 另有 GUI 侧产物存在：{product_check['guiOnlyPresent']}（云端不判定）")
 
+    # ---- 第 2 道 + 回复对账 + 楼中楼对账（用户第三节：每轮自动跑）----
+    plan_data = _guard.load_json(work / "plan" / f"plan_{source}.json", {})
+    declared_map = plan_data.get("postHashes") or {}
+    field_check = _check_post_fields(posts)
+    image_field_check = _check_images_fields(posts)
+    reply_check = _check_reply_counts(posts, declared_map)
+    sub_check = _check_second_level(posts)
+    log(
+        f"[完整性] 第2道 字段：{field_check['checked']} 帖 → "
+        f"{'✅ 全含必需字段' if field_check['passed'] else f'❌ {field_check["badCount"]} 帖缺字段 {field_check["bad"][:3]}'}"
+    )
+    log(
+        f"[完整性] 第2道 图片字段：{image_field_check['imagesChecked']} 张 → "
+        f"{'✅' if image_field_check['passed'] else f'❌ {image_field_check["badCount"]} 张缺字段 {image_field_check["bad"][:3]}'}"
+    )
+    log(
+        f"[完整性] 回复数对账：比对 {reply_check['compared']} 帖，"
+        f"声明缺口(<95%) {reply_check['shortfallCount']} 帖"
+        + (f" 样本 {reply_check['shortfall'][:3]}" if reply_check["shortfallCount"] else "  ✅")
+    )
+    log(
+        f"[完整性] 楼中楼对账：比对 {sub_check['commentsChecked']} 条二级回复，"
+        f"缺口(<95%) {sub_check['shortfallCount']} 条"
+        + (f" 样本 {sub_check['shortfall'][:3]}" if sub_check["shortfallCount"] else "  ✅")
+    )
+    integrity = {
+        "postFields": field_check,
+        "imageFields": image_field_check,
+        "replyCounts": reply_check,
+        "secondLevel": sub_check,
+    }
+    if not field_check["passed"]:
+        log("[完整性] ❌ 第2道字段完整性不通过 → 硬失败（不生成残缺产物）")
+        _guard.save_json(
+            work / "audit" / f"FAIL_{source}_{time.strftime('%Y%m%d_%H%M%S')}.json",
+            {"reason": "postFieldIncomplete", "detail": field_check},
+        )
+        return 31
+    if not image_field_check["passed"]:
+        log("[完整性] ❌ 图片字段完整性不通过 → 硬失败")
+        _guard.save_json(
+            work / "audit" / f"FAIL_{source}_{time.strftime('%Y%m%d_%H%M%S')}.json",
+            {"reason": "imageFieldIncomplete", "detail": image_field_check},
+        )
+        return 32
+
     # ---- 防线 1 / 2：独立对账（三源都做）----
     scan = {}
     post_check = {"passed": None}
@@ -1409,6 +1713,26 @@ def do_run(args, mode: str = "run") -> int:
             },
         }
         _guard.save_json(state_file.parent / f"imagecost_{source}.json", image_cost)
+        # ---- 内容指纹快照：只在**本轮全部通过**时写（用户第四节），供下一轮 plan 比对 ----
+        try:
+            plan_path = _work_dir(args.work) / "plan" / f"plan_{source}.json"
+            plan_data = _guard.load_json(plan_path, {})
+            hashes = plan_data.get("postHashes") or {}
+            if hashes:
+                _guard.save_json(
+                    state_file.parent / f"hashsnapshot_{source}.json",
+                    {
+                        "period": period,
+                        "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "_note": "每帖 title/content/images/replies 四个 hash；供下一轮内容变更识别",
+                        "hashes": hashes,
+                    },
+                )
+                log(f"[{mode}] 已落盘内容指纹快照 hashsnapshot_{source}.json：{len(hashes)} 帖")
+            else:
+                log(f"[{mode}] ⚠ plan 里没有 postHashes（可能预抓失败），本轮不更新内容指纹快照")
+        except Exception as exc:  # noqa: BLE001 - 快照失败不该让整轮失败
+            log(f"[{mode}] ⚠ 写内容指纹快照失败（不影响本轮产物）：{type(exc).__name__}: {exc}")
         log(
             f"[{mode}] 已落盘分片成本基线 imagecost_{source}.json：{len(image_cost['cost'])} 帖，"
             f"合计 {sum(v['count'] for v in image_cost['cost'].values())} 图 / "
@@ -1673,6 +1997,7 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 

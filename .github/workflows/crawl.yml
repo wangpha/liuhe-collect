@@ -513,6 +513,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r cloud/requirements.txt
+      - name: 下载本源 plan（含内容指纹 + 分片分配）
+        uses: actions/download-artifact@v4
+        with:
+          name: plans-dahkg-${{ github.run_id }}
+          path: repo/work/plan-dl
+      - name: 归位 plan（merge 用 postHashes 做内容指纹快照与回复数对账）
+        working-directory: repo
+        run: |
+          mkdir -p work/plan
+          find work/plan-dl -name 'plan_*.json' -exec cp -v {} work/plan/ \;
+          ls -la work/plan
       - name: 下载各分片缓存
         uses: actions/download-artifact@v4
         with:
@@ -639,6 +650,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r cloud/requirements.txt
+      - name: 下载本源 plan（含内容指纹 + 分片分配）
+        uses: actions/download-artifact@v4
+        with:
+          name: plans-aocai-${{ github.run_id }}
+          path: repo/work/plan-dl
+      - name: 归位 plan（merge 用 postHashes 做内容指纹快照与回复数对账）
+        working-directory: repo
+        run: |
+          mkdir -p work/plan
+          find work/plan-dl -name 'plan_*.json' -exec cp -v {} work/plan/ \;
+          ls -la work/plan
       - name: 下载各分片缓存
         uses: actions/download-artifact@v4
         with:
@@ -765,6 +787,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r cloud/requirements.txt
+      - name: 下载本源 plan（含内容指纹 + 分片分配）
+        uses: actions/download-artifact@v4
+        with:
+          name: plans-tuku-${{ github.run_id }}
+          path: repo/work/plan-dl
+      - name: 归位 plan（merge 用 postHashes 做内容指纹快照与回复数对账）
+        working-directory: repo
+        run: |
+          mkdir -p work/plan
+          find work/plan-dl -name 'plan_*.json' -exec cp -v {} work/plan/ \;
+          ls -la work/plan
       - name: 下载各分片缓存
         uses: actions/download-artifact@v4
         with:
