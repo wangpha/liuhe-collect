@@ -68,7 +68,7 @@ env:
   PYTHONIOENCODING: "utf-8"
   # 每源分片数（唯一事实源）：plan 用它算「按累计图片数」的均衡分组，
   # shard job 的 matrix 用它取下标 —— 两处必须同源，否则分组与下标对不上。
-  SHARD_MAP: "dahkg:14,aocai:3,tuku:2"
+  SHARD_MAP: "dahkg:16,aocai:2,tuku:1"
 
 jobs:
   # ---------------- JobP：决定跑哪些源 + 每源分片数 ----------------
@@ -96,9 +96,9 @@ jobs:
             tuku|aocai|dahkg) echo "sources=[\"$REQ\"]" >> "$GITHUB_OUTPUT" ;;
             *) echo "未知源: $REQ" >&2; exit 2 ;;
           esac
-          python -c "import json;n=14;print('shards_dahkg='+json.dumps(list(range(n))));print('count_dahkg='+str(n))" >> "$GITHUB_OUTPUT"
-          python -c "import json;n=3;print('shards_aocai='+json.dumps(list(range(n))));print('count_aocai='+str(n))" >> "$GITHUB_OUTPUT"
-          python -c "import json;n=2;print('shards_tuku='+json.dumps(list(range(n))));print('count_tuku='+str(n))" >> "$GITHUB_OUTPUT"
+          python -c "import json;n=16;print('shards_dahkg='+json.dumps(list(range(n))));print('count_dahkg='+str(n))" >> "$GITHUB_OUTPUT"
+          python -c "import json;n=2;print('shards_aocai='+json.dumps(list(range(n))));print('count_aocai='+str(n))" >> "$GITHUB_OUTPUT"
+          python -c "import json;n=1;print('shards_tuku='+json.dumps(list(range(n))));print('count_tuku='+str(n))" >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
 
   # ---------------- Job 0：清理（图片 2 天轮转 + 产物 30 期轮转）----------------
@@ -188,13 +188,17 @@ jobs:
             repo/work/plan_${{ matrix.source }}.log
           if-no-files-found: error
 
-  # ---------------- 分片 dahkg：#=0..13 （并行预热缓存）----------------
+  # ---------------- 分片 dahkg：#=0..15 （并行预热缓存）----------------
   shard_dahkg:
     name: "分片 dahkg#${{ matrix.shard }}"
     needs: [plan, prepare]
     if: contains(needs.plan.outputs.sources, 'dahkg')
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    # 硬超时保护：实测 runner CPU 异构（AMD EPYC 0.37s/图 vs Intel 6975P 1.95s/图，
+    # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 20 分钟；
+    # runner 内部还有 16 分钟「软超时」：到点把剩余帖子写 unfinished_*.json 后正常退出，
+    # 剩余工作交给 merge 补抓（见 runner.py 的 watchdog）。
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -275,15 +279,20 @@ jobs:
           path: |
             repo/work/cacheout
             repo/work/shard_dahkg_${{ matrix.shard }}.log
+            repo/work/unfinished
           if-no-files-found: warn
 
-  # ---------------- 分片 aocai：#=0..2 （并行预热缓存）----------------
+  # ---------------- 分片 aocai：#=0..1 （并行预热缓存）----------------
   shard_aocai:
     name: "分片 aocai#${{ matrix.shard }}"
     needs: [plan, prepare]
     if: contains(needs.plan.outputs.sources, 'aocai')
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    # 硬超时保护：实测 runner CPU 异构（AMD EPYC 0.37s/图 vs Intel 6975P 1.95s/图，
+    # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 20 分钟；
+    # runner 内部还有 16 分钟「软超时」：到点把剩余帖子写 unfinished_*.json 后正常退出，
+    # 剩余工作交给 merge 补抓（见 runner.py 的 watchdog）。
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -364,15 +373,20 @@ jobs:
           path: |
             repo/work/cacheout
             repo/work/shard_aocai_${{ matrix.shard }}.log
+            repo/work/unfinished
           if-no-files-found: warn
 
-  # ---------------- 分片 tuku：#=0..1 （并行预热缓存）----------------
+  # ---------------- 分片 tuku：#=0..0 （并行预热缓存）----------------
   shard_tuku:
     name: "分片 tuku#${{ matrix.shard }}"
     needs: [plan, prepare]
     if: contains(needs.plan.outputs.sources, 'tuku')
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    # 硬超时保护：实测 runner CPU 异构（AMD EPYC 0.37s/图 vs Intel 6975P 1.95s/图，
+    # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 20 分钟；
+    # runner 内部还有 16 分钟「软超时」：到点把剩余帖子写 unfinished_*.json 后正常退出，
+    # 剩余工作交给 merge 补抓（见 runner.py 的 watchdog）。
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -453,6 +467,7 @@ jobs:
           path: |
             repo/work/cacheout
             repo/work/shard_tuku_${{ matrix.shard }}.log
+            repo/work/unfinished
           if-no-files-found: warn
 
   # ---------------- 合并 dahkg：解开各片缓存后完整跑一次 ----------------

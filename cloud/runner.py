@@ -811,6 +811,104 @@ def _ocr_micro_benchmark(out_root: Path, limit: int = 3) -> dict:
     }
 
 
+def _cpu_ocr_probe() -> float:
+    """在**本机**跑一张合成图，测出这台 runner 的 pure-OCR 秒/张（用于按预算切片）。
+
+    ## 为什么要开机就测（2026-11-17 实测结论）
+    GitHub 的 runner 池里 CPU 是异构的，实测 14 片拿到 5 种型号：
+      AMD EPYC 9V45 / 7763 / 9V74 → 纯 OCR 0.37~0.65 秒/张
+      Intel Xeon 6975P-C          → 纯 OCR 1.15~1.95 秒/张（慢 3~5 倍）
+    静态分片因此永远不均。这里改成：**开机先自测速度**，再决定这台机器能吃多少活，
+    超预算的部分写进 unfinished_*.json 交给 merge 补抓。
+    """
+    global _CPU_PROBE_CACHE
+    if _CPU_PROBE_CACHE is not None:
+        return _CPU_PROBE_CACHE
+    try:
+        import tempfile
+
+        import numpy as np
+
+        from core import ocr as ocr_mod
+
+        analyze = getattr(ocr_mod, "analyze_image", None)
+        if analyze is None:
+            _CPU_PROBE_CACHE = 0.0
+            return 0.0
+        # 合成一张 240x360 的"有内容"图：白底 + 若干黑条，避免被当成空图跳过
+        arr = np.full((360, 240, 3), 255, dtype=np.uint8)
+        for i in range(6):
+            arr[40 + i * 40: 52 + i * 40, 30: 210] = 30
+        tmp = Path(tempfile.mkdtemp(prefix="cpuprobe-")) / "probe.png"
+        import cv2
+
+        cv2.imwrite(str(tmp), arr)
+        analyze(str(tmp))          # 预热（模型加载，不计时）
+        t0 = time.perf_counter()
+        analyze(str(tmp))
+        seconds = time.perf_counter() - t0
+        _CPU_PROBE_CACHE = round(seconds, 4)
+        return _CPU_PROBE_CACHE
+    except Exception as exc:  # noqa: BLE001 - 探针失败不该影响主流程
+        log(f"[shard] ⚠ CPU 探针失败（跳过按预算切片）：{type(exc).__name__}: {exc}")
+        _CPU_PROBE_CACHE = 0.0
+        return 0.0
+
+
+_CPU_PROBE_CACHE: float | None = None
+
+
+def _pick_within_budget(ids: list[int], cost: dict, per_image_seconds: float, budget_seconds: float) -> tuple[list[int], list[int]]:
+    """按预算挑出本机要处理的帖子，其余留给 merge。
+
+    cost: {articleId: 预计图片数}（来自 plan 的 postCost）
+    估算：每帖耗时 ≈ 图片数 × 本机秒/张；另留 60s 固定开销（启动/扫描/收尾）。
+    """
+    if per_image_seconds <= 0 or budget_seconds <= 0 or not ids:
+        return list(ids), []
+    usable = max(0.0, budget_seconds - 60.0)
+    taken: list[int] = []
+    rest: list[int] = []
+    acc = 0.0
+    # 先按代价从小到大装，尽量多装（同片内顺序不影响正确性）
+    for aid in sorted(ids, key=lambda x: cost.get(x, 1)):
+        est = max(1, cost.get(aid, 1)) * per_image_seconds
+        if acc + est > usable:
+            rest.append(aid)
+            continue
+        acc += est
+        taken.append(aid)
+    return taken, rest
+
+
+def _collect_unfinished(work: Path, source: str, log) -> list[int]:
+    """收集本源的 unfinished 清单（分片因预算到点留下的未处理帖子）。
+
+    分片 job 会写 `work/unfinished/unfinished_<源>_<片>.json`，随 artifact 传到 merge；
+    merge 里 artifact 解在 `work/incoming-cache/<artifact>/unfinished/...`，
+    所以这里递归找一遍。失败/损坏一律忽略（不能让补抓本身把 merge 搞挂）。
+    """
+    ids: set[int] = set()
+    seen_files = 0
+    for path in Path(work).rglob(f"unfinished_{source}_*.json"):
+        try:
+            import json as _json
+
+            data = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            log(f"[merge] ⚠ 读取 {path.name} 失败（忽略）：{type(exc).__name__}")
+            continue
+        seen_files += 1
+        for x in data.get("ids") or []:
+            try:
+                ids.add(int(x))
+            except (TypeError, ValueError):
+                continue
+    if seen_files:
+        log(f"[merge] unfinished 文件 {seen_files} 份，合计 {len(ids)} 帖")
+    return sorted(ids)
+
+
 def do_shard(args) -> int:
     """分片任务：**只负责把它那一份帖子的缓存（详情/回复/图片/OCR）暖起来**。
 
@@ -860,6 +958,47 @@ def do_shard(args) -> int:
         f"[shard] 已给 {source} 的列表取数打切片补丁"
         f"（{'plan 均衡分组' if planned_ids is not None else f'id % {shard_total} == {shard_index}'}）"
     )
+
+    # ---- 按本机 CPU 速度决定「这一片能干多少」，超预算的交给 merge（用户 2026-11-17 方案）----
+    rest_ids: list[int] = []
+    if planned_ids:
+        post_cost = (plan.get("postCost") or {})
+        cost = {}
+        for aid in planned_ids:
+            info = post_cost.get(str(aid)) or {}
+            cost[aid] = int(info.get("count") or 1) if isinstance(info, dict) else 1
+        probe = _cpu_ocr_probe()
+        budget = float(os.environ.get("LIUHE_SHARD_SOFT_BUDGET", "900"))
+        if probe > 0:
+            taken, rest_ids = _pick_within_budget(sorted(planned_ids), cost, probe, budget)
+            total_imgs = sum(cost.values())
+            est_all = total_imgs * probe
+            log(
+                f"[shard] 本机 OCR 探针 {probe:.3f} 秒/张；本片 {len(planned_ids)} 帖 / {total_imgs} 图，"
+                f"全干预估 {est_all/60:.1f} 分；预算 {budget/60:.1f} 分"
+            )
+            if rest_ids:
+                log(
+                    f"[shard] ⏱ 预算内只能处理 {len(taken)} 帖，"
+                    f"剩余 {len(rest_ids)} 帖写入 unfinished_{source}_{shard_index}.json 交 merge 补抓"
+                )
+                _guard.save_json(
+                    work / "unfinished" / f"unfinished_{source}_{shard_index}.json",
+                    {
+                        "source": source,
+                        "shard": shard_index,
+                        "ids": rest_ids,
+                        "reason": f"本机 OCR {probe:.3f} 秒/张，超出 {budget:.0f}s 预算",
+                        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    },
+                )
+                planned_ids = set(taken)
+                # 重新打补丁（用缩小后的集合）
+                for mod, name, original in (originals or []):
+                    setattr(mod, name, original)
+                originals = _patch_shard(source, shard_index, shard_total, sink, planned_ids=planned_ids)
+            else:
+                log(f"[shard] 本片工作量在预算内，全部自己处理")
 
     argv = ["--out", str(out_root), "--period", str(period)]
     if args.workers:
@@ -973,6 +1112,24 @@ def do_run(args, mode: str = "run") -> int:
 
     # ---- 采集（现有模块，同参数入口）----
     collect_started = time.time()          # 时间对齐基准：只对账"采集前已存在"的帖子
+
+    # ---- merge 侧补抓：分片因 CPU 慢/预算到点而留下的 unfinished 清单 ----
+    if mode == "merge":
+        catch_up = _collect_unfinished(work, source, log)
+        if catch_up:
+            log(f"[merge] 发现分片遗留 {len(catch_up)} 帖（unfinished_*.json），先补抓再走完整流程")
+            t0 = time.time()
+            sink: dict = {"total": 0, "picked": 0}
+            patched = _patch_shard(source, 0, 1, sink, planned_ids=set(catch_up))
+            try:
+                rc_cu = _run_module_main(MODULE_OF[source], _collect_argv(out_root, args, period))
+                log(f"[merge] 补抓退出码={rc_cu} 耗时={time.time()-t0:.1f}s（本机 CPU 慢时这一步会久一些）")
+            finally:
+                for mod, name, orig in (patched or []):
+                    setattr(mod, name, orig)
+        else:
+            log("[merge] 没有分片遗留，直接走完整流程")
+
     if source == "dahkg":
         # dahkg 走**进程内**：这样"按赞+按时间并集"的 scan_period 补丁才生效
         # （模块的 fetch_list_page 把 sortType 写死成 3，按赞分页有竞态，实测漏过 1 帖）
