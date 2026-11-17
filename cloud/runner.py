@@ -1215,7 +1215,13 @@ def _product_post_fingerprint(post: dict) -> str:
         "replies": len(post.get("replies") or []),
     }
     blob = _json.dumps(keep, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return _sha256_text(blob)
+    full = _sha256_text(blob)
+    # 纯内容指纹：剔除「回复数/评论数」这两个随时间变化的量。
+    # 两次相隔一段时间的运行，只要帖子正文/标题/图片没变，这个 hash 就相同 ——
+    # 用它可以把「期间有人在盖楼」与「分片/合并把内容搞坏了」区分开。
+    content_only = {k: v for k, v in keep.items() if k not in ("commentsAll", "replies")}
+    cblob = _json.dumps(content_only, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return full + ":" + _sha256_text(cblob)
 
 
 def do_shard(args) -> int:
