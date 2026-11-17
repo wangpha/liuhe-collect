@@ -790,37 +790,6 @@ def _item_image_weight(item: dict) -> int:
     return max(1, body * 2 + replies)
 
 
-def _balanced_groups(ids: list[int], weights: dict[int, int], n: int) -> list[list[int]]:
-    """把帖子切成 n 组，使每组的权重之和尽量相等。
-
-    ## 为什么用「贪心最长优先（LPT）」而不是连续切分
-    连续切分（按 id 顺序、累计到比例边界就换组）遇到**单个超大项**就切不匀：
-    实测大港澳一帖的 det 面积可达 0.86 亿像素，占每片目标（≈0.52 亿）的 1.6 倍，
-    连续切分只能得到 1.56 倍不均。
-    LPT（先放大项、每次放进当前最轻的组）对重尾分布接近最优，实测同一批帖子：
-      连续切分 1.56 倍 → **LPT 1.1x 倍**。
-
-    ## 确定性
-    所有分片 job 读同一份 plan JSON，分组只在 plan 里算一次，
-    所以「同一份输入必然同一份分组」；具体是否连续不影响正确性
-    （每个分片只按 id 集合取自己那批帖子）。
-    """
-    if n <= 0:
-        return []
-    ordered = sorted(set(ids))
-    order = sorted(ordered, key=lambda a: (-max(1, int(weights.get(a, 1))), a))
-    groups: list[list[int]] = [[] for _ in range(n)]
-    load = [0] * n
-    for aid in order:
-        idx = min(range(n), key=lambda i: (load[i], i))
-        groups[idx].append(aid)
-        load[idx] += max(1, int(weights.get(aid, 1)))
-    # 组内按 id 排序，便于人看日志
-    for g in groups:
-        g.sort()
-    return groups
-
-
 def _sender_of(item: dict) -> str:
     """列表行里的作者标识（三源字段名不同，统一成字符串）。
 
@@ -921,10 +890,15 @@ def _slice_items(items, shard: int, total: int, sink: dict, planned_ids: set[int
         sink["mode"] = "by-user"
     elif planned_ids is not None:
         picked = [it for it in seq if _plan_item_id(it) in planned_ids]
-        sink["mode"] = "balanced"
+        sink["mode"] = "planned-ids"
     else:
-        picked = [it for it in seq if _plan_item_id(it) % max(1, total) == shard]
-        sink["mode"] = "modulo"
+        # 方案 3 cleanup：删掉「按 ID 取模」兜底。
+        # 取模会让每次运行的归属漂移（缓存命中率低、无法复现），
+        # 而且和 plan 的分组冲突时是**静默**错误 —— 宁可直接失败。
+        raise SystemExit(
+            "[shard] ❌ 没有分片依据：plan 里既没有按用户分组（shards）也没有分组（shardPlan.groups）。"
+            "拒绝用「按 ID 取模」兜底（会静默漂移）。请检查 plan 阶段。"
+        )
     sink["picked"] = len(picked)
     sink["imagesPicked"] = sum(_item_image_weight(it) for it in picked)
     return (picked, *meta) if meta else picked
