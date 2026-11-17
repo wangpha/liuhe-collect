@@ -68,7 +68,7 @@ env:
   PYTHONIOENCODING: "utf-8"
   # 每源分片数（唯一事实源）：plan 用它算「按累计图片数」的均衡分组，
   # shard job 的 matrix 用它取下标 —— 两处必须同源，否则分组与下标对不上。
-  SHARD_MAP: "dahkg:16,aocai:2,tuku:1"
+  SHARD_MAP: "dahkg:18,aocai:1,tuku:1"
 
 jobs:
   # ---------------- JobP：决定跑哪些源 + 每源分片数 ----------------
@@ -96,8 +96,8 @@ jobs:
             tuku|aocai|dahkg) echo "sources=[\"$REQ\"]" >> "$GITHUB_OUTPUT" ;;
             *) echo "未知源: $REQ" >&2; exit 2 ;;
           esac
-          python -c "import json;n=16;print('shards_dahkg='+json.dumps(list(range(n))));print('count_dahkg='+str(n))" >> "$GITHUB_OUTPUT"
-          python -c "import json;n=2;print('shards_aocai='+json.dumps(list(range(n))));print('count_aocai='+str(n))" >> "$GITHUB_OUTPUT"
+          python -c "import json;n=18;print('shards_dahkg='+json.dumps(list(range(n))));print('count_dahkg='+str(n))" >> "$GITHUB_OUTPUT"
+          python -c "import json;n=1;print('shards_aocai='+json.dumps(list(range(n))));print('count_aocai='+str(n))" >> "$GITHUB_OUTPUT"
           python -c "import json;n=1;print('shards_tuku='+json.dumps(list(range(n))));print('count_tuku='+str(n))" >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
 
@@ -188,7 +188,7 @@ jobs:
             repo/work/plan_${{ matrix.source }}.log
           if-no-files-found: error
 
-  # ---------------- 分片 dahkg：#=0..15 （并行预热缓存）----------------
+  # ---------------- 分片 dahkg：#=0..17 （并行预热缓存）----------------
   shard_dahkg:
     name: "分片 dahkg#${{ matrix.shard }}"
     needs: [plan, prepare]
@@ -282,7 +282,7 @@ jobs:
             repo/work/unfinished
           if-no-files-found: warn
 
-  # ---------------- 分片 aocai：#=0..1 （并行预热缓存）----------------
+  # ---------------- 分片 aocai：#=0..0 （并行预热缓存）----------------
   shard_aocai:
     name: "分片 aocai#${{ matrix.shard }}"
     needs: [plan, prepare]

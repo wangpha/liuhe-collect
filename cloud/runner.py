@@ -796,11 +796,13 @@ def _ocr_micro_benchmark(out_root: Path, limit: int = 3) -> dict:
     if not imgs:
         return {"error": "找不到可测的图片"}
     seconds: list[float] = []
+    cache_dir = Path(out_root) / ".cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
     try:
-        analyze(str(imgs[0]))          # 预热：把引擎拉起来并写入缓存
+        analyze(str(imgs[0]), 0, str(cache_dir))   # 预热：把引擎拉起来
         for img in imgs:
             t0 = time.perf_counter()
-            analyze(str(img))
+            analyze(str(img), 0, str(cache_dir))
             seconds.append(round(time.perf_counter() - t0, 3))
     except Exception as exc:  # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {exc}", "done": seconds}
@@ -843,9 +845,23 @@ def _cpu_ocr_probe() -> float:
         import cv2
 
         cv2.imwrite(str(tmp), arr)
-        analyze(str(tmp))          # 预热（模型加载，不计时）
+        # ⚠️ analyze_image 的真实签名是 (image_path, target_period, cache_dir, ...)：
+        # 2026-11-17 v8 实测漏传这两个参数 → `TypeError: missing 2 required positional arguments`
+        # → 探针静默失败、预算切片全部没生效（分片仍按原样跑）。这里用独立缓存目录，避免污染真实缓存。
+        # 合成若干张**互不相同**的图，并用 force=True 强制真实识别：
+        # 否则同一张图第二次会命中 OCR 缓存（实测返回 0.0013 秒，等于没测）
+        cache_dir = tmp.parent / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        probes: list[Path] = []
+        for idx in range(2):
+            arr2 = arr.copy()
+            arr2[20 + idx * 30: 26 + idx * 30, 10: 230] = 60   # 让两张图不同
+            p2 = tmp.parent / f"probe{idx}.png"
+            cv2.imwrite(str(p2), arr2)
+            probes.append(p2)
+        analyze(str(probes[0]), 0, str(cache_dir), force=True)   # 预热（模型加载，不计时）
         t0 = time.perf_counter()
-        analyze(str(tmp))
+        analyze(str(probes[1]), 0, str(cache_dir), force=True)
         seconds = time.perf_counter() - t0
         _CPU_PROBE_CACHE = round(seconds, 4)
         return _CPU_PROBE_CACHE
@@ -1392,7 +1408,7 @@ def do_run(args, mode: str = "run") -> int:
                 if int(p.get("articleId") or 0)
             },
         }
-        _guard.save_json(state_dir / f"imagecost_{source}.json", image_cost)
+        _guard.save_json(state_file.parent / f"imagecost_{source}.json", image_cost)
         log(
             f"[{mode}] 已落盘分片成本基线 imagecost_{source}.json：{len(image_cost['cost'])} 帖，"
             f"合计 {sum(v['count'] for v in image_cost['cost'].values())} 图 / "
@@ -1657,6 +1673,7 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 
