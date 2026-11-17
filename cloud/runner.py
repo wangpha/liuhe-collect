@@ -1224,6 +1224,52 @@ def _product_post_fingerprint(post: dict) -> str:
     return full + ":" + _sha256_text(cblob)
 
 
+def _check_low_confidence(out_dir: Path, threshold: float = 0.7) -> dict:
+    """OCR 七条第 6 条：把低置信度的 claim 单独列出（用户第三节·第 4 类）。
+
+    ⚠️ 这里**只做归档，不改产物、不丢 claim**：
+    用户要求的是"低于阈值的单独列出"，不是"低于阈值的删掉"。
+    阈值默认 0.7（实测当期 19715 条 claim 的分布：
+      <0.5 为 0；0.5–0.7 有 4627；0.7–0.9 有 2302；≥0.9 有 12786；中位 0.95）。
+    可用环境变量 LIUHE_CONF_THRESHOLD 调整。
+    """
+    import json as _json
+
+    path = Path(out_dir) / "claims.json"
+    if not path.exists():
+        return {"skipped": "claims.json 不存在"}
+    try:
+        data = _json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    items = data if isinstance(data, list) else (data.get("claims") or [])
+    low: list[dict] = []
+    total = 0
+    for it in items:
+        conf = (it or {}).get("confidence")
+        if not isinstance(conf, (int, float)):
+            continue
+        total += 1
+        if float(conf) < threshold:
+            low.append({
+                "claimId": it.get("claimId"),
+                "articleId": it.get("articleId"),
+                "confidence": round(float(conf), 3),
+                "kind": it.get("kind"),
+                "playName": it.get("playName"),
+                "count": it.get("count"),
+                "cleanText": str(it.get("cleanText") or "")[:120],
+            })
+    low.sort(key=lambda x: x["confidence"])
+    return {
+        "threshold": threshold,
+        "totalClaims": total,
+        "lowCount": len(low),
+        "ratio": round(len(low) / total, 4) if total else 0,
+        "samples": low[:50],
+    }
+
+
 def do_shard(args) -> int:
     """分片任务：**只负责把它那一份帖子的缓存（详情/回复/图片/OCR）暖起来**。
 
@@ -1551,11 +1597,22 @@ def do_run(args, mode: str = "run") -> int:
         f"缺口(<95%) {sub_check['shortfallCount']} 条"
         + (f" 样本 {sub_check['shortfall'][:3]}" if sub_check["shortfallCount"] else "  ✅")
     )
+    # ---- OCR 七条第 6 条：低置信度 claim 单独归档（只归档，不删改产物）----
+    conf_threshold = float(os.environ.get("LIUHE_CONF_THRESHOLD", "0.7"))
+    conf_check = _check_low_confidence(out_dir, threshold=conf_threshold)
+    if conf_check.get("totalClaims"):
+        _guard.save_json(work / "audit" / f"low_confidence_{source}.json", conf_check)
+        log(
+            f"[完整性] 低置信度归档：{conf_check['totalClaims']} 条 claim 中 "
+            f"<{conf_threshold:g} 的 {conf_check['lowCount']} 条（{conf_check['ratio'] * 100:.1f}%），"
+            f"已写 work/audit/low_confidence_{source}.json（只归档、不删改）"
+        )
     integrity = {
         "postFields": field_check,
         "imageFields": image_field_check,
         "replyCounts": reply_check,
         "secondLevel": sub_check,
+        "lowConfidence": conf_check,
     }
     if not field_check["passed"]:
         log("[完整性] ❌ 第2道字段完整性不通过 → 硬失败（不生成残缺产物）")
