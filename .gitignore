@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+!*.pyc
+recovered/
+_sync_cache/
+*.log
+!work/**/*.log
+
