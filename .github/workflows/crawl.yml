@@ -260,13 +260,46 @@ jobs:
           cp -v work/plan-dl/plan/*.json work/plan/ 2>/dev/null || true
           find work/plan-dl -name 'plan_*.json' -exec cp -v {} work/plan/ \;
           ls -la work/plan
-      - name: 恢复 OCR 缓存
+      - name: 读取本片期号（供缓存分层用）
+        id: period
+        working-directory: repo
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import glob, json
+          fs = glob.glob("work/plan/plan_*.json")
+          p = 0
+          if fs:
+              p = int((json.load(open(fs[0], encoding="utf-8")).get("period") or 0))
+          print("period=" + str(p))
+          PY
+      - name: 恢复元数据缓存（层1·按期隔离）
         uses: actions/cache@v4
         with:
-          path: repo/work/out
-          key: ocr-v3-${{ matrix.shard }}-dahkg-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
+          path: repo/work/meta-cache
+          key: ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-dahkg-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
-            ocr-v3-${{ matrix.shard }}-dahkg-${{ github.event.inputs.cache_buster || '0' }}-
+            ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-dahkg-${{ github.event.inputs.cache_buster || '0' }}-
+      - name: 恢复 OCR 缓存（层2·跨期共享）
+        uses: actions/cache@v4
+        with:
+          path: repo/work/ocr-cache
+          key: ocr-hash-dahkg-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
+          restore-keys: |
+            ocr-hash-dahkg-${{ github.event.inputs.cache_buster || '0' }}-
+      - name: 把两层缓存铺回各 .cache 目录
+        working-directory: repo
+        run: |
+          PERIOD="${{ steps.period.outputs.period }}"
+          mkdir -p "work/meta-cache/$PERIOD" work/ocr-cache/ocr
+          n=0
+          for d in $(find work/out -type d -name .cache 2>/dev/null); do
+            [ -d "$d" ] || continue
+            cp -n "work/meta-cache/$PERIOD/"*.json "$d/" 2>/dev/null || true
+            mkdir -p "$d/ocr"
+            cp -n work/ocr-cache/ocr/*.json "$d/ocr/" 2>/dev/null || true
+            n=$((n+1))
+          done
+          echo "铺回 $n 个 .cache（meta 期号=$PERIOD / OCR 跨期）"
       - name: 分片预热（只处理本片：详情+回复+图片+OCR）
         id: shard
         working-directory: repo
@@ -282,6 +315,18 @@ jobs:
             --shards "${{ needs.plan.outputs.count_dahkg }}" \
             --source "dahkg" --work work --out work/out --workers 8 \
             $EXTRA 2>&1 | tee "work/shard_dahkg_${{ matrix.shard }}.log"
+      - name: 收集两层缓存（meta 按期 / OCR 跨期）
+        if: always()
+        working-directory: repo
+        run: |
+          PERIOD="${{ steps.period.outputs.period }}"
+          mkdir -p "work/meta-cache/$PERIOD" work/ocr-cache/ocr
+          for d in $(find work/out -type d -name .cache 2>/dev/null); do
+            [ -d "$d" ] || continue
+            cp -f "$d"/*.json "work/meta-cache/$PERIOD/" 2>/dev/null || true
+            cp -f "$d"/ocr/*.json work/ocr-cache/ocr/ 2>/dev/null || true
+          done
+          echo "meta($PERIOD): $(ls work/meta-cache/$PERIOD 2>/dev/null | wc -l) 个；ocr: $(ls work/ocr-cache/ocr 2>/dev/null | wc -l) 个"
       - name: 缓存体积检查（超 500MB 才瘦身）
         if: always()
         working-directory: repo
@@ -377,13 +422,46 @@ jobs:
           cp -v work/plan-dl/plan/*.json work/plan/ 2>/dev/null || true
           find work/plan-dl -name 'plan_*.json' -exec cp -v {} work/plan/ \;
           ls -la work/plan
-      - name: 恢复 OCR 缓存
+      - name: 读取本片期号（供缓存分层用）
+        id: period
+        working-directory: repo
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import glob, json
+          fs = glob.glob("work/plan/plan_*.json")
+          p = 0
+          if fs:
+              p = int((json.load(open(fs[0], encoding="utf-8")).get("period") or 0))
+          print("period=" + str(p))
+          PY
+      - name: 恢复元数据缓存（层1·按期隔离）
         uses: actions/cache@v4
         with:
-          path: repo/work/out
-          key: ocr-v3-${{ matrix.shard }}-aocai-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
+          path: repo/work/meta-cache
+          key: ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-aocai-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
-            ocr-v3-${{ matrix.shard }}-aocai-${{ github.event.inputs.cache_buster || '0' }}-
+            ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-aocai-${{ github.event.inputs.cache_buster || '0' }}-
+      - name: 恢复 OCR 缓存（层2·跨期共享）
+        uses: actions/cache@v4
+        with:
+          path: repo/work/ocr-cache
+          key: ocr-hash-aocai-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
+          restore-keys: |
+            ocr-hash-aocai-${{ github.event.inputs.cache_buster || '0' }}-
+      - name: 把两层缓存铺回各 .cache 目录
+        working-directory: repo
+        run: |
+          PERIOD="${{ steps.period.outputs.period }}"
+          mkdir -p "work/meta-cache/$PERIOD" work/ocr-cache/ocr
+          n=0
+          for d in $(find work/out -type d -name .cache 2>/dev/null); do
+            [ -d "$d" ] || continue
+            cp -n "work/meta-cache/$PERIOD/"*.json "$d/" 2>/dev/null || true
+            mkdir -p "$d/ocr"
+            cp -n work/ocr-cache/ocr/*.json "$d/ocr/" 2>/dev/null || true
+            n=$((n+1))
+          done
+          echo "铺回 $n 个 .cache（meta 期号=$PERIOD / OCR 跨期）"
       - name: 分片预热（只处理本片：详情+回复+图片+OCR）
         id: shard
         working-directory: repo
@@ -399,6 +477,18 @@ jobs:
             --shards "${{ needs.plan.outputs.count_aocai }}" \
             --source "aocai" --work work --out work/out --workers 8 \
             $EXTRA 2>&1 | tee "work/shard_aocai_${{ matrix.shard }}.log"
+      - name: 收集两层缓存（meta 按期 / OCR 跨期）
+        if: always()
+        working-directory: repo
+        run: |
+          PERIOD="${{ steps.period.outputs.period }}"
+          mkdir -p "work/meta-cache/$PERIOD" work/ocr-cache/ocr
+          for d in $(find work/out -type d -name .cache 2>/dev/null); do
+            [ -d "$d" ] || continue
+            cp -f "$d"/*.json "work/meta-cache/$PERIOD/" 2>/dev/null || true
+            cp -f "$d"/ocr/*.json work/ocr-cache/ocr/ 2>/dev/null || true
+          done
+          echo "meta($PERIOD): $(ls work/meta-cache/$PERIOD 2>/dev/null | wc -l) 个；ocr: $(ls work/ocr-cache/ocr 2>/dev/null | wc -l) 个"
       - name: 缓存体积检查（超 500MB 才瘦身）
         if: always()
         working-directory: repo
@@ -494,13 +584,46 @@ jobs:
           cp -v work/plan-dl/plan/*.json work/plan/ 2>/dev/null || true
           find work/plan-dl -name 'plan_*.json' -exec cp -v {} work/plan/ \;
           ls -la work/plan
-      - name: 恢复 OCR 缓存
+      - name: 读取本片期号（供缓存分层用）
+        id: period
+        working-directory: repo
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import glob, json
+          fs = glob.glob("work/plan/plan_*.json")
+          p = 0
+          if fs:
+              p = int((json.load(open(fs[0], encoding="utf-8")).get("period") or 0))
+          print("period=" + str(p))
+          PY
+      - name: 恢复元数据缓存（层1·按期隔离）
         uses: actions/cache@v4
         with:
-          path: repo/work/out
-          key: ocr-v3-${{ matrix.shard }}-tuku-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
+          path: repo/work/meta-cache
+          key: ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-tuku-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
-            ocr-v3-${{ matrix.shard }}-tuku-${{ github.event.inputs.cache_buster || '0' }}-
+            ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-tuku-${{ github.event.inputs.cache_buster || '0' }}-
+      - name: 恢复 OCR 缓存（层2·跨期共享）
+        uses: actions/cache@v4
+        with:
+          path: repo/work/ocr-cache
+          key: ocr-hash-tuku-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
+          restore-keys: |
+            ocr-hash-tuku-${{ github.event.inputs.cache_buster || '0' }}-
+      - name: 把两层缓存铺回各 .cache 目录
+        working-directory: repo
+        run: |
+          PERIOD="${{ steps.period.outputs.period }}"
+          mkdir -p "work/meta-cache/$PERIOD" work/ocr-cache/ocr
+          n=0
+          for d in $(find work/out -type d -name .cache 2>/dev/null); do
+            [ -d "$d" ] || continue
+            cp -n "work/meta-cache/$PERIOD/"*.json "$d/" 2>/dev/null || true
+            mkdir -p "$d/ocr"
+            cp -n work/ocr-cache/ocr/*.json "$d/ocr/" 2>/dev/null || true
+            n=$((n+1))
+          done
+          echo "铺回 $n 个 .cache（meta 期号=$PERIOD / OCR 跨期）"
       - name: 分片预热（只处理本片：详情+回复+图片+OCR）
         id: shard
         working-directory: repo
@@ -516,6 +639,18 @@ jobs:
             --shards "${{ needs.plan.outputs.count_tuku }}" \
             --source "tuku" --work work --out work/out --workers 8 \
             $EXTRA 2>&1 | tee "work/shard_tuku_${{ matrix.shard }}.log"
+      - name: 收集两层缓存（meta 按期 / OCR 跨期）
+        if: always()
+        working-directory: repo
+        run: |
+          PERIOD="${{ steps.period.outputs.period }}"
+          mkdir -p "work/meta-cache/$PERIOD" work/ocr-cache/ocr
+          for d in $(find work/out -type d -name .cache 2>/dev/null); do
+            [ -d "$d" ] || continue
+            cp -f "$d"/*.json "work/meta-cache/$PERIOD/" 2>/dev/null || true
+            cp -f "$d"/ocr/*.json work/ocr-cache/ocr/ 2>/dev/null || true
+          done
+          echo "meta($PERIOD): $(ls work/meta-cache/$PERIOD 2>/dev/null | wc -l) 个；ocr: $(ls work/ocr-cache/ocr 2>/dev/null | wc -l) 个"
       - name: 缓存体积检查（超 500MB 才瘦身）
         if: always()
         working-directory: repo

@@ -570,7 +570,10 @@ def do_plan(args) -> int:
                 str(aid): {k: v.get(k) for k in hash_fields}
                 for aid, v in prefetched.items()
             }
-            prev = _guard.load_json(state_dir / f"hashsnapshot_{source}.json", {})
+            # 阶段2：快照按期分文件（hashsnapshot_<源>_<期>.json），旧的无期号文件只在缺新文件时兜底读一次
+            snap_new = state_dir / f"hashsnapshot_{source}_{period}.json"
+            snap_old = state_dir / f"hashsnapshot_{source}.json"
+            prev = _guard.load_json(snap_new, {}) or (_guard.load_json(snap_old, {}) if snap_old.exists() else {})
             prev_map = (prev or {}).get("hashes") or {}
             prev_period = int((prev or {}).get("period") or 0)
             changed: list[dict] = []
@@ -594,7 +597,7 @@ def do_plan(args) -> int:
                     "detectedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "count": len(changed),
                     "newPosts": new_posts,
-                    "comparedAgainst": f"hashsnapshot_{source}.json@period={prev_period}",
+                    "comparedAgainst": f"hashsnapshot_{source}_{period}.json@prevPeriod={prev_period}",
                     "changes": changed,
                 },
             )
@@ -2178,7 +2181,7 @@ def do_run(args, mode: str = "run") -> int:
             hashes = plan_data.get("postHashes") or {}
             if hashes:
                 _guard.save_json(
-                    state_file.parent / f"hashsnapshot_{source}.json",
+                    state_file.parent / f"hashsnapshot_{source}_{period}.json",
                     {
                         "period": period,
                         "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -2186,7 +2189,7 @@ def do_run(args, mode: str = "run") -> int:
                         "hashes": hashes,
                     },
                 )
-                log(f"[{mode}] 已落盘内容指纹快照 hashsnapshot_{source}.json：{len(hashes)} 帖")
+                log(f"[{mode}] 已落盘内容指纹快照 hashsnapshot_{source}_{period}.json：{len(hashes)} 帖（数据仓兜底）")
             else:
                 log(f"[{mode}] ⚠ plan 里没有 postHashes（可能预抓失败），本轮不更新内容指纹快照")
         except Exception as exc:  # noqa: BLE001 - 快照失败不该让整轮失败
