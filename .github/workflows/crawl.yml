@@ -587,9 +587,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: repo/work/out
-          key: ocr-v3-dahkg-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}-merge
+          key: ocr-merge-v3-dahkg-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
-            ocr-v3-dahkg-${{ github.event.inputs.cache_buster || '0' }}-
+            ocr-merge-v3-dahkg-${{ github.event.inputs.cache_buster || '0' }}-
       - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
         working-directory: repo
         run: |
@@ -724,9 +724,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: repo/work/out
-          key: ocr-v3-aocai-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}-merge
+          key: ocr-merge-v3-aocai-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
-            ocr-v3-aocai-${{ github.event.inputs.cache_buster || '0' }}-
+            ocr-merge-v3-aocai-${{ github.event.inputs.cache_buster || '0' }}-
       - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
         working-directory: repo
         run: |
@@ -861,9 +861,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: repo/work/out
-          key: ocr-v3-tuku-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}-merge
+          key: ocr-merge-v3-tuku-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
-            ocr-v3-tuku-${{ github.event.inputs.cache_buster || '0' }}-
+            ocr-merge-v3-tuku-${{ github.event.inputs.cache_buster || '0' }}-
       - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
         working-directory: repo
         run: |
