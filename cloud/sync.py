@@ -174,44 +174,52 @@ def sync_source(repo: Path, dest: Path, key: str, info: dict, dry_run: bool) -> 
         entry = entries.get(period_name) or {}
         archive_name = entry.get("archive") or f"{period_name}.tar.gz"
         rel = f"data/{key}/{archive_name}"
-        log(f"[sync]   ↓ {rel}")
-        cache_dir = repo / "_sync_cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        local_archive = cache_dir / archive_name
-        proc = run(["git", "show", f"origin/main:{rel}"], cwd=repo, check=False)
-        if proc.returncode != 0:
-            problems.append(f"{period_name}: 取归档失败（{proc.stderr[:120]}）")
-            log(f"[sync]     ✗ {period_name} 取归档失败，跳过")
-            continue
-        # git show 会把二进制写进 stdout；用二进制方式重取一次，避免编码问题
-        with local_archive.open("wb") as fh:
+        target_dir = (dest / sub / period_name) if sub else (dest / period_name)
+
+        # 用户第三节·第3类要求：校验不一致 → **重新下载，重试 3 次仍失败 → 硬失败，不覆盖本地**。
+        # unpack 内部是「先校验 sha256，再 rmtree/mkdir」，
+        # 所以任何一次失败都不会动到本地已有数据（这一点由 pack_period 的自检守住）。
+        max_attempts = 3
+        last_err = ""
+        done = False
+        for attempt in range(1, max_attempts + 1):
+            log(f"[sync]   ↓ {rel}（第 {attempt}/{max_attempts} 次）")
+            cache_dir = repo / "_sync_cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            local_archive = cache_dir / archive_name
+            # 用二进制方式取归档（git show 会走 stdout，不能用文本模式）
             p2 = subprocess.run(
                 ["git", "show", f"origin/main:{rel}"],
                 cwd=str(repo), capture_output=True, check=False,
             )
             if p2.returncode != 0:
-                problems.append(f"{period_name}: 取归档失败（二进制）")
+                last_err = f"取归档失败（{p2.stderr[:120]!r}）"
+                log(f"[sync]     ✗ {last_err}")
                 continue
-            fh.write(p2.stdout)
-
-        target_dir = (dest / sub / period_name) if sub else (dest / period_name)
-        try:
-            res = unpack(
-                local_archive,
-                target_dir,
-                expected_sha256=str(entry.get("sha256") or ""),
-                expected_files=int(entry.get("files") or 0),
-            )
-        except SystemExit as exc:
-            problems.append(f"{period_name}: 解包失败（{exc}）")
-            log(f"[sync]     ✗ {period_name} 解包失败：{exc}")
-            continue
-        if not res["passed"]:
-            problems.append(f"{period_name}: 文件数不符 实际 {res['files']} 期望 {res['expectedFiles']}")
-            log(f"[sync]     ✗ {period_name} 文件数不符")
-            continue
-        copied.append(period_name)
-        log(f"[sync]     ✅ 已补齐 {period_name}（{res['files']} 个文件，sha256 校验通过）")
+            local_archive.write_bytes(p2.stdout)
+            try:
+                res = unpack(
+                    local_archive,
+                    target_dir,
+                    expected_sha256=str(entry.get("sha256") or ""),
+                    expected_files=int(entry.get("files") or 0),
+                )
+            except SystemExit as exc:
+                last_err = f"解包/校验失败（{exc}）"
+                log(f"[sync]     ✗ {last_err}")
+                continue
+            if not res["passed"]:
+                last_err = f"文件数不符 实际 {res['files']} 期望 {res['expectedFiles']}"
+                log(f"[sync]     ✗ {last_err}")
+                continue
+            copied.append(period_name)
+            log(f"[sync]     ✅ 已补齐 {period_name}（{res['files']} 个文件，sha256 校验通过）")
+            done = True
+            break
+        if not done:
+            # 硬失败：记入 problems，由 main 汇总成非 0 退出码；**本地已有数据保持不动**
+            problems.append(f"{period_name}: 重试 {max_attempts} 次仍失败 — {last_err}")
+            log(f"[sync]     ❌ {period_name} 重试 {max_attempts} 次仍失败，本地数据未改动")
 
     after = local_periods(dest, sub)
     missing = sorted(remote - after, key=period_number)
