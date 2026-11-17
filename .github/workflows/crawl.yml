@@ -585,6 +585,21 @@ jobs:
         with:
           pattern: cache-dahkg-*-${{ github.run_id }}
           path: repo/work/incoming-cache
+      - name: 把各片图片与 .cache 汇集到 merge 的工作目录（不覆盖）
+        working-directory: repo
+        run: |
+          # 第3步要点：分片 artifact 现在带 work/out（图片约 200MB/片）。
+          # 汇集到 merge 的 work/out 后，merge 不再重新下载图片、也能命中已有 .cache。
+          # 用 cp -rn（不覆盖）：同名文件内容相同，谁先到无所谓，冲突时保留已有。
+          mkdir -p work/out
+          merged=0
+          for d in work/incoming-cache/cache-*-*/out; do
+            [ -d "$d" ] || continue
+            cp -rn "$d"/. work/out/ 2>/dev/null || true
+            merged=$((merged+1))
+          done
+          size_mb=$(du -sm work/out 2>/dev/null | cut -f1 || echo 0)
+          echo "已汇集 ${merged} 个分片的 out，work/out 现有 ${size_mb}MB"
       - name: 解开各分片缓存到独立目录（不能直接解到 work/out，否则同名 JSON 互相覆盖）
         working-directory: repo
         run: |
@@ -722,6 +737,21 @@ jobs:
         with:
           pattern: cache-aocai-*-${{ github.run_id }}
           path: repo/work/incoming-cache
+      - name: 把各片图片与 .cache 汇集到 merge 的工作目录（不覆盖）
+        working-directory: repo
+        run: |
+          # 第3步要点：分片 artifact 现在带 work/out（图片约 200MB/片）。
+          # 汇集到 merge 的 work/out 后，merge 不再重新下载图片、也能命中已有 .cache。
+          # 用 cp -rn（不覆盖）：同名文件内容相同，谁先到无所谓，冲突时保留已有。
+          mkdir -p work/out
+          merged=0
+          for d in work/incoming-cache/cache-*-*/out; do
+            [ -d "$d" ] || continue
+            cp -rn "$d"/. work/out/ 2>/dev/null || true
+            merged=$((merged+1))
+          done
+          size_mb=$(du -sm work/out 2>/dev/null | cut -f1 || echo 0)
+          echo "已汇集 ${merged} 个分片的 out，work/out 现有 ${size_mb}MB"
       - name: 解开各分片缓存到独立目录（不能直接解到 work/out，否则同名 JSON 互相覆盖）
         working-directory: repo
         run: |
@@ -859,6 +889,21 @@ jobs:
         with:
           pattern: cache-tuku-*-${{ github.run_id }}
           path: repo/work/incoming-cache
+      - name: 把各片图片与 .cache 汇集到 merge 的工作目录（不覆盖）
+        working-directory: repo
+        run: |
+          # 第3步要点：分片 artifact 现在带 work/out（图片约 200MB/片）。
+          # 汇集到 merge 的 work/out 后，merge 不再重新下载图片、也能命中已有 .cache。
+          # 用 cp -rn（不覆盖）：同名文件内容相同，谁先到无所谓，冲突时保留已有。
+          mkdir -p work/out
+          merged=0
+          for d in work/incoming-cache/cache-*-*/out; do
+            [ -d "$d" ] || continue
+            cp -rn "$d"/. work/out/ 2>/dev/null || true
+            merged=$((merged+1))
+          done
+          size_mb=$(du -sm work/out 2>/dev/null | cut -f1 || echo 0)
+          echo "已汇集 ${merged} 个分片的 out，work/out 现有 ${size_mb}MB"
       - name: 解开各分片缓存到独立目录（不能直接解到 work/out，否则同名 JSON 互相覆盖）
         working-directory: repo
         run: |
