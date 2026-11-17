@@ -1194,6 +1194,30 @@ def _check_second_level(posts: list[dict]) -> dict:
     }
 
 
+def _product_post_fingerprint(post: dict) -> str:
+    """产物里一帖的内容指纹（第5道 A/B 对照用）。
+
+    只取内容字段，**不含**任何运行期元数据（updateTime/rank/claims 顺序等），
+    这样两次运行只要该帖内容相同，指纹就相同 —— 可以把"数据漂移"与"合并过程出错"分开。
+    """
+    import json as _json
+
+    keep = {
+        "articleId": post.get("articleId"),
+        "title": post.get("title"),
+        "text": post.get("text"),
+        "createTime": post.get("createTime"),
+        "period": post.get("period"),
+        "userId": post.get("userId"),
+        "username": post.get("username"),
+        "images": [str((i or {}).get("url") or "") for i in (post.get("images") or [])],
+        "commentsAll": len(post.get("commentsAll") or []),
+        "replies": len(post.get("replies") or []),
+    }
+    blob = _json.dumps(keep, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return _sha256_text(blob)
+
+
 def do_shard(args) -> int:
     """分片任务：**只负责把它那一份帖子的缓存（详情/回复/图片/OCR）暖起来**。
 
@@ -1484,6 +1508,13 @@ def do_run(args, mode: str = "run") -> int:
             fingerprints[fpath.name] = h
             log(f"[产物指纹] {fpath.name} {h}")
         log(f"[产物指纹] 合计 {len(fingerprints)} 个文件（已排除 {sorted(stamped)}）")
+        # 每帖指纹（第5道 A/B 对照：可分帖区分"数据漂移"与"合并出错"）
+        per_post = {int(p.get("articleId") or 0): _product_post_fingerprint(p)
+                    for p in posts if int(p.get("articleId") or 0)}
+        for aid in sorted(per_post):
+            log(f"[帖子指纹] {aid} {per_post[aid]}")
+        agg = hashlib.sha256("\n".join(f"{a}:{per_post[a]}" for a in sorted(per_post)).encode()).hexdigest()
+        log(f"[帖子指纹汇总] 帖数={len(per_post)} sha256={agg}")
         _guard.save_json(work / "audit" / f"fingerprints_{source}.json",
                          {"period": period, "files": fingerprints})
     except Exception as exc:  # noqa: BLE001 - 指纹失败不该影响产物
@@ -2026,6 +2057,7 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 
