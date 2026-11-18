@@ -99,13 +99,18 @@ def test_no_transfer_when_capacity_sufficient():
 
 
 def test_normal_transfer_when_merge_can_absorb():
-    """分片装不下、merge 能吸收 → shortfall=0 且 transfer==transferable。"""
-    # effective=2.0：分片容量 675、merge 容量 675；总数 1200 → transferable 525 < 675
-    d = decide_transfer(1200, 2.0)
-    assert d["shard_capacity"] == int(1500 * USABLE_RATIO / 2.0)
-    assert d["merge_capacity"] == int(1500 * USABLE_RATIO / 2.0)
+    """分片装不下、merge 能吸收 → shortfall=0 且 transfer==transferable。
+
+    用 USABLE_RATIO 动态算，避免系数变化（0.9→0.6）让测试失效。
+    """
+    eff = 2.0
+    cap = int(1500 * USABLE_RATIO / eff)
+    total = cap + int(cap * 0.5)          # transferable = 0.5×cap < merge 容量
+    d = decide_transfer(total, eff)
+    assert d["shard_capacity"] == cap
+    assert d["merge_capacity"] == cap
     assert d["shortfall"] == 0
-    assert d["transfer"] == 1200 - d["shard_capacity"]
+    assert d["transfer"] == total - cap
 
 
 def test_shortfall_when_both_capacities_exceeded():
@@ -121,8 +126,10 @@ def test_shortfall_when_both_capacities_exceeded():
 def test_shard_uses_job_timeout_not_soft_budget():
     """容量必须用 job timeout × 0.9（1350s），不是旧的软预算 1080s。"""
     d = decide_transfer(10**6, 1.0)          # 必然转移
-    assert d["shard_capacity"] == 1350       # 1500 × 0.9，不是 1080
+    # 1500 × 0.6 = 900（2026-11-19 C 方案）；不是旧的软预算 1080，也不是 0.9 的 1350
+    assert d["shard_capacity"] == 900
     assert d["shard_capacity"] != 1080
+    assert d["shard_capacity"] != 1350
 
 
 # ============================================================

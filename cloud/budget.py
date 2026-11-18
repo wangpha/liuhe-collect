@@ -53,8 +53,23 @@ HIT_COST: float = 0.005
 #: **PENDING 假设值**（见模块 docstring 的循环依赖说明）：最近一轮实测的缓存命中率
 HIT_RATE_HISTORY: float = 0.74
 
-#: 容量利用率：留 10% 余量给收尾（打包/上传），避免撞上 job 硬超时
-USABLE_RATIO: float = 0.9
+#: 分片容量利用率（2026-11-19 用户裁决 C：0.9 → 0.6）
+#:
+#: ## 为什么不是 0.9（实测：run 44393292932 整轮 41 分，watchdog 40 分 cancel → publish 被跳过）
+#: 整轮时长 = 固定开销(7 分) + max(各源 [最慢分片 + merge])
+#: 0.9 → 分片容量 22.5 分 → dahkg 最慢分片 23.7 分 + merge 10 分 + 7 = **40.7 分** ❌
+#: 0.6 → 分片容量 15 分   → 预计 dahkg 15 + merge 10 + 7 = 32 分 ✅（< 40，watchdog 不触发）
+#:
+#: ## 为什么不是「按源差异化倒推」（选项 A）
+#: merge 的 10 分钟**不是补抓，是重跑整个 main()**：
+#:   扫列表 + 抓全部详情 + 抓全部回复 + 建 21 个产物 + 防线 1-5 ≈ 6-7 分钟（固定，转移不走）
+#:   只有 OCR 部分（3-4 分钟）会随转移增加
+#: → 「分片容量 = 总预算 - 固定 - merge预估」里 merge预估又取决于分片做了多少 = 循环依赖
+#: → 用 0.6 这个近似系数实现同一目标，无循环依赖
+#:
+#: 注：0.6 是**临时止血**（目标 ≤35 分、publish 成功）；要达 ≤30 分需 summary 上线
+#:     （merge 从重跑 main() 的 10 分降到只汇总的 2 分）。
+USABLE_RATIO: float = 0.6
 
 #: GitHub runner 池 CPU → **端到端秒/次**（2026-11-19 run 44358492008 的 20 片实测中位）
 RUNNER_CPU_E2E_SECONDS: dict[str, float] = {
@@ -177,6 +192,10 @@ def estimate_effective_seconds(
 
     total = max(0, int(total_images))
     cached = max(0, int(cached_count))
+    # ⚠ 近似：cached 是**整个层2 缓存的唯一条目数**（跨片/跨源共享），而分母是**本片图数**
+    # → 可能 >100%（实测 aocai：本片 61 图 / 层2 缓存 839 条）→ min(1.0) 截断
+    # 方向：缓存充足时**高估**命中率 → effective 低估 → 容量高估 → 分片可能超时（危险侧）
+    # 兜底：USABLE_RATIO=0.6 的折扣 + shortfall 告警 + job timeout(25 分) + continue-on-error
     hit_rate = min(1.0, cached / total) if total > 0 else 0.0
 
     e2e, cpu_hit, matched = _resolve_e2e(cpu_model, e2e_table, unknown_e2e)
