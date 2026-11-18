@@ -1161,7 +1161,7 @@ jobs:
             !repo/work/out/**/images/**
           if-no-files-found: warn
 
-  # ---------------- 整轮 watchdog：40 分钟硬上限（超时自动诊断 + 取消） ----------------
+  # ---------------- 整轮 watchdog：步骤级软超时（主）+ 40 分钟兜底（副） ----------------
   watchdog:
     name: "Watchdog 整轮 40 分钟上限"
     needs: [plan]
@@ -1169,39 +1169,120 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
-      - name: 整轮监控（40 分钟硬上限）
+      - name: 整轮监控（步骤级软超时 + 40 分钟兜底）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MAX_MIN: "40"
         run: |
           START=$(date +%s)
+          TMP=$(mktemp)
+          REPO="${{ github.repository }}"
+          RUN="${{ github.run_id }}"
+
+          # 步骤软超时（分钟）= 实测正常 × 1.5；未列出的按 15 分
+          soft_limit() {
+            case "$1" in
+              "Set up job") echo 3 ;;
+              "检出代码") echo 3 ;;
+              "安装 Python") echo 3 ;;
+              "检出私有数据仓"*) echo 3 ;;
+              "安装系统依赖"*) echo 5 ;;
+              "恢复 pip 缓存") echo 3 ;;
+              "安装依赖") echo 5 ;;
+              "下载本源 plan"*) echo 3 ;;
+              "归位 plan"*) echo 2 ;;
+              "下载各分片缓存") echo 5 ;;
+              "解开各分片缓存到独立目录"*) echo 5 ;;
+              "恢复元数据缓存"*) echo 10 ;;
+              "恢复 OCR 缓存"*) echo 10 ;;
+              "把两层缓存铺回"*) echo 5 ;;
+              "合并分片缓存"*) echo 10 ;;
+              "清理昨日图片"*) echo 5 ;;
+              "收集两层缓存"*) echo 5 ;;
+              "缓存体积检查"*) echo 5 ;;
+              "打包本片缓存") echo 8 ;;
+              "上传本片缓存") echo 8 ;;
+              "生成 plan"*) echo 9 ;;
+              "分片预热"*) echo 21 ;;
+              "完整跑一次"*) echo 21 ;;
+              "上传产物"*) echo 8 ;;
+              "上传日志与审计证据") echo 5 ;;
+              "上传 plan") echo 5 ;;
+              "失败/超时诊断"*) echo 5 ;;
+              "读取本片期号"*) echo 3 ;;
+              *) echo 15 ;;
+            esac
+          }
+
           while true; do
             ELAPSED=$(( ($(date +%s) - START) / 60 ))
 
-            # 【关键】先检查业务是否已全部完成：完成就正常退出，绝不 cancel
-            # 否则会空转到 MAX_MIN 然后 cancel 掉正在等 publish 的整轮（2026-11-18 事故）
-            PENDING=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
-              --jq '[.jobs[] | select(.name != "Watchdog 整轮 40 分钟上限") | select(.status != "completed")] | length' 2>/dev/null || echo "99")
-            echo "=== 已跑 ${ELAPSED} 分钟（上限 ${MAX_MIN}）；未完成 job 数 ${PENDING} ==="
+            # ① 业务是否全部完成（gh 内嵌 jq，不依赖外部 jq 二进制）
+            PENDING=$(gh api "repos/$REPO/actions/runs/$RUN/jobs" \
+              --jq '[.jobs[] | select(.name != "Watchdog 整轮 40 分钟上限") | select(.status != "completed")] | length' \
+              2>/dev/null || echo 99)
+            echo "=== 已跑 ${ELAPSED} 分（兜底 ${MAX_MIN}）；未完成 job 数 ${PENDING} ==="
             if [ "$PENDING" = "0" ]; then
               echo "✅ 所有业务 job 已完成（${ELAPSED} 分钟），watchdog 正常退出（不取消）"
               exit 0
             fi
-            if [ "$ELAPSED" -ge "$MAX_MIN" ]; then
-              echo "::error::整轮超过 ${MAX_MIN} 分钟且仍有 ${PENDING} 个 job 未完成，开始诊断并取消"
+
+            # ② 步骤级软超时
+            OVER=""
+            gh api "repos/$REPO/actions/runs/$RUN/jobs" \
+              --jq '.jobs[] | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "\($j)\t\(.name)\t\(.started_at)"' \
+              2>/dev/null > "$TMP.steps" || true
+            while IFS="$(printf '\t')" read -r JN SN ST; do
+              [ -n "${ST:-}" ] || continue
+              S=$(date -d "$ST" +%s 2>/dev/null) || continue
+              M=$(( ($(date +%s) - S) / 60 ))
+              LIM=$(soft_limit "$SN")
+              echo "    ${JN} / ${SN} : 已 ${M} 分（软超时 ${LIM}）"
+              if [ "$M" -ge "$LIM" ]; then
+                OVER="${JN} / ${SN} 已 ${M} 分 > 软超时 ${LIM} 分"
+                break
+              fi
+            done < "$TMP.steps"
+
+            if [ -n "$OVER" ]; then
+              echo "::error::步骤超软超时：$OVER"
               {
-                echo "## 整轮超时诊断（${MAX_MIN} 分钟）"
+                echo "## 🚨 步骤软超时诊断"
+                echo ""
+                echo "| 项 | 值 |"
+                echo "|---|---|"
+                echo "| 超时步骤 | $OVER |"
+                echo "| 已跑整轮 | ${ELAPSED} 分钟 |"
+                echo ""
+                echo "| job | 当前步骤 | 状态 |"
+                echo "|---|---|---|"
+                gh api "repos/$REPO/actions/runs/$RUN/jobs" \
+                  --jq '.jobs[] | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "| \($j) | \(.name) | \(.status) |"' \
+                  2>/dev/null || true
+              } >> "$GITHUB_STEP_SUMMARY"
+              gh run cancel "$RUN" --repo "$REPO" || true
+              exit 1
+            fi
+
+            # ③ 绝对兜底
+            if [ "$ELAPSED" -ge "$MAX_MIN" ]; then
+              echo "::error::整轮 ${ELAPSED} 分达绝对兜底 ${MAX_MIN} 分（仍有 ${PENDING} 个 job 未完成）"
+              {
+                echo "## 🚨 整轮兜底超时诊断（${MAX_MIN} 分钟）"
                 echo ""
                 echo "| job | 状态 | 开始时间 |"
                 echo "|---|---|---|"
-                gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
-                  --jq '.jobs[] | "| \(.name) | \(.status) | \(.started_at) |"' || true
+                gh api "repos/$REPO/actions/runs/$RUN/jobs" \
+                  --jq '.jobs[] | "| \(.name) | \(.status) | \(.started_at) |"' \
+                  2>/dev/null || true
               } >> "$GITHUB_STEP_SUMMARY"
-              gh run cancel "${{ github.run_id }}" --repo "${{ github.repository }}" || true
+              gh run cancel "$RUN" --repo "$REPO" || true
               exit 1
             fi
+
             sleep 60
           done
+
 
   # ---------------- Job 13：推送到私有数据仓 ----------------
   publish:
