@@ -1215,6 +1215,12 @@ def _ocr_micro_benchmark(out_root: Path, limit: int = 3) -> dict:
 #: 探针结果缓存（同进程只测一次）
 _CPU_PROBE_CACHE: float | None = None
 
+#: 「纯 OCR 探针值」→「端到端秒/次」的换算系数（2026-11-19 run 44358492008 实测）
+#: 8 片 AMD 机器的「真实秒/次 ÷ 探针值」= 1.75 / 2.26 / 2.32 / 2.34 / 2.36 / 2.67 / 2.83 / 1.99
+#: → 取中位 2.34。含义：探针测纯 OCR（det+rec），diag 的秒/次还含缓存查找/解码/调度。
+#: ⚠ 仅由 AMD 样本标定；Intel Xeon 6975P-C（1.5）的换算值待复核。
+END_TO_END_FACTOR: float = 2.34
+
 #: GitHub runner 池的 CPU → 纯 OCR 秒/张（2026-11-17/18 多轮实测）
 CPU_OCR_SECONDS: dict[str, float] = {
     "AMD EPYC 9V45": 0.371,
@@ -1262,8 +1268,9 @@ def _cpu_ocr_probe() -> float:
     cpu = _read_cpu_model_name()
     for model, sec in CPU_OCR_SECONDS.items():
         if model in cpu:
-            _CPU_PROBE_CACHE = float(sec)
-            log(f"[shard] CPU 型号 {cpu} → 探针 {sec:.3f} 秒/张（历史实测表）")
+            _CPU_PROBE_CACHE = round(float(sec) * END_TO_END_FACTOR, 4)
+            log(f"[shard] CPU 型号 {cpu} → 探针 {sec:.3f} 秒/张 × {END_TO_END_FACTOR}"
+                f"（端到端系数）= {_CPU_PROBE_CACHE:.3f} 秒/次")
             return _CPU_PROBE_CACHE
 
     # 兜底①：仓库自带真实图
@@ -1296,16 +1303,17 @@ def _cpu_ocr_probe() -> float:
                 if times:
                     times.sort()
                     median = times[len(times) // 2]
-                    _CPU_PROBE_CACHE = round(median, 4)
-                    log(f"[shard] 未知 CPU {cpu} → 真实图探针 {_CPU_PROBE_CACHE:.3f} 秒/张"
+                    _CPU_PROBE_CACHE = round(median * END_TO_END_FACTOR, 4)
+                    log(f"[shard] 未知 CPU {cpu} → 真实图探针 {median:.3f} 秒/张 × "
+                        f"{END_TO_END_FACTOR}（端到端系数）= {_CPU_PROBE_CACHE:.3f} 秒/次"
                         f"（{len(times)} 张中位）")
                     return _CPU_PROBE_CACHE
         except Exception as exc:  # noqa: BLE001 - 探针失败不阻断
             log(f"[shard] ⚠ 真实图探针失败（{type(exc).__name__}: {exc}），改用保守值")
 
-    _CPU_PROBE_CACHE = 1.5
-    log(f"[shard] ⚠ 未知 CPU {cpu} 且无有效探针图 → 慢机下限 1.5 秒/张"
-        f"（宁可过度转移 unfinished，也不超时）")
+    _CPU_PROBE_CACHE = round(1.5 * END_TO_END_FACTOR, 4)
+    log(f"[shard] ⚠ 未知 CPU {cpu} 且无有效探针图 → 慢机下限 1.5 × {END_TO_END_FACTOR}"
+        f" = {_CPU_PROBE_CACHE:.3f} 秒/次（宁可过度转移 unfinished，也不超时）")
     return _CPU_PROBE_CACHE
 
 def _pick_within_budget(ids: list[int], cost: dict, per_image_seconds: float, budget_seconds: float) -> tuple[list[int], list[int]]:
