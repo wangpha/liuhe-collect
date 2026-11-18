@@ -1212,66 +1212,92 @@ def _ocr_micro_benchmark(out_root: Path, limit: int = 3) -> dict:
     }
 
 
-def _cpu_ocr_probe() -> float:
-    """在**本机**跑一张合成图，测出这台 runner 的 pure-OCR 秒/张（用于按预算切片）。
+#: 探针结果缓存（同进程只测一次）
+_CPU_PROBE_CACHE: float | None = None
 
-    ## 为什么要开机就测（2026-11-17 实测结论）
-    GitHub 的 runner 池里 CPU 是异构的，实测 14 片拿到 5 种型号：
-      AMD EPYC 9V45 / 7763 / 9V74 → 纯 OCR 0.37~0.65 秒/张
-      Intel Xeon 6975P-C          → 纯 OCR 1.15~1.95 秒/张（慢 3~5 倍）
-    静态分片因此永远不均。这里改成：**开机先自测速度**，再决定这台机器能吃多少活，
-    超预算的部分写进 unfinished_*.json 交给 merge 补抓。
+#: GitHub runner 池的 CPU → 纯 OCR 秒/张（2026-11-17/18 多轮实测）
+CPU_OCR_SECONDS: dict[str, float] = {
+    "AMD EPYC 9V45": 0.371,
+    "AMD EPYC 7763": 0.450,      # 实测 0.408-0.647，取中位
+    "AMD EPYC 9V74": 0.484,
+    "Intel Xeon 8370C": 0.597,
+    "Intel Xeon 6975P-C": 1.500,  # 实测 1.152-1.95，取中位
+}
+
+
+def _read_cpu_model_name() -> str:
+    """读本机 CPU 型号名（Linux 读 /proc/cpuinfo；Windows 用 platform 兜底）。"""
+    try:
+        info = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
+        for line in info.splitlines():
+            if line.lower().startswith("model name"):
+                return line.split(":", 1)[-1].strip()
+    except OSError:
+        pass
+    try:
+        import platform
+
+        return platform.processor() or platform.machine() or "unknown"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def _cpu_ocr_probe() -> float:
+    """测本机 pure-OCR 秒/张（用于按预算切片）。
+
+    ## 为什么不再用合成图（2026-11-18 实测核实）
+    合成图（cv2 画黑条 / putText）OCR 后 `rows=0 / items=0` —— rec 阶段几乎不耗时，
+    测出来的秒数只反映 det + 开销：云端实测探针 0.191 秒/张，而真实 0.909 秒/张（低估 4.8 倍）。
+    后果：软预算误判「在预算内，全部自己处理」→ 分片跑 22.8 分钟。
+
+    ## 现在的方案
+    ① CPU 型号映射（GitHub runner 池 CPU 可枚举，历史实测值可靠）
+    ② 未知型号 → 仓库自带真实图探针（cloud/probe/*.jpg，200-500 KB 典型图）
+    ③ 都没有 → 保守值 1.0 秒/张（宁可低估预算、触发转移，也不要超时）
     """
     global _CPU_PROBE_CACHE
     if _CPU_PROBE_CACHE is not None:
         return _CPU_PROBE_CACHE
-    try:
-        import tempfile
 
-        import numpy as np
+    cpu = _read_cpu_model_name()
+    for model, sec in CPU_OCR_SECONDS.items():
+        if model in cpu:
+            _CPU_PROBE_CACHE = float(sec)
+            log(f"[shard] CPU 型号 {cpu} → 探针 {sec:.3f} 秒/张（历史实测表）")
+            return _CPU_PROBE_CACHE
 
-        from core import ocr as ocr_mod
+    # 兜底①：仓库自带真实图
+    probe_dir = Path(__file__).parent / "probe"
+    probes = sorted(probe_dir.glob("*.jpg"))[:3] if probe_dir.exists() else []
+    if probes:
+        try:
+            import tempfile
 
-        analyze = getattr(ocr_mod, "analyze_image", None)
-        if analyze is None:
-            _CPU_PROBE_CACHE = 0.0
-            return 0.0
-        # 合成一张 240x360 的"有内容"图：白底 + 若干黑条，避免被当成空图跳过
-        arr = np.full((360, 240, 3), 255, dtype=np.uint8)
-        for i in range(6):
-            arr[40 + i * 40: 52 + i * 40, 30: 210] = 30
-        tmp = Path(tempfile.mkdtemp(prefix="cpuprobe-")) / "probe.png"
-        import cv2
+            from core import ocr as ocr_mod
 
-        cv2.imwrite(str(tmp), arr)
-        # ⚠️ analyze_image 的真实签名是 (image_path, target_period, cache_dir, ...)：
-        # 2026-11-17 v8 实测漏传这两个参数 → `TypeError: missing 2 required positional arguments`
-        # → 探针静默失败、预算切片全部没生效（分片仍按原样跑）。这里用独立缓存目录，避免污染真实缓存。
-        # 合成若干张**互不相同**的图，并用 force=True 强制真实识别：
-        # 否则同一张图第二次会命中 OCR 缓存（实测返回 0.0013 秒，等于没测）
-        cache_dir = tmp.parent / "cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        probes: list[Path] = []
-        for idx in range(2):
-            arr2 = arr.copy()
-            arr2[20 + idx * 30: 26 + idx * 30, 10: 230] = 60   # 让两张图不同
-            p2 = tmp.parent / f"probe{idx}.png"
-            cv2.imwrite(str(p2), arr2)
-            probes.append(p2)
-        analyze(str(probes[0]), 0, str(cache_dir), force=True)   # 预热（模型加载，不计时）
-        t0 = time.perf_counter()
-        analyze(str(probes[1]), 0, str(cache_dir), force=True)
-        seconds = time.perf_counter() - t0
-        _CPU_PROBE_CACHE = round(seconds, 4)
-        return _CPU_PROBE_CACHE
-    except Exception as exc:  # noqa: BLE001 - 探针失败不该影响主流程
-        log(f"[shard] ⚠ CPU 探针失败（跳过按预算切片）：{type(exc).__name__}: {exc}")
-        _CPU_PROBE_CACHE = 0.0
-        return 0.0
+            analyze = getattr(ocr_mod, "analyze_image", None)
+            if analyze is not None:
+                cache_dir = Path(tempfile.mkdtemp(prefix="cpuprobe-")) / "cache"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                analyze(str(probes[0]), 0, str(cache_dir), force=True)      # 预热（含模型加载）
+                times: list[float] = []
+                for pr in probes[1:] or probes[:1]:
+                    t0 = time.perf_counter()
+                    analyze(str(pr), 0, str(cache_dir), force=True)
+                    times.append(time.perf_counter() - t0)
+                if times:
+                    times.sort()
+                    median = times[len(times) // 2]
+                    _CPU_PROBE_CACHE = round(median, 4)
+                    log(f"[shard] 未知 CPU {cpu} → 真实图探针 {_CPU_PROBE_CACHE:.3f} 秒/张"
+                        f"（{len(times)} 张中位）")
+                    return _CPU_PROBE_CACHE
+        except Exception as exc:  # noqa: BLE001 - 探针失败不阻断
+            log(f"[shard] ⚠ 真实图探针失败（{type(exc).__name__}: {exc}），改用保守值")
 
-
-_CPU_PROBE_CACHE: float | None = None
-
+    _CPU_PROBE_CACHE = 1.0
+    log(f"[shard] ⚠ 未知 CPU {cpu} 且无探针图 → 保守值 1.0 秒/张（会倾向触发 unfinished 转移）")
+    return _CPU_PROBE_CACHE
 
 def _pick_within_budget(ids: list[int], cost: dict, per_image_seconds: float, budget_seconds: float) -> tuple[list[int], list[int]]:
     """按预算挑出本机要处理的帖子，其余留给 merge。
