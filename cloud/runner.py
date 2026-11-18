@@ -1213,6 +1213,56 @@ def _ocr_micro_benchmark(out_root: Path, limit: int = 3) -> dict:
 
 
 #: 探针结果缓存（同进程只测一次）
+def _install_sigterm_surrender(work: Path, source: str, shard_index: int,
+                                planned_ids: set[int], log) -> bool:
+    """装 SIGTERM 处理器：把「预算用完」变成**优雅投降**而不是被 SIGKILL。
+
+    ## 为什么需要（2026-11-19 实测事故）
+    分片跑到 25 分钟被 GitHub job timeout **SIGKILL** → 没写 unfinished、没建产物、判 failure。
+    改成 workflow 用 `timeout --signal=SIGTERM --kill-after=30 1440`（24 分钟）后，
+    SIGTERM 是**可捕获**的，于是可以：
+        写 unfinished（保守：本片全部 planned_ids 都写，merge 会去重）→ `SystemExit(0)`
+    `_run_module_main` 的 `except SystemExit: code = int(exc.code or 0)` 会把它当成
+    「模块正常退出 0」→ do_shard 继续收尾写分片 json → 返回 0 → **分片判 success**。
+
+    ## 牺牲与收益
+    牺牲：本片没做完的活（但那部分本来就会由 merge 的 unfinished 机制补抓）
+    收益：分片不被 kill、整轮 < 40 分钟、publish 能执行（数据入库）
+
+    返回 True 表示装上了（Windows 主线程也支持 Python 级 SIGTERM 处理）。
+    """
+    import signal as _signal
+
+    def handler(signum, frame):  # noqa: ARG001 - signal 签名固定
+        log("[shard] ⚠ 收到 SIGTERM（预算用完），写 unfinished 后优雅退出")
+        try:
+            # ⚠ 必须在这里 import：`_guard` 只在 do_shard 函数内导入过，模块级没有。
+            # 2026-11-19 踩坑：handler 里直接用 `_guard` → NameError 被 except 吞掉
+            # → 文件没写、只打了「写 unfinished 失败」 → 分片「优雅退出」但交付物缺失。
+            from . import _guard
+            _guard.save_json(
+                work / "unfinished" / f"unfinished_{source}_{shard_index}.json",
+                {
+                    "source": source,
+                    "shard": shard_index,
+                    "ids": sorted(int(x) for x in (planned_ids or [])),
+                    "reason": "SIGTERM（分片预算用完，workflow 的 timeout 触发）",
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            )
+            log(f"[shard] ✅ unfinished 已写（{len(planned_ids or [])} 帖），merge 会补抓")
+        except Exception as exc:  # noqa: BLE001 - 写盘失败也要正常退出
+            log(f"[shard] ⚠ 写 unfinished 失败：{type(exc).__name__}: {exc}")
+        raise SystemExit(0)          # 正常退出 → 分片判 success
+
+    try:
+        _signal.signal(_signal.SIGTERM, handler)
+        return True
+    except Exception as exc:  # noqa: BLE001 - 非主线程/平台不支持时降级
+        log(f"[shard] ⚠ 装 SIGTERM handler 失败（{type(exc).__name__}），仍由 job timeout 兜底")
+        return False
+
+
 def _find_ocr_cache_dir(work: Path, out_root: Path) -> Path | None:
     """找本源本期的 `.cache` 目录（分片启动时只有本期缓存被铺回）。
 
@@ -1717,6 +1767,9 @@ def do_shard(args) -> int:
         if budget_dec["shortfall"] > 0:
             log(f"[shard] ⚠ {budget_dec['reason']}")
             log("[shard] ⚠ 建议：提高缓存命中率（连续跑同期限）> 增加分片数（付费）> 冷启动轮单独放宽时限（需批准）")
+
+    # SIGTERM 优雅投降（必须在跑模块**之前**装，handler 里的 planned_ids 用当前值）
+    _install_sigterm_surrender(work, source, shard_index, set(planned_ids or ()), log)
 
     argv = ["--out", str(out_root), "--period", str(period)]
     if args.workers:

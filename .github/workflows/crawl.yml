@@ -332,13 +332,25 @@ jobs:
           NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
         run: |
           set -o pipefail
+          # SIGTERM 优雅投降（2026-11-19）：1440s(24 分) < job timeout 1500s(25 分)
+          # → 分片「自己退出」而不是被 GitHub SIGKILL，能写 unfinished 并判 success。
+          # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
+          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1440"
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
-          python -m cloud.runner --shard "${{ matrix.shard }}" \
+          set +e
+          $SHARD_TO python -m cloud.runner --shard "${{ matrix.shard }}" \
             --shards "${{ needs.plan.outputs.count_dahkg }}" \
             --source "dahkg" --work work --out work/out --workers 8 \
             $EXTRA 2>&1 | tee "work/shard_dahkg_${{ matrix.shard }}.log"
+            code=$?
+            set -e
+            if [ "$code" -eq 124 ] || [ "$code" -eq 143 ]; then
+              echo "::warning::分片被 SIGTERM（24 分钟预算用完）→ 按优雅退出处理（unfinished 已由 runner 写出）"
+              exit 0
+            fi
+            exit $code
       - name: 收集两层缓存（meta 按期 / OCR 跨期）
         if: always()
         working-directory: repo
@@ -517,13 +529,25 @@ jobs:
           NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
         run: |
           set -o pipefail
+          # SIGTERM 优雅投降（2026-11-19）：1440s(24 分) < job timeout 1500s(25 分)
+          # → 分片「自己退出」而不是被 GitHub SIGKILL，能写 unfinished 并判 success。
+          # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
+          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1440"
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
-          python -m cloud.runner --shard "${{ matrix.shard }}" \
+          set +e
+          $SHARD_TO python -m cloud.runner --shard "${{ matrix.shard }}" \
             --shards "${{ needs.plan.outputs.count_aocai }}" \
             --source "aocai" --work work --out work/out --workers 8 \
             $EXTRA 2>&1 | tee "work/shard_aocai_${{ matrix.shard }}.log"
+            code=$?
+            set -e
+            if [ "$code" -eq 124 ] || [ "$code" -eq 143 ]; then
+              echo "::warning::分片被 SIGTERM（24 分钟预算用完）→ 按优雅退出处理（unfinished 已由 runner 写出）"
+              exit 0
+            fi
+            exit $code
       - name: 收集两层缓存（meta 按期 / OCR 跨期）
         if: always()
         working-directory: repo
@@ -702,13 +726,25 @@ jobs:
           NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
         run: |
           set -o pipefail
+          # SIGTERM 优雅投降（2026-11-19）：1440s(24 分) < job timeout 1500s(25 分)
+          # → 分片「自己退出」而不是被 GitHub SIGKILL，能写 unfinished 并判 success。
+          # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
+          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1440"
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
-          python -m cloud.runner --shard "${{ matrix.shard }}" \
+          set +e
+          $SHARD_TO python -m cloud.runner --shard "${{ matrix.shard }}" \
             --shards "${{ needs.plan.outputs.count_tuku }}" \
             --source "tuku" --work work --out work/out --workers 8 \
             $EXTRA 2>&1 | tee "work/shard_tuku_${{ matrix.shard }}.log"
+            code=$?
+            set -e
+            if [ "$code" -eq 124 ] || [ "$code" -eq 143 ]; then
+              echo "::warning::分片被 SIGTERM（24 分钟预算用完）→ 按优雅退出处理（unfinished 已由 runner 写出）"
+              exit 0
+            fi
+            exit $code
       - name: 收集两层缓存（meta 按期 / OCR 跨期）
         if: always()
         working-directory: repo
