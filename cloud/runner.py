@@ -1417,6 +1417,46 @@ def _check_low_confidence(out_dir: Path, threshold: float = 0.7) -> dict:
     }
 
 
+def _annotate_hit_rate(out_dir: Path, meta: dict, shard_stats: dict, log) -> None:
+    """把分片上报的缓存命中率写进 run_meta（A''：校准 HIT_RATE_HISTORY 的数据来源）。
+
+    写两个字段：
+      `ocrCacheHitRate`        本轮各片命中率的中位 + 明细（机器可读）
+      `ocrMissCostCalibration` 假设值 vs 本轮反推值的对比提示（供人工裁决是否回写表）
+    """
+    from . import budget as _budget
+
+    hrs = list((shard_stats or {}).get("ocrHitRates") or [])
+    if not hrs:
+        return
+    hrs.sort()
+    median = hrs[len(hrs) // 2]
+    e2es = list((shard_stats or {}).get("ocrEffectiveSecs") or [])
+    e2es.sort()
+    meta["ocrCacheHitRate"] = {
+        "median": round(median, 4),
+        "min": round(hrs[0], 4),
+        "max": round(hrs[-1], 4),
+        "shards": len(hrs),
+        "cacheHit": int((shard_stats or {}).get("ocrCacheHit") or 0),
+        "cacheMiss": int((shard_stats or {}).get("ocrCacheMiss") or 0),
+        "plannedImages": int((shard_stats or {}).get("plannedImages") or 0),
+        "effectiveSecMedian": round(e2es[len(e2es) // 2], 4) if e2es else None,
+    }
+    meta["ocrMissCostCalibration"] = {
+        "assumedHitRateHistory": _budget.HIT_RATE_HISTORY,
+        "actualHitRateMedian": round(median, 4),
+        "delta": round(median - _budget.HIT_RATE_HISTORY, 4),
+        "action": ("误差 >30% → 回写 RUNNER_CPU_E2E_SECONDS 或 HIT_RATE_HISTORY；"
+                   "≤30% → 保留假设并标注已校准"),
+    }
+    log(
+        f"[预算校准] 本轮命中率中位 {median * 100:.0f}%（{hrs[0] * 100:.0f}%-{hrs[-1] * 100:.0f}%，"
+        f"{len(hrs)} 片），假设值 {_budget.HIT_RATE_HISTORY * 100:.0f}%"
+        f" → delta {median - _budget.HIT_RATE_HISTORY:+.3f}"
+    )
+
+
 def _summarize_shards(work: Path, source: str, log) -> dict:
     """汇总本轮各分片的状态，并**把失败暴露出来**（用户 2026-11-17 要求）。
 
@@ -1433,7 +1473,9 @@ def _summarize_shards(work: Path, source: str, log) -> dict:
     """
     import json as _json
 
-    stats = {"total": 0, "withItems": 0, "empty": 0, "failed": 0, "details": []}
+    stats = {"total": 0, "withItems": 0, "empty": 0, "failed": 0, "details": [],
+             "ocrHitRates": [], "ocrCacheHit": 0, "ocrCacheMiss": 0,
+             "ocrEffectiveSecs": [], "plannedImages": 0}
     for path in Path(work).rglob(f"shard_{source}_*.json"):
         try:
             data = _json.loads(path.read_text(encoding="utf-8"))
@@ -1452,6 +1494,27 @@ def _summarize_shards(work: Path, source: str, log) -> dict:
             stats["withItems"] += 1
             kind = "ok"
         stats["details"].append({"shard": data.get("shard"), "picked": picked, "exitCode": code, "kind": kind})
+        # A'' 命中率汇总（只统计有上报的片）
+        if "ocrHitRate" in data:
+            stats["ocrHitRates"].append(float(data.get("ocrHitRate") or 0))
+            stats["ocrCacheHit"] += int(data.get("ocrCacheHit") or 0)
+            stats["ocrCacheMiss"] += int(data.get("ocrCacheMiss") or 0)
+            stats["plannedImages"] += int(data.get("plannedImages") or 0)
+            if data.get("ocrEffectiveSec"):
+                stats["ocrEffectiveSecs"].append(float(data["ocrEffectiveSec"]))
+
+    if stats["ocrHitRates"]:
+        hrs = sorted(stats["ocrHitRates"])
+        stats["ocrHitRateMedian"] = hrs[len(hrs) // 2]
+        stats["ocrCacheHitTotal"] = stats["ocrCacheHit"]
+        stats["ocrCacheMissTotal"] = stats["ocrCacheMiss"]
+        log(
+            f"[分片汇总] {source}：缓存命中 {stats['ocrCacheHit']} / 计划 {stats['plannedImages']}"
+            f"（各片中位 {stats['ocrHitRateMedian'] * 100:.0f}%）；"
+            f"有效秒/次中位 {sorted(stats['ocrEffectiveSecs'])[len(stats['ocrEffectiveSecs']) // 2]:.3f}"
+            if stats["ocrEffectiveSecs"] else
+            f"[分片汇总] {source}：缓存命中 {stats['ocrCacheHit']} / 计划 {stats['plannedImages']}"
+        )
 
     if stats["total"]:
         rate = stats["failed"] / stats["total"]
@@ -1550,6 +1613,8 @@ def do_shard(args) -> int:
         cached = _budget.count_cached_ocr(cache_dir) if cache_dir else 0
         cpu = _budget.read_cpu_model_name()
         budget_est = _budget.estimate_effective_seconds(cpu, cached, total_imgs)
+        budget_est["cached"] = cached
+        budget_est["total_images"] = total_imgs
         shard_to, merge_to = _budget.timeouts_from_env()
         budget_dec = _budget.decide_transfer(
             total_imgs, budget_est["effective"],
@@ -1690,6 +1755,16 @@ def do_shard(args) -> int:
             "pickedItems": sink.get("picked", 0),
             "exitCode": code,
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            # A'' 命中率上报（供 merge 写进 run_meta，校准 HIT_RATE_HISTORY）
+            "ocrCacheHit": budget_est.get("cached", 0),
+            "ocrCacheMiss": max(0, budget_est.get("total_images", 0) - budget_est.get("cached", 0)),
+            "ocrHitRate": round(budget_est.get("hit_rate", 0.0), 4),
+            "ocrEffectiveSec": round(budget_est.get("effective", 0.0), 4),
+            "ocrMissCostSec": round(budget_est.get("miss_cost", 0.0), 4),
+            "ocrE2eSec": round(budget_est.get("e2e_history", 0.0), 4),
+            "budgetTransfer": budget_dec.get("transfer", 0),
+            "budgetShortfall": budget_dec.get("shortfall", 0),
+            "plannedImages": budget_est.get("total_images", 0),
             "diag": {
                 "cpuModel": cpu_model,
                 "runSeconds": run_seconds,
@@ -1840,6 +1915,7 @@ def do_merge_summary(args) -> int:
 
     # ---------- ② 解 artifact ----------
     shard_posts, shard_metas, ocr_rows, list_order, image_members = _extract_shard_artifacts(work, source, log)
+    _shard_stats = _summarize_shards(work, source, log) or {}
     if not shard_metas:
         raise SystemExit("[merge-summary] ❌ 没有 run_meta.json 可作模板")
 
@@ -2033,6 +2109,7 @@ def do_merge_summary(args) -> int:
     meta["textReportKnownDiff"] = known_diff
     meta["durationSec"] = round(_time.time() - started, 2)
     meta["rebuildDurationSec"] = round(rebuild_sec, 2)
+    _annotate_hit_rate(out_dir, meta, _shard_stats, log)
     _guard.save_json(out_dir / "run_meta.json", meta)
     log(f"[merge-summary] 已知差异标注：{known_diff}")
 
@@ -2082,8 +2159,9 @@ def do_run(args, mode: str = "run") -> int:
     collect_started = time.time()          # 时间对齐基准：只对账"采集前已存在"的帖子
 
     # ---- 分片状态汇总 + 告警（continue-on-error 之后必须让失败可见）----
+    shard_stats: dict = {}
     if mode == "merge":
-        _summarize_shards(work, source, log)
+        shard_stats = _summarize_shards(work, source, log) or {}
 
     # ---- merge 侧补抓：分片因 CPU 慢/预算到点而留下的 unfinished 清单 ----
     if mode == "merge":
@@ -2124,6 +2202,10 @@ def do_run(args, mode: str = "run") -> int:
     out_dir = _find_period_dir(work, out_root, source, period=period)
     log(f"[{mode}] 产物目录：{out_dir}")
     meta, posts = _reconcile.load_products(out_dir)
+
+    # A'' 命中率写进 run_meta（用户 2026-11-19 条件②：供下一轮校准 HIT_RATE_HISTORY）
+    if mode == "merge":
+        _annotate_hit_rate(out_dir, meta, shard_stats, log)
     got_period = int(meta.get("period") or 0)
     if not period:
         period = got_period
