@@ -1213,163 +1213,6 @@ def _ocr_micro_benchmark(out_root: Path, limit: int = 3) -> dict:
 
 
 #: 探针结果缓存（同进程只测一次）
-_CPU_PROBE_CACHE: float | None = None
-
-#: 「探针值」→「预算用秒/次」的换算系数。
-#:
-#: ## 为什么是 1.0（2026-11-19 run 44358492008 的 20 片实测推翻了 2.34）
-#:   AMD EPYC 7763（5 片）：探针 0.450，真实 1.018-1.275 → 比值 2.26-2.83（探针低估）
-#:   AMD EPYC 9V74（3 片）：探针 0.484，真实 0.846-1.144 → 比值 1.75-2.36（探针低估）
-#:   Intel 6975P-C（11 片）：探针 1.522-1.620（**真实图兜底**），真实 0.541-1.186
-#:                          → 比值 0.35-0.74（**探针高估 1.4-2.9 倍**）
-#:
-#: 结论：系数**不能统一**——AMD 需要 ×2.3，Intel 需要 ×0.6。
-#: 统一乘 2.34 会让 Intel 机器高估 4.2 倍 → 全部误触发 unfinished 转移 → merge 单点被拖死。
-#: 所以系数回退 1.0；正确做法是「CPU 表直接用实测端到端秒/次」（见 RUNNER_CPU_E2E_SECONDS），
-#: 而不是「纯 OCR × 固定系数」。
-END_TO_END_FACTOR: float = 1.0   # ⚠ 2026-11-19 回退：见下方注释
-
-#: GitHub runner 池的 CPU → 纯 OCR 秒/张（2026-11-17/18 多轮实测）
-#: GitHub runner 池 CPU → **端到端秒/次**（2026-11-19 run 44358492008 的 20 片实测中位）
-#: 与 [diag] 的「秒/次」同量纲 → 直接作预算输入（已含缓存命中影响）
-RUNNER_CPU_E2E_SECONDS: dict[str, float] = {
-    "AMD EPYC 7763": 1.040,
-    "AMD EPYC 9V74": 0.960,
-    "Intel Xeon 6975P-C": 0.950,
-    "AMD EPYC 9V45": 1.000,
-    "Intel Xeon 8370C": 1.200,
-}
-#: 未知 CPU 的保守端到端值（慢机上限量级）
-UNKNOWN_CPU_E2E_SECONDS: float = 1.500
-
-CPU_OCR_SECONDS: dict[str, float] = {
-    "AMD EPYC 9V45": 0.371,
-    "AMD EPYC 7763": 0.450,      # 实测 0.408-0.647，取中位
-    "AMD EPYC 9V74": 0.484,
-    "Intel Xeon 8370C": 0.597,
-    "Intel Xeon 6975P-C": 1.500,  # 实测 1.152-1.95，取中位
-}
-
-
-def _read_cpu_model_name() -> str:
-    """读本机 CPU 型号名（Linux 读 /proc/cpuinfo；Windows 用 platform 兜底）。"""
-    try:
-        info = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
-        for line in info.splitlines():
-            if line.lower().startswith("model name"):
-                return line.split(":", 1)[-1].strip()
-    except OSError:
-        pass
-    try:
-        import platform
-
-        return platform.processor() or platform.machine() or "unknown"
-    except Exception:  # noqa: BLE001
-        return "unknown"
-
-
-def _normalize_cpu_name(raw: str) -> str:
-    """归一化 CPU 型号名：去 (R)/(TM)/双空格，便于与表做子串匹配。
-
-    实测坑（2026-11-19）：`/proc/cpuinfo` 给 "Intel(R) Xeon(R) 6975P-C"，
-    而表里写 "Intel Xeon 6975P-C" → 直接 `in` 匹配失败 → 白白走兜底探针。
-    """
-    t = str(raw or "").replace("(R)", " ").replace("(TM)", " ").replace("(tm)", " ")
-    t = t.replace("CPU ", " ").replace("Processor", " ")
-    return " ".join(t.split())
-
-
-def _cpu_ocr_probe() -> float:
-    """测本机 pure-OCR 秒/张（用于按预算切片）。
-
-    ## 为什么不再用合成图（2026-11-18 实测核实）
-    合成图（cv2 画黑条 / putText）OCR 后 `rows=0 / items=0` —— rec 阶段几乎不耗时，
-    测出来的秒数只反映 det + 开销：云端实测探针 0.191 秒/张，而真实 0.909 秒/张（低估 4.8 倍）。
-    后果：软预算误判「在预算内，全部自己处理」→ 分片跑 22.8 分钟。
-
-    ## 现在的方案
-    ① CPU 型号映射（GitHub runner 池 CPU 可枚举，历史实测值可靠）
-    ② 未知型号 → 仓库自带真实图探针（cloud/probe/*.jpg，200-500 KB 典型图）
-    ③ 都没有 → 保守值 1.0 秒/张（宁可低估预算、触发转移，也不要超时）
-    """
-    global _CPU_PROBE_CACHE
-    if _CPU_PROBE_CACHE is not None:
-        return _CPU_PROBE_CACHE
-
-    cpu = _read_cpu_model_name()
-    norm = _normalize_cpu_name(cpu)
-    for model, sec in RUNNER_CPU_E2E_SECONDS.items():
-        if _normalize_cpu_name(model) in norm:
-            _CPU_PROBE_CACHE = float(sec)
-            log(f"[shard] CPU 型号 {cpu} → 端到端 {sec:.3f} 秒/次（20 片实测表中位）")
-            return _CPU_PROBE_CACHE
-
-    # 兜底①：仓库自带真实图
-    probe_dir = Path(__file__).parent / "probe"
-    probes = sorted(probe_dir.glob("*.jpg"))[:3] if probe_dir.exists() else []
-    if probes:
-        try:
-            import tempfile
-
-            from core import ocr as ocr_mod
-
-            analyze = getattr(ocr_mod, "analyze_image", None)
-            if analyze is not None:
-                cache_dir = Path(tempfile.mkdtemp(prefix="cpuprobe-")) / "cache"
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                analyze(str(probes[0]), 0, str(cache_dir), force=True)      # 预热（含模型加载）
-                times: list[float] = []
-                for pr in probes:
-                    t0 = time.perf_counter()
-                    res = analyze(str(pr), 0, str(cache_dir), force=True)
-                    dt = time.perf_counter() - t0
-                    # ⚠ analyze_image 返回的是 rowCount / fullText，**没有 rows/items**
-                    # （rows/items 是缓存 payload 的键，不是分析结果的键）
-                    rc = int((res or {}).get("rowCount") or 0)
-                    ft = str((res or {}).get("fullText") or "")
-                    if rc <= 0 or not ft.strip():
-                        log(f"[shard] ⚠ 探针图 {pr.name} 无文字（rowCount={rc}），跳过")
-                        continue
-                    times.append(dt)
-                if times:
-                    times.sort()
-                    median = times[len(times) // 2]
-                    _CPU_PROBE_CACHE = round(median * END_TO_END_FACTOR, 4)
-                    log(f"[shard] 未知 CPU {cpu} → 真实图探针 {median:.3f} 秒/张 × "
-                        f"{END_TO_END_FACTOR}（端到端系数）= {_CPU_PROBE_CACHE:.3f} 秒/次"
-                        f"（{len(times)} 张中位）")
-                    return _CPU_PROBE_CACHE
-        except Exception as exc:  # noqa: BLE001 - 探针失败不阻断
-            log(f"[shard] ⚠ 真实图探针失败（{type(exc).__name__}: {exc}），改用保守值")
-
-    _CPU_PROBE_CACHE = round(1.5 * END_TO_END_FACTOR, 4)
-    log(f"[shard] ⚠ 未知 CPU {cpu} 且无有效探针图 → 慢机下限 1.5 × {END_TO_END_FACTOR}"
-        f" = {_CPU_PROBE_CACHE:.3f} 秒/次（宁可过度转移 unfinished，也不超时）")
-    return _CPU_PROBE_CACHE
-
-def _pick_within_budget(ids: list[int], cost: dict, per_image_seconds: float, budget_seconds: float) -> tuple[list[int], list[int]]:
-    """按预算挑出本机要处理的帖子，其余留给 merge。
-
-    cost: {articleId: 预计图片数}（来自 plan 的 postCost）
-    估算：每帖耗时 ≈ 图片数 × 本机秒/张；另留 60s 固定开销（启动/扫描/收尾）。
-    """
-    if per_image_seconds <= 0 or budget_seconds <= 0 or not ids:
-        return list(ids), []
-    usable = max(0.0, budget_seconds - 60.0)
-    taken: list[int] = []
-    rest: list[int] = []
-    acc = 0.0
-    # 先按代价从小到大装，尽量多装（同片内顺序不影响正确性）
-    for aid in sorted(ids, key=lambda x: cost.get(x, 1)):
-        est = max(1, cost.get(aid, 1)) * per_image_seconds
-        if acc + est > usable:
-            rest.append(aid)
-            continue
-        acc += est
-        taken.append(aid)
-    return taken, rest
-
-
 def _collect_unfinished(work: Path, source: str, log) -> list[int]:
     """收集本源的 unfinished 清单（分片因预算到点留下的未处理帖子）。
 
@@ -1687,46 +1530,78 @@ def do_shard(args) -> int:
         f"（{'plan 均衡分组' if planned_ids is not None else f'id % {shard_total} == {shard_index}'}）"
     )
 
-    # ---- 按本机 CPU 速度决定「这一片能干多少」，超预算的交给 merge（用户 2026-11-17 方案）----
+    # ---- A'' 预算：命中率 → 有效秒/次 → 转移决策（2026-11-19 用户裁决）----
+    # 容量用「job timeout × 0.9」而不是软预算：分片能吃满 22.5 分钟（旧逻辑只有 18 分钟），
+    # 且 22.5 < 25 的硬超时 → 永不被 kill（被 kill 时 unfinished 就写不出来了）。
     rest_ids: list[int] = []
+    budget_est: dict = {}
+    budget_dec: dict = {}
     if planned_ids:
+        from . import budget as _budget
+
         post_cost = (plan.get("postCost") or {})
-        cost = {}
+        cost: dict[int, int] = {}
         for aid in planned_ids:
             info = post_cost.get(str(aid)) or {}
             cost[aid] = int(info.get("count") or 1) if isinstance(info, dict) else 1
-        probe = _cpu_ocr_probe()
-        budget = float(os.environ.get("LIUHE_SHARD_SOFT_BUDGET", "900"))
-        if probe > 0:
-            taken, rest_ids = _pick_within_budget(sorted(planned_ids), cost, probe, budget)
-            total_imgs = sum(cost.values())
-            est_all = total_imgs * probe
-            log(
-                f"[shard] 本机 OCR 探针 {probe:.3f} 秒/张；本片 {len(planned_ids)} 帖 / {total_imgs} 图，"
-                f"全干预估 {est_all/60:.1f} 分；预算 {budget/60:.1f} 分"
+        total_imgs = sum(cost.values())
+
+        cache_dir = _find_ocr_cache_dir(work, out_root)
+        cached = _budget.count_cached_ocr(cache_dir) if cache_dir else 0
+        cpu = _budget.read_cpu_model_name()
+        budget_est = _budget.estimate_effective_seconds(cpu, cached, total_imgs)
+        shard_to, merge_to = _budget.timeouts_from_env()
+        budget_dec = _budget.decide_transfer(
+            total_imgs, budget_est["effective"],
+            shard_timeout_s=shard_to, merge_timeout_s=merge_to,
+        )
+        ratio = _budget.USABLE_RATIO
+        log(
+            f"[shard] 本片 {total_imgs} 图，缓存命中 {cached}"
+            f"（{budget_est['hit_rate'] * 100:.0f}%），"
+            f"有效 {budget_est['effective']:.3f} 秒/次，"
+            f"估算 {total_imgs * budget_est['effective'] / 60:.1f} 分钟"
+            f"（分片上限 {shard_to * ratio / 60:.1f} / merge 上限 {merge_to * ratio / 60:.1f} 分）"
+        )
+        log(
+            f"[shard] CPU {cpu}（{'命中表' if budget_est['cpu_hit'] else '未命中表→保守值'}）"
+            f" E2E={budget_est['e2e_history']:.3f} 秒/次，反推未命中成本 {budget_est['miss_cost']:.3f} 秒/次"
+        )
+
+        if budget_dec["transfer"] > 0:
+            # 与 decide_transfer 的 capacity 口径对齐：_pick_within_budget 内部有 usable = budget - 60
+            taken, rest_ids = _pick_within_budget(
+                sorted(planned_ids), cost, budget_est["effective"],
+                budget_seconds=budget_dec["shard_capacity"] * budget_est["effective"] + 60.0,
             )
-            if rest_ids:
-                log(
-                    f"[shard] ⏱ 预算内只能处理 {len(taken)} 帖，"
-                    f"剩余 {len(rest_ids)} 帖写入 unfinished_{source}_{shard_index}.json 交 merge 补抓"
-                )
-                _guard.save_json(
-                    work / "unfinished" / f"unfinished_{source}_{shard_index}.json",
-                    {
-                        "source": source,
-                        "shard": shard_index,
-                        "ids": rest_ids,
-                        "reason": f"本机 OCR {probe:.3f} 秒/张，超出 {budget:.0f}s 预算",
-                        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    },
-                )
-                planned_ids = set(taken)
-                # 重新打补丁（用缩小后的集合）
-                for mod, name, original in (originals or []):
-                    setattr(mod, name, original)
-                originals = _patch_shard(source, shard_index, shard_total, sink, planned_ids=planned_ids, mine_users=mine_users)
-            else:
-                log(f"[shard] 本片工作量在预算内，全部自己处理")
+            log(
+                f"[shard] ⏱ 分片容量内只能处理 {len(taken)} 帖（{budget_dec['shard_capacity']} 图），"
+                f"剩余 {len(rest_ids)} 帖写入 unfinished_{source}_{shard_index}.json 交 merge 补抓"
+            )
+            _guard.save_json(
+                work / "unfinished" / f"unfinished_{source}_{shard_index}.json",
+                {
+                    "source": source,
+                    "shard": shard_index,
+                    "ids": rest_ids,
+                    "reason": (
+                        f"有效 {budget_est['effective']:.3f} 秒/次（命中率 "
+                        f"{budget_est['hit_rate'] * 100:.0f}%），超出分片容量 "
+                        f"{budget_dec['shard_capacity']} 图"
+                    ),
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            )
+            planned_ids = set(taken)
+            for mod, name, original in (originals or []):
+                setattr(mod, name, original)
+            originals = _patch_shard(source, shard_index, shard_total, sink, planned_ids=planned_ids, mine_users=mine_users)
+        else:
+            log("[shard] 本片工作量在分片容量内，全部自己处理")
+
+        if budget_dec["shortfall"] > 0:
+            log(f"[shard] ⚠ {budget_dec['reason']}")
+            log("[shard] ⚠ 建议：提高缓存命中率（连续跑同期限）> 增加分片数（付费）> 冷启动轮单独放宽时限（需批准）")
 
     argv = ["--out", str(out_root), "--period", str(period)]
     if args.workers:

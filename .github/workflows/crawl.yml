@@ -234,8 +234,8 @@ jobs:
     # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 18 分钟；
     # runner 内部还有 16 分钟「软超时」：到点把剩余帖子写 unfinished_*.json 后正常退出，
     # 剩余工作交给 merge 补抓（见 runner.py 的 watchdog）。
-    # 硬超时 25（用户表：软超时 18 由 runner 的 LIUHE_SHARD_SOFT_BUDGET 实现，
-    # 到点把剩余帖写 unfinished 交 merge 补抓）
+    # 硬超时 25。分片容量由 runner 的 cloud/budget.py 按「本 job timeout × 0.9」算
+    # （= 22.5 分钟，永不被 kill）；装不下的帖写 unfinished 交 merge 补抓。
     timeout-minutes: 25
     # 分片只是「预热缓存」，**正确性由 merge 的全量重采 + 五道防线保证**。
     # 2026-11-17 事故：跨期时若干分片报「没有 X 期的帖子」→ 整个 run 变 failure → publish 被跳过，
@@ -329,9 +329,6 @@ jobs:
         env:
           NO_OCR: ${{ github.event.inputs.no_ocr || 'false' }}
           NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
-          # 软超时 18 分（用户表）：到点把剩余帖写 unfinished_*.json 正常退出，
-          # 剩余工作交 merge 补抓（硬超时由 job 的 timeout-minutes: 25 兜底）
-          LIUHE_SHARD_SOFT_BUDGET: "1080"
         run: |
           set -o pipefail
           EXTRA=""
@@ -421,8 +418,8 @@ jobs:
     # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 18 分钟；
     # runner 内部还有 16 分钟「软超时」：到点把剩余帖子写 unfinished_*.json 后正常退出，
     # 剩余工作交给 merge 补抓（见 runner.py 的 watchdog）。
-    # 硬超时 25（用户表：软超时 18 由 runner 的 LIUHE_SHARD_SOFT_BUDGET 实现，
-    # 到点把剩余帖写 unfinished 交 merge 补抓）
+    # 硬超时 25。分片容量由 runner 的 cloud/budget.py 按「本 job timeout × 0.9」算
+    # （= 22.5 分钟，永不被 kill）；装不下的帖写 unfinished 交 merge 补抓。
     timeout-minutes: 25
     # 分片只是「预热缓存」，**正确性由 merge 的全量重采 + 五道防线保证**。
     # 2026-11-17 事故：跨期时若干分片报「没有 X 期的帖子」→ 整个 run 变 failure → publish 被跳过，
@@ -516,9 +513,6 @@ jobs:
         env:
           NO_OCR: ${{ github.event.inputs.no_ocr || 'false' }}
           NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
-          # 软超时 18 分（用户表）：到点把剩余帖写 unfinished_*.json 正常退出，
-          # 剩余工作交 merge 补抓（硬超时由 job 的 timeout-minutes: 25 兜底）
-          LIUHE_SHARD_SOFT_BUDGET: "1080"
         run: |
           set -o pipefail
           EXTRA=""
@@ -608,8 +602,8 @@ jobs:
     # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 18 分钟；
     # runner 内部还有 16 分钟「软超时」：到点把剩余帖子写 unfinished_*.json 后正常退出，
     # 剩余工作交给 merge 补抓（见 runner.py 的 watchdog）。
-    # 硬超时 25（用户表：软超时 18 由 runner 的 LIUHE_SHARD_SOFT_BUDGET 实现，
-    # 到点把剩余帖写 unfinished 交 merge 补抓）
+    # 硬超时 25。分片容量由 runner 的 cloud/budget.py 按「本 job timeout × 0.9」算
+    # （= 22.5 分钟，永不被 kill）；装不下的帖写 unfinished 交 merge 补抓。
     timeout-minutes: 25
     # 分片只是「预热缓存」，**正确性由 merge 的全量重采 + 五道防线保证**。
     # 2026-11-17 事故：跨期时若干分片报「没有 X 期的帖子」→ 整个 run 变 failure → publish 被跳过，
@@ -703,9 +697,6 @@ jobs:
         env:
           NO_OCR: ${{ github.event.inputs.no_ocr || 'false' }}
           NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
-          # 软超时 18 分（用户表）：到点把剩余帖写 unfinished_*.json 正常退出，
-          # 剩余工作交 merge 补抓（硬超时由 job 的 timeout-minutes: 25 兜底）
-          LIUHE_SHARD_SOFT_BUDGET: "1080"
         run: |
           set -o pipefail
           EXTRA=""

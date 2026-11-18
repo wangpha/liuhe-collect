@@ -58,6 +58,23 @@ RUNNER_CPU_E2E_SECONDS: dict[str, float] = {
 UNKNOWN_CPU_E2E_SECONDS: float = 1.500
 
 
+def read_cpu_model_name() -> str:
+    """读本机 CPU 型号名（Linux 读 /proc/cpuinfo；Windows 用 platform 兜底）。"""
+    try:
+        info = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
+        for line in info.splitlines():
+            if line.lower().startswith("model name"):
+                return line.split(":", 1)[-1].strip()
+    except OSError:
+        pass
+    try:
+        import platform
+
+        return platform.processor() or platform.machine() or "unknown"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 def normalize_cpu_name(raw: str) -> str:
     """归一化 CPU 型号名，便于与表做子串匹配。
 
