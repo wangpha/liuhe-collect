@@ -1177,16 +1177,25 @@ jobs:
           START=$(date +%s)
           while true; do
             ELAPSED=$(( ($(date +%s) - START) / 60 ))
-            echo "=== 已跑 ${ELAPSED} 分钟（上限 ${MAX_MIN}）==="
-            gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs"               --jq '.jobs[] | select(.status=="in_progress") | "  \(.name): \(.started_at)"' || true
+
+            # 【关键】先检查业务是否已全部完成：完成就正常退出，绝不 cancel
+            # 否则会空转到 MAX_MIN 然后 cancel 掉正在等 publish 的整轮（2026-11-18 事故）
+            PENDING=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+              --jq '[.jobs[] | select(.name != "Watchdog 整轮 40 分钟上限") | select(.status != "completed")] | length' 2>/dev/null || echo "99")
+            echo "=== 已跑 ${ELAPSED} 分钟（上限 ${MAX_MIN}）；未完成 job 数 ${PENDING} ==="
+            if [ "$PENDING" = "0" ]; then
+              echo "✅ 所有业务 job 已完成（${ELAPSED} 分钟），watchdog 正常退出（不取消）"
+              exit 0
+            fi
             if [ "$ELAPSED" -ge "$MAX_MIN" ]; then
-              echo "::error::整轮超过 ${MAX_MIN} 分钟，开始诊断并取消"
+              echo "::error::整轮超过 ${MAX_MIN} 分钟且仍有 ${PENDING} 个 job 未完成，开始诊断并取消"
               {
                 echo "## 整轮超时诊断（${MAX_MIN} 分钟）"
                 echo ""
                 echo "| job | 状态 | 开始时间 |"
                 echo "|---|---|---|"
-                gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs"                   --jq '.jobs[] | "| \(.name) | \(.status) | \(.started_at) |"' || true
+                gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+                  --jq '.jobs[] | "| \(.name) | \(.status) | \(.started_at) |"' || true
               } >> "$GITHUB_STEP_SUMMARY"
               gh run cancel "${{ github.run_id }}" --repo "${{ github.repository }}" || true
               exit 1
