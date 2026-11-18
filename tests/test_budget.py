@@ -174,3 +174,22 @@ def test_hit_rate_history_constant_is_documented():
     assert "PENDING" in doc, "docstring 必须标注 HIT_RATE_HISTORY 是待校准假设"
     assert "循环依赖" in doc, "docstring 必须说明循环依赖"
     assert HIT_RATE_HISTORY == pytest.approx(0.74)
+
+# ============================================================
+# ⑥ 跨目录去重统计（2026-11-19 假 0% bug 的回归测试）
+# ============================================================
+def test_count_cached_ocr_unique_across_dirs(tmp_path: Path):
+    """两个目录 + 同名文件 → 只算一次（按文件名去重）。"""
+    from cloud.budget import count_cached_ocr_unique
+
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    (a / "ocr").mkdir(parents=True)
+    (b / "ocr").mkdir(parents=True)
+    (a / "ocr" / "s1.json").write_text("{}", encoding="utf-8")
+    (a / "ocr" / "s2.json").write_text("{}", encoding="utf-8")
+    (b / "ocr" / "s2.json").write_text("{}", encoding="utf-8")   # 重复
+    (b / "ocr" / "s3.json").write_text("{}", encoding="utf-8")
+    assert count_cached_ocr_unique([a, b]) == 3
+    assert count_cached_ocr_unique([]) == 0
+    assert count_cached_ocr_unique([None, tmp_path / "nope"]) == 0

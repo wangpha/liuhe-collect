@@ -1654,8 +1654,13 @@ def do_shard(args) -> int:
             cost[aid] = int(info.get("count") or 1) if isinstance(info, dict) else 1
         total_imgs = sum(cost.values())
 
+        # 缓存可能分布在两处（见 budget.count_cached_ocr_unique 的说明）：
+        #   ① work/out/**/.cache（workflow 铺回，可能为空）
+        #   ② work/ocr-cache（actions/cache 层2 直接恢复，一定有货）
         cache_dir = _find_ocr_cache_dir(work, out_root)
-        cached = _budget.count_cached_ocr(cache_dir) if cache_dir else 0
+        cached = _budget.count_cached_ocr_unique(
+            [cache_dir, work / "ocr-cache"] if cache_dir else [work / "ocr-cache"]
+        )
         cpu = _budget.read_cpu_model_name()
         budget_est = _budget.estimate_effective_seconds(cpu, cached, total_imgs)
         budget_est["cached"] = cached

@@ -109,6 +109,33 @@ def count_cached_ocr(cache_dir: Path | str) -> int:
     return sum(1 for p in ocr_dir.glob("*.json") if p.is_file())
 
 
+def count_cached_ocr_unique(cache_dirs: list[Path | str]) -> int:
+    """跨多个目录统计 OCR 缓存**唯一**条目数（按文件名去重）。
+
+    ## 为什么必须跨目录（2026-11-19 run 44385229471 实测 bug）
+    分片启动时缓存可能在两处：
+      ① `work/out/**/.cache/ocr/`  —— workflow 的「铺回」把它拷进来
+         但铺回只遍历**已存在的** `.cache` 目录（`find work/out -type d -name .cache`），
+         新容器里 work/out 下没有 .cache → 一个都没铺 → 这处为空
+      ② `work/ocr-cache/ocr/`      —— actions/cache 层2 直接恢复到这里，**一定有货**
+    只数 ① 会得到假的 0%（实测：模型有效 3.64 秒/次，而真实只要 0.87-2.55 秒/次，
+    证明有大量命中）。所以两个位置都要数。
+
+    OCR 缓存文件名就是图片 sha256 → 按文件名天然去重。
+    """
+    names: set[str] = set()
+    for d in cache_dirs or []:
+        if not d:
+            continue
+        ocr_dir = Path(d) / "ocr"
+        if not ocr_dir.exists():
+            continue
+        for p in ocr_dir.glob("*.json"):
+            if p.is_file():
+                names.add(p.name)
+    return len(names)
+
+
 def _resolve_e2e(cpu_model: str, e2e_table: dict[str, float] | None,
                  unknown_e2e: float | None) -> tuple[float, bool, str]:
     table = RUNNER_CPU_E2E_SECONDS if e2e_table is None else e2e_table
