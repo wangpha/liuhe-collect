@@ -1215,13 +1215,33 @@ def _ocr_micro_benchmark(out_root: Path, limit: int = 3) -> dict:
 #: 探针结果缓存（同进程只测一次）
 _CPU_PROBE_CACHE: float | None = None
 
-#: 「纯 OCR 探针值」→「端到端秒/次」的换算系数（2026-11-19 run 44358492008 实测）
-#: 8 片 AMD 机器的「真实秒/次 ÷ 探针值」= 1.75 / 2.26 / 2.32 / 2.34 / 2.36 / 2.67 / 2.83 / 1.99
-#: → 取中位 2.34。含义：探针测纯 OCR（det+rec），diag 的秒/次还含缓存查找/解码/调度。
-#: ⚠ 仅由 AMD 样本标定；Intel Xeon 6975P-C（1.5）的换算值待复核。
-END_TO_END_FACTOR: float = 2.34
+#: 「探针值」→「预算用秒/次」的换算系数。
+#:
+#: ## 为什么是 1.0（2026-11-19 run 44358492008 的 20 片实测推翻了 2.34）
+#:   AMD EPYC 7763（5 片）：探针 0.450，真实 1.018-1.275 → 比值 2.26-2.83（探针低估）
+#:   AMD EPYC 9V74（3 片）：探针 0.484，真实 0.846-1.144 → 比值 1.75-2.36（探针低估）
+#:   Intel 6975P-C（11 片）：探针 1.522-1.620（**真实图兜底**），真实 0.541-1.186
+#:                          → 比值 0.35-0.74（**探针高估 1.4-2.9 倍**）
+#:
+#: 结论：系数**不能统一**——AMD 需要 ×2.3，Intel 需要 ×0.6。
+#: 统一乘 2.34 会让 Intel 机器高估 4.2 倍 → 全部误触发 unfinished 转移 → merge 单点被拖死。
+#: 所以系数回退 1.0；正确做法是「CPU 表直接用实测端到端秒/次」（见 RUNNER_CPU_E2E_SECONDS），
+#: 而不是「纯 OCR × 固定系数」。
+END_TO_END_FACTOR: float = 1.0   # ⚠ 2026-11-19 回退：见下方注释
 
 #: GitHub runner 池的 CPU → 纯 OCR 秒/张（2026-11-17/18 多轮实测）
+#: GitHub runner 池 CPU → **端到端秒/次**（2026-11-19 run 44358492008 的 20 片实测中位）
+#: 与 [diag] 的「秒/次」同量纲 → 直接作预算输入（已含缓存命中影响）
+RUNNER_CPU_E2E_SECONDS: dict[str, float] = {
+    "AMD EPYC 7763": 1.040,
+    "AMD EPYC 9V74": 0.960,
+    "Intel Xeon 6975P-C": 0.950,
+    "AMD EPYC 9V45": 1.000,
+    "Intel Xeon 8370C": 1.200,
+}
+#: 未知 CPU 的保守端到端值（慢机上限量级）
+UNKNOWN_CPU_E2E_SECONDS: float = 1.500
+
 CPU_OCR_SECONDS: dict[str, float] = {
     "AMD EPYC 9V45": 0.371,
     "AMD EPYC 7763": 0.450,      # 实测 0.408-0.647，取中位
@@ -1248,6 +1268,17 @@ def _read_cpu_model_name() -> str:
         return "unknown"
 
 
+def _normalize_cpu_name(raw: str) -> str:
+    """归一化 CPU 型号名：去 (R)/(TM)/双空格，便于与表做子串匹配。
+
+    实测坑（2026-11-19）：`/proc/cpuinfo` 给 "Intel(R) Xeon(R) 6975P-C"，
+    而表里写 "Intel Xeon 6975P-C" → 直接 `in` 匹配失败 → 白白走兜底探针。
+    """
+    t = str(raw or "").replace("(R)", " ").replace("(TM)", " ").replace("(tm)", " ")
+    t = t.replace("CPU ", " ").replace("Processor", " ")
+    return " ".join(t.split())
+
+
 def _cpu_ocr_probe() -> float:
     """测本机 pure-OCR 秒/张（用于按预算切片）。
 
@@ -1266,11 +1297,11 @@ def _cpu_ocr_probe() -> float:
         return _CPU_PROBE_CACHE
 
     cpu = _read_cpu_model_name()
-    for model, sec in CPU_OCR_SECONDS.items():
-        if model in cpu:
-            _CPU_PROBE_CACHE = round(float(sec) * END_TO_END_FACTOR, 4)
-            log(f"[shard] CPU 型号 {cpu} → 探针 {sec:.3f} 秒/张 × {END_TO_END_FACTOR}"
-                f"（端到端系数）= {_CPU_PROBE_CACHE:.3f} 秒/次")
+    norm = _normalize_cpu_name(cpu)
+    for model, sec in RUNNER_CPU_E2E_SECONDS.items():
+        if _normalize_cpu_name(model) in norm:
+            _CPU_PROBE_CACHE = float(sec)
+            log(f"[shard] CPU 型号 {cpu} → 端到端 {sec:.3f} 秒/次（20 片实测表中位）")
             return _CPU_PROBE_CACHE
 
     # 兜底①：仓库自带真实图
