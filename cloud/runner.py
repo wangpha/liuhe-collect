@@ -392,6 +392,13 @@ def _prefetch_post_costs(
                 body_count = len(urls)
                 for rep in reps:
                     urls += [u.strip() for u in str(rep.get("img") or "").split(",") if u.strip()]
+                    # #10（2026-11-18 修）：楼中楼 subList 里每条也有 img，必须统计，否则权重偏低
+                    for sub in (rep.get("subList") or []):
+                        urls += [
+                            u.strip()
+                            for u in str((sub or {}).get("img") or "").split(",")
+                            if u.strip()
+                        ]
                 return aid, {
                     "count": len(urls),
                     "detArea": sum(_det_input_area(u) for u in urls),
@@ -410,9 +417,16 @@ def _prefetch_post_costs(
                 body_count = len(urls)
                 for rep in reps:
                     urls += [u.strip() for u in str(rep.get("img") or "").split(",") if u.strip()]
+                    # #10 同类：楼中楼 subList 的 img 也要统计
+                    for sub in (rep.get("subList") or []):
+                        urls += [
+                            u.strip()
+                            for u in str((sub or {}).get("img") or "").split(",")
+                            if u.strip()
+                        ]
                 return aid, {
                     "count": len(urls),
-                    "detArea": 0,
+                    "detArea": sum(_det_input_area(u) for u in urls),
                     "bodyCount": body_count,
                     "replyCount": len(urls) - body_count,
                     **_post_content_hashes(tiezi, reps),
@@ -421,11 +435,13 @@ def _prefetch_post_costs(
                 from core import scraper
 
                 raw = scraper.api_get("/unite49/h5/article/detail", {"articleId": aid}, delay=0)
-                pics = (raw or {}).get("pictureList") or []
-                urls += [str((pic or {}).get("url") or "") for pic in pics if (pic or {}).get("url")]
+                # #9（2026-11-18 修）：pictureList 元素字段是 imageUrl/pictureUrl，**没有 url**，
+                # 直接取 pic["url"] 会全部为 None → 权重恒为 1（假均衡）。改用 core 的同一函数。
+                imgs = scraper.images_from_picture_list((raw or {}).get("pictureList") or [])
+                urls += [str(im.get("url") or "") for im in imgs if im.get("url")]
                 return aid, {
                     "count": len(urls),
-                    "detArea": 0,
+                    "detArea": sum(_det_input_area(u) for u in urls),
                     "bodyCount": len(urls),
                     "replyCount": 0,
                     **_post_content_hashes(raw or {}, []),

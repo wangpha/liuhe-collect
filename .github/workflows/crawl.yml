@@ -199,6 +199,14 @@ jobs:
           set -o pipefail
           python -m cloud.runner --plan --source "${{ matrix.source }}" \
             --work work --state work/store/state --period "${{ github.event.inputs.period || '0' }}" --slot "${{ github.event.inputs.slot || '' }}" 2>&1 | tee "work/plan_${{ matrix.source }}.log"
+      - name: 失败/超时诊断（写 Step Summary）
+        if: failure()
+        run: |
+          echo "## ⏱ 失败/超时诊断" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -30 work/plan_${{ matrix.source }}.log 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '\[详情\]|\[OCR\]|\[图片\]|\[plan\]|\[merge\]' work/plan_${{ matrix.source }}.log 2>/dev/null | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
       - name: 上传 plan
         uses: actions/upload-artifact@v4
         with:
@@ -349,6 +357,14 @@ jobs:
           else
             echo "未超阈值，图片保留在 artifact 里（merge 无需重下）"
           fi
+      - name: 失败/超时诊断（写 Step Summary）
+        if: failure()
+        run: |
+          echo "## ⏱ 失败/超时诊断" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -30 work/shard_dahkg_${{ matrix.shard }}.log 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '\[详情\]|\[OCR\]|\[图片\]|\[shard\]' work/shard_dahkg_${{ matrix.shard }}.log 2>/dev/null | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
       - name: 打包本片缓存
         if: always()
         working-directory: repo
@@ -511,6 +527,14 @@ jobs:
           else
             echo "未超阈值，图片保留在 artifact 里（merge 无需重下）"
           fi
+      - name: 失败/超时诊断（写 Step Summary）
+        if: failure()
+        run: |
+          echo "## ⏱ 失败/超时诊断" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -30 work/shard_aocai_${{ matrix.shard }}.log 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '\[详情\]|\[OCR\]|\[图片\]|\[shard\]' work/shard_aocai_${{ matrix.shard }}.log 2>/dev/null | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
       - name: 打包本片缓存
         if: always()
         working-directory: repo
@@ -673,6 +697,14 @@ jobs:
           else
             echo "未超阈值，图片保留在 artifact 里（merge 无需重下）"
           fi
+      - name: 失败/超时诊断（写 Step Summary）
+        if: failure()
+        run: |
+          echo "## ⏱ 失败/超时诊断" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -30 work/shard_tuku_${{ matrix.shard }}.log 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '\[详情\]|\[OCR\]|\[图片\]|\[shard\]' work/shard_tuku_${{ matrix.shard }}.log 2>/dev/null | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
       - name: 打包本片缓存
         if: always()
         working-directory: repo
@@ -794,6 +826,14 @@ jobs:
           [ "$LIMIT" != "0" ] && EXTRA="$EXTRA --limit $LIMIT"
           python -m cloud.runner --merge --source "dahkg" --work work --out work/out \
             --state work/store/state --workers 8 $EXTRA --period "${{ github.event.inputs.period || '0' }}" 2>&1 | tee "work/run_dahkg.log"
+      - name: 失败/超时诊断（写 Step Summary）
+        if: failure()
+        run: |
+          echo "## ⏱ 失败/超时诊断" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -30 work/run_dahkg.log 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '\[详情\]|\[OCR\]|\[图片\]|\[plan\]|\[merge\]' work/run_dahkg.log 2>/dev/null | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
       - name: 日志零错误审计（文档 6B.3 方式 1）
         if: always()
         working-directory: repo
@@ -931,6 +971,14 @@ jobs:
           [ "$LIMIT" != "0" ] && EXTRA="$EXTRA --limit $LIMIT"
           python -m cloud.runner --merge --source "aocai" --work work --out work/out \
             --state work/store/state --workers 8 $EXTRA --period "${{ github.event.inputs.period || '0' }}" 2>&1 | tee "work/run_aocai.log"
+      - name: 失败/超时诊断（写 Step Summary）
+        if: failure()
+        run: |
+          echo "## ⏱ 失败/超时诊断" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -30 work/run_aocai.log 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '\[详情\]|\[OCR\]|\[图片\]|\[plan\]|\[merge\]' work/run_aocai.log 2>/dev/null | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
       - name: 日志零错误审计（文档 6B.3 方式 1）
         if: always()
         working-directory: repo
@@ -1068,6 +1116,14 @@ jobs:
           [ "$LIMIT" != "0" ] && EXTRA="$EXTRA --limit $LIMIT"
           python -m cloud.runner --merge --source "tuku" --work work --out work/out \
             --state work/store/state --workers 8 $EXTRA --period "${{ github.event.inputs.period || '0' }}" 2>&1 | tee "work/run_tuku.log"
+      - name: 失败/超时诊断（写 Step Summary）
+        if: failure()
+        run: |
+          echo "## ⏱ 失败/超时诊断" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -30 work/run_tuku.log 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '\[详情\]|\[OCR\]|\[图片\]|\[plan\]|\[merge\]' work/run_tuku.log 2>/dev/null | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
       - name: 日志零错误审计（文档 6B.3 方式 1）
         if: always()
         working-directory: repo
@@ -1104,6 +1160,39 @@ jobs:
             repo/work/out
             !repo/work/out/**/images/**
           if-no-files-found: warn
+
+  # ---------------- 整轮 watchdog：40 分钟硬上限（超时自动诊断 + 取消） ----------------
+  watchdog:
+    name: "Watchdog 整轮 40 分钟上限"
+    needs: [plan]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: 整轮监控（40 分钟硬上限）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAX_MIN: "40"
+        run: |
+          START=$(date +%s)
+          while true; do
+            ELAPSED=$(( ($(date +%s) - START) / 60 ))
+            echo "=== 已跑 ${ELAPSED} 分钟（上限 ${MAX_MIN}）==="
+            gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs"               --jq '.jobs[] | select(.status=="in_progress") | "  \(.name): \(.started_at)"' || true
+            if [ "$ELAPSED" -ge "$MAX_MIN" ]; then
+              echo "::error::整轮超过 ${MAX_MIN} 分钟，开始诊断并取消"
+              {
+                echo "## 整轮超时诊断（${MAX_MIN} 分钟）"
+                echo ""
+                echo "| job | 状态 | 开始时间 |"
+                echo "|---|---|---|"
+                gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs"                   --jq '.jobs[] | "| \(.name) | \(.status) | \(.started_at) |"' || true
+              } >> "$GITHUB_STEP_SUMMARY"
+              gh run cancel "${{ github.run_id }}" --repo "${{ github.repository }}" || true
+              exit 1
+            fi
+            sleep 60
+          done
 
   # ---------------- Job 13：推送到私有数据仓 ----------------
   publish:
