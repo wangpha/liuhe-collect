@@ -41,11 +41,17 @@ def test_hit_rate_zero_returns_miss_cost():
     assert r["effective"] == pytest.approx(r["miss_cost"], rel=1e-9)
 
 
-def test_hit_rate_full_returns_hit_cost():
-    """hit_rate=1（全命中）→ effective 必须等于 HIT_COST。"""
+def test_hit_rate_full_is_capped_at_history():
+    """缓存 100% 覆盖时，命中率被封顶在历史实测值（不假设 100%）。
+
+    2026-11-19 变更：原先允许 hit_rate=1.0 → effective 塌到 HIT_COST
+    → 容量变无限（实测导致分片跑 24.6 分钟）。现在按「不乐观假设」封顶。
+    """
     r = estimate_effective_seconds("AMD EPYC 7763", 1000, 1000)
-    assert r["hit_rate"] == pytest.approx(1.0)
-    assert r["effective"] == pytest.approx(HIT_COST, rel=1e-6)
+    assert r["hit_rate"] == pytest.approx(HIT_RATE_HISTORY)
+    expect = r["miss_cost"] * (1 - HIT_RATE_HISTORY) + HIT_COST * HIT_RATE_HISTORY
+    assert r["effective"] == pytest.approx(expect, rel=1e-9)
+    assert r["effective"] > HIT_COST * 10, "不能塌到 hit_cost 附近"
 
 
 def test_hit_rate_half():
@@ -200,3 +206,22 @@ def test_count_cached_ocr_unique_across_dirs(tmp_path: Path):
     assert count_cached_ocr_unique([a, b]) == 3
     assert count_cached_ocr_unique([]) == 0
     assert count_cached_ocr_unique([None, tmp_path / "nope"]) == 0
+
+def test_hit_rate_capped_at_history():
+    """缓存远超本片需求时，命中率不得假设超过历史实测（防容量变成无限）。
+
+    回归 run 44402947409：本片 63 图 / 层2 缓存 1027 条 → 曾算出 100%
+    → effective 0.005 秒/次 → 容量 18 万图 → 永不转移 → 分片跑 24.6 分钟。
+    """
+    r = estimate_effective_seconds("AMD EPYC 7763", 1027, 63)
+    assert r["hit_rate"] == pytest.approx(HIT_RATE_HISTORY), "命中率必须封顶在历史实测值"
+    assert r["hit_rate_raw"] > 1.0, "raw 应记录真实比值（>100%）以便诊断"
+    assert r["effective"] > 0.1, "effective 不能塌到 hit_cost（否则容量无限）"
+
+
+def test_hit_rate_below_history_kept_as_is():
+    """真实比值低于历史实测时，按实际比值（不抬高）。"""
+    r = estimate_effective_seconds("AMD EPYC 7763", 351, 392)   # 0.895 > 0.74 → 封顶
+    assert r["hit_rate"] == pytest.approx(HIT_RATE_HISTORY)
+    r2 = estimate_effective_seconds("AMD EPYC 7763", 100, 400)  # 0.25 < 0.74 → 保留
+    assert r2["hit_rate"] == pytest.approx(0.25)

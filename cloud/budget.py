@@ -192,11 +192,19 @@ def estimate_effective_seconds(
 
     total = max(0, int(total_images))
     cached = max(0, int(cached_count))
-    # ⚠ 近似：cached 是**整个层2 缓存的唯一条目数**（跨片/跨源共享），而分母是**本片图数**
-    # → 可能 >100%（实测 aocai：本片 61 图 / 层2 缓存 839 条）→ min(1.0) 截断
-    # 方向：缓存充足时**高估**命中率 → effective 低估 → 容量高估 → 分片可能超时（危险侧）
-    # 兜底：USABLE_RATIO=0.6 的折扣 + shortfall 告警 + job timeout(25 分) + continue-on-error
-    hit_rate = min(1.0, cached / total) if total > 0 else 0.0
+    # ⚠ 口径近似：cached 是**整个层2 缓存的唯一条目数**（跨片/跨源/跨期共享），
+    # 而分母是**本片计划图数** → 比值可能远超 1（实测 run 44402947409：本片 63 图 / 层2 缓存 1027 条）。
+    #
+    # 2026-11-19 血泪教训：若直接 `min(1.0, cached/total)`，命中率会恒等于 100%
+    #   → effective = miss_cost×0 + hit_cost = 0.005 秒/次
+    #   → 分片容量 = 900/0.005 = 18 万图（等于无限）→ 永不转移
+    #   → 分片吃满全部帖，实测跑 24.6 分钟（容量上限 15 分钟形同虚设）
+    #
+    # 所以按「**不乐观假设**」：缓存再多，也不假设命中率超过历史实测值。
+    # 理由：命中率的高估是**危险方向**（effective 低估 → 容量高估 → 分片超时），
+    #       而低估计只是过度转移（安全侧）。
+    raw_rate = (cached / total) if total > 0 else 0.0
+    hit_rate = min(1.0, min(raw_rate, hist))
 
     e2e, cpu_hit, matched = _resolve_e2e(cpu_model, e2e_table, unknown_e2e)
     denom = max(1e-6, 1.0 - hist)
@@ -215,6 +223,7 @@ def estimate_effective_seconds(
     return {
         "effective": effective,
         "hit_rate": hit_rate,
+        "hit_rate_raw": raw_rate,
         "miss_cost": miss_cost,
         "e2e_history": e2e,
         "cpu_hit": cpu_hit,
