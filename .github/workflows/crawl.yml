@@ -1166,6 +1166,10 @@ jobs:
     name: "Watchdog 整轮 40 分钟上限"
     needs: [plan]
     if: always()
+    # 取消整轮需要 actions: write；默认 GITHUB_TOKEN 没有该权限（实测 403）
+    permissions:
+      actions: write
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
@@ -1210,6 +1214,7 @@ jobs:
               "上传 plan") echo 5 ;;
               "失败/超时诊断"*) echo 5 ;;
               "读取本片期号"*) echo 3 ;;
+              "整轮监控"*) echo 55 ;;
               *) echo 15 ;;
             esac
           }
@@ -1230,7 +1235,7 @@ jobs:
             # ② 步骤级软超时
             OVER=""
             gh api "repos/$REPO/actions/runs/$RUN/jobs" \
-              --jq '.jobs[] | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "\($j)\t\(.name)\t\(.started_at)"' \
+              --jq '.jobs[] | select(.name != "Watchdog 整轮 40 分钟上限") | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "\($j)\t\(.name)\t\(.started_at)"' \
               2>/dev/null > "$TMP.steps" || true
             while IFS="$(printf '\t')" read -r JN SN ST; do
               [ -n "${ST:-}" ] || continue
@@ -1257,7 +1262,7 @@ jobs:
                 echo "| job | 当前步骤 | 状态 |"
                 echo "|---|---|---|"
                 gh api "repos/$REPO/actions/runs/$RUN/jobs" \
-                  --jq '.jobs[] | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "| \($j) | \(.name) | \(.status) |"' \
+                  --jq '.jobs[] | select(.name != "Watchdog 整轮 40 分钟上限") | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "| \($j) | \(.name) | \(.status) |"' \
                   2>/dev/null || true
               } >> "$GITHUB_STEP_SUMMARY"
               gh run cancel "$RUN" --repo "$REPO" || true
