@@ -44,15 +44,6 @@ def _work_dir(explicit: str | None) -> Path:
     return root
 
 
-def _state_path(work: Path, source: str, name: str) -> Path:
-    """状态文件路径。
-
-    实测 bug（2026-11-16）：state 原先写在工作目录 `work/state`，而 workflow 只把
-    `work/store`（数据仓检出目录）提交回仓库 → 期号/快照从来没落地过，
-    导致「单调性检查」永远走首轮分支、`lastPeriod` 永远是 0。
-    现在支持 `--state` 指定目录，workflow 传 `work/store/state` 让它随数据仓持久化。
-    """
-    return work / "state" / f"{name}_{source}.json"
 
 
 def _resolve_state_dir(args, work: Path) -> Path:
@@ -255,18 +246,6 @@ def do_cleanup(args) -> int:
 # ---------------------------------------------------------------------------
 # 模式：--plan
 # ---------------------------------------------------------------------------
-def _post_total_images(post: dict) -> int:
-    """一帖的**全部图片数** = 正文图 + 每条回复里的图。
-
-    v4 权重的核心（2026-11-17 实测）：分片真正的成本是「要 OCR 多少张图」，
-    而回复图既不在列表行的 `imgTotal` 里，也无法用 `replyPoint` 估准
-    （实测三片体图都是 ~94 张、回复数相近，实际 OCR 却是 274 / 613 / 841 张，差 3.07 倍）。
-    但这些数字**上一轮 merge 的 posts.json 里就有**，同一期 id 稳定 → 直接用实测值。
-    """
-    total = len(post.get("images") or [])
-    for reply in post.get("replies") or []:
-        total += len(reply.get("images") or [])
-    return int(total)
 
 
 def _load_image_cost(state_dir: Path, source: str) -> dict:

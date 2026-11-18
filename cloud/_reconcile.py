@@ -1057,9 +1057,6 @@ PRODUCTS_GUI_ONLY_BY_SOURCE = {
 }
 
 #: 兼容旧名字
-PRODUCTS_CLI = PRODUCTS_CLI_CORE
-PRODUCTS_GUI_ONLY = PRODUCTS_SITE_TEXT + ["report.html"]
-PRODUCTS_21 = PRODUCTS_DOC_21
 
 
 def check_products(out_dir: Path, source: str = "dahkg") -> dict:

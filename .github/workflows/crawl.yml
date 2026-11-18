@@ -168,7 +168,7 @@ jobs:
     name: "计划 ${{ matrix.source }}"
     needs: [plan, cleanup]
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -215,10 +215,10 @@ jobs:
     if: contains(needs.plan.outputs.sources, 'dahkg') && github.event.inputs.no_shard != 'true'
     runs-on: ubuntu-24.04
     # 硬超时保护：实测 runner CPU 异构（AMD EPYC 0.37s/图 vs Intel 6975P 1.95s/图，
-    # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 20 分钟；
+    # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 18 分钟；
     # runner 内部还有 16 分钟「软超时」：到点把剩余帖子写 unfinished_*.json 后正常退出，
     # 剩余工作交给 merge 补抓（见 runner.py 的 watchdog）。
-    timeout-minutes: 20
+    timeout-minutes: 18
     # 分片只是「预热缓存」，**正确性由 merge 的全量重采 + 五道防线保证**。
     # 2026-11-17 事故：跨期时若干分片报「没有 X 期的帖子」→ 整个 run 变 failure → publish 被跳过，
     # 当天数据没进数据仓。所以这里让分片失败**不连累整轮**：
@@ -377,10 +377,10 @@ jobs:
     if: contains(needs.plan.outputs.sources, 'aocai') && github.event.inputs.no_shard != 'true'
     runs-on: ubuntu-24.04
     # 硬超时保护：实测 runner CPU 异构（AMD EPYC 0.37s/图 vs Intel 6975P 1.95s/图，
-    # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 20 分钟；
+    # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 18 分钟；
     # runner 内部还有 16 分钟「软超时」：到点把剩余帖子写 unfinished_*.json 后正常退出，
     # 剩余工作交给 merge 补抓（见 runner.py 的 watchdog）。
-    timeout-minutes: 20
+    timeout-minutes: 18
     # 分片只是「预热缓存」，**正确性由 merge 的全量重采 + 五道防线保证**。
     # 2026-11-17 事故：跨期时若干分片报「没有 X 期的帖子」→ 整个 run 变 failure → publish 被跳过，
     # 当天数据没进数据仓。所以这里让分片失败**不连累整轮**：
@@ -539,10 +539,10 @@ jobs:
     if: contains(needs.plan.outputs.sources, 'tuku') && github.event.inputs.no_shard != 'true'
     runs-on: ubuntu-24.04
     # 硬超时保护：实测 runner CPU 异构（AMD EPYC 0.37s/图 vs Intel 6975P 1.95s/图，
-    # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 20 分钟；
+    # 差 5.3 倍），慢机会把单片拖到 25 分钟以上。这里封顶 18 分钟；
     # runner 内部还有 16 分钟「软超时」：到点把剩余帖子写 unfinished_*.json 后正常退出，
     # 剩余工作交给 merge 补抓（见 runner.py 的 watchdog）。
-    timeout-minutes: 20
+    timeout-minutes: 18
     # 分片只是「预热缓存」，**正确性由 merge 的全量重采 + 五道防线保证**。
     # 2026-11-17 事故：跨期时若干分片报「没有 X 期的帖子」→ 整个 run 变 failure → publish 被跳过，
     # 当天数据没进数据仓。所以这里让分片失败**不连累整轮**：
@@ -701,7 +701,7 @@ jobs:
     # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
     if: always() && !cancelled() && contains(needs.plan.outputs.sources, 'dahkg')
     runs-on: ubuntu-24.04
-    timeout-minutes: 330
+    timeout-minutes: 25
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -838,7 +838,7 @@ jobs:
     # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
     if: always() && !cancelled() && contains(needs.plan.outputs.sources, 'aocai')
     runs-on: ubuntu-24.04
-    timeout-minutes: 330
+    timeout-minutes: 25
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -975,7 +975,7 @@ jobs:
     # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
     if: always() && !cancelled() && contains(needs.plan.outputs.sources, 'tuku')
     runs-on: ubuntu-24.04
-    timeout-minutes: 330
+    timeout-minutes: 25
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -1111,7 +1111,7 @@ jobs:
     needs: [merge_dahkg, merge_aocai, merge_tuku]
     if: always() && !cancelled() && github.event.inputs.dry_publish != 'true' && !contains(needs.*.result, 'failure')
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 10
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
