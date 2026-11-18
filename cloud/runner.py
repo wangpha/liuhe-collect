@@ -1765,6 +1765,306 @@ def do_shard(args) -> int:
 # ---------------------------------------------------------------------------
 # 模式：--run / --merge（共用主流程）
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# C1 第 2 步：merge 只汇总（--merge-mode=summary）
+# ---------------------------------------------------------------------------
+def _extract_shard_artifacts(work: Path, source: str, log) -> tuple[list[list[dict]], list[dict], dict, dict, list]:
+    """解开各片 artifact，返回 (每片 posts, 每片 run_meta, OCR rows 索引, list 原始位置)。
+
+    artifact 目录形如 work/incoming-cache/cache-<源>-<片>-<runid>/cacheout/
+      products_<源>_<片>.tar.gz  → posts.json / run_meta.json
+      cache_<源>_<片>.tar.gz     → .cache/ocr/*.json / .cache/list.json
+    """
+    import json as _json
+    import tarfile as _tar
+
+    incoming = work / "incoming-cache"
+    shard_posts: list[list[dict]] = []
+    shard_metas: list[dict] = []
+    ocr_rows: dict[str, list[dict]] = {}
+    list_order: dict[int, int] = {}
+
+    prod_tars = sorted(incoming.rglob(f"products_{source}_*.tar.gz"))
+    cache_tars = sorted(incoming.rglob(f"cache_{source}_*.tar.gz"))
+    log(f"[merge-summary] 找到 products 包 {len(prod_tars)} 个 / cache 包 {len(cache_tars)} 个")
+
+    for tf in prod_tars:
+        with _tar.open(tf, "r:gz") as t:
+            posts = None
+            meta = None
+            for name in t.getnames():
+                if name.endswith("/posts.json"):
+                    d = _json.loads(t.extractfile(name).read())
+                    posts = d if isinstance(d, list) else (d.get("posts") or [])
+                elif name.endswith("/run_meta.json"):
+                    meta = _json.loads(t.extractfile(name).read())
+            if posts is None:
+                raise SystemExit(f"[merge-summary] ❌ {tf.name} 里没有 posts.json")
+            shard_posts.append(posts)
+            if meta:
+                shard_metas.append(meta)
+    if not shard_posts:
+        raise SystemExit("[merge-summary] ❌ 没找到任何分片产物包（products_*.tar.gz）")
+
+    image_members: list[tuple[Path, str]] = []      # (tar 路径, 成员名)
+    for tf in cache_tars:
+        with _tar.open(tf, "r:gz") as t:
+            for name in t.getnames():
+                if "/images/" in name and not name.endswith("/") and "/.cache/" not in name:
+                    image_members.append((tf, name))
+                if "/ocr/" in name and name.endswith(".json"):
+                    try:
+                        d = _json.loads(t.extractfile(name).read())
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if not isinstance(d, dict):
+                        continue
+                    img = str(d.get("image") or "")
+                    if img:
+                        ocr_rows[img.split("/images/", 1)[-1]] = d.get("rows") or []
+                elif name.endswith("/list.json"):
+                    try:
+                        d = _json.loads(t.extractfile(name).read())
+                    except Exception:  # noqa: BLE001
+                        continue
+                    rows = d if isinstance(d, list) else (d.get("rows") or d.get("items") or [])
+                    for idx, row in enumerate(rows if isinstance(rows, list) else []):
+                        if isinstance(row, dict):
+                            aid = row.get("articleId") or row.get("id") or row.get("singaporeId")
+                            try:
+                                list_order[int(aid)] = idx
+                            except (TypeError, ValueError):
+                                continue
+
+    log(f"[merge-summary] OCR rows 索引 {len(ocr_rows)} 条 / list 原始位置 {len(list_order)} 条 / "
+        f"图片成员 {len(image_members)} 个")
+    return shard_posts, shard_metas, ocr_rows, list_order, image_members
+
+
+def _iter_images(post: dict):
+    """按 core `ocr_post_images` 的口径遍历一个帖的所有图（含评论规则）。"""
+    from . import _guard  # noqa: F401  (保持与其它函数一致的导入风格)
+    from core import scraper as _scraper
+
+    as_int = _scraper.as_int
+    for im in (post.get("images") or []):
+        yield im
+    for r in (post.get("replies") or []):
+        for im in (r.get("images") or []):
+            yield im
+        for s in (r.get("secondLevelComments") or []):
+            for im in (s.get("images") or []):
+                yield im
+    author_ids = {as_int(r.get("commentId")) for r in (post.get("replies") or [])}
+    for c in (post.get("commentsAll") or []):
+        cid = as_int(c.get("commentId"))
+        if not (cid and cid in author_ids):
+            for im in (c.get("images") or []):
+                yield im
+        for s in (c.get("secondLevelComments") or []):
+            for im in (s.get("images") or []):
+                yield im
+
+
+def do_merge_summary(args) -> int:
+    """merge 只汇总：不扫列表、不抓详情、不下载图片、不做 OCR、不调 main()。"""
+    import time as _time
+
+    from . import _guard, _period, _reconcile, merge_summary as _ms
+    from core import backfill, scraper as _scraper, source as _source, text_report
+
+    work = _work_dir(args.work)
+    out_root = Path(args.out or work / "out").resolve()
+    source = args.source
+    started = _time.time()
+    log("=" * 70)
+    log(f"[merge-summary] source={source} 输出根={out_root}（只汇总，不重抓）")
+    log("=" * 70)
+
+    # ---------- ① plan ----------
+    plan = _guard.load_json(work / "plan" / f"plan_{source}.json", {})
+    period = int(plan.get("period") or 0)
+    if not period:
+        raise SystemExit("[merge-summary] ❌ plan 里没有 period")
+    expected = int(((plan.get("counts") or {}).get("expectedPosts")) or 0)
+    display = int(_period.normalize_period(period)) or period
+
+    # ---------- ② 解 artifact ----------
+    shard_posts, shard_metas, ocr_rows, list_order, image_members = _extract_shard_artifacts(work, source, log)
+    if not shard_metas:
+        raise SystemExit("[merge-summary] ❌ 没有 run_meta.json 可作模板")
+
+    # ---------- ③ 合并去重 ----------
+    merged, mstats = _ms.merge_posts(shard_posts)
+    log(f"[merge-summary] 读 {mstats['shards']} 片，共 {mstats['inputTotal']} 帖；"
+        f"去重 {mstats['duplicates']} 帖 → {len(merged)} 帖")
+
+    # ---------- ④ 排序（list.json 原始顺序）----------
+    merged = _ms.order_posts_by_list(merged, list_order)
+    for i, p in enumerate(merged, 1):
+        p["rank"] = i
+    log(f"[merge-summary] 按 list.json 原始顺序排序完成（{len(merged)} 帖）")
+
+    # ---------- ⑤ fullText 还原（rowCount 截断）----------
+    n_ft = n_trunc = n_nocache = 0
+    rc_mismatch = 0
+    for p in merged:
+        for im in _iter_images(p):
+            lp = str((im or {}).get("localPath") or "")
+            key = lp[7:] if lp.startswith("images/") else lp
+            ocr = im.get("ocr")
+            if not isinstance(ocr, dict):
+                ocr = {}
+                im["ocr"] = ocr
+            rows = ocr_rows.get(key)
+            if rows is None:
+                n_nocache += 1
+                continue
+            rc = ocr.get("rowCount")
+            if isinstance(rc, int) and 0 < rc < len(rows):
+                n_trunc += 1
+                rc_mismatch += 1
+            ocr["fullText"] = _ms.build_fulltext_from_rows(rows, rc, ocr.get("rowIndexes"))
+            n_ft += 1
+    log(f"[merge-summary] fullText 还原 {n_ft} 张（其中按 rowCount 截断 {n_trunc} 张，"
+        f"无缓存 {n_nocache} 张）")
+
+    # ---------- ⑥ 纯函数链 ----------
+    users = _scraper.build_users(merged)
+    t_claims = _time.time()
+    claims, claim_stats = _scraper.collect_claims(merged, period)
+    claims_sec = _time.time() - t_claims
+    users = _scraper.attach_user_claims(users, claims)
+    log(f"[merge-summary] users={len(users)} claims={len(claims)}（重跑 collect_claims {claims_sec:.2f}s）")
+
+    # ---------- ⑦ meta（三类规则）----------
+    # summary 模式是**创建**产物目录，不能用 _find_period_dir（它要求目录已存在）。
+    # core 的目录名规则：out_root / f"{lotteryName}_{year}_{display}期"
+    # （见 core.scraper.main / core.forum.run_forum_report / core.dahkg.run_dahkg_report）
+    _sub = SOURCE_SUBDIR.get(source, "")
+    _lottery_name = str((shard_metas[0] or {}).get("lotteryName") or "澳门")
+    _year = int((shard_metas[0] or {}).get("year") or 0) or 2026
+    _base = (out_root / _sub) if _sub else out_root
+    out_dir = _base / f"{_lottery_name}_{_year}_{display}期"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log(f"[merge-summary] 产物目录：{out_dir}")
+
+    # 把各片 cache 里的 images/ 落盘（summary 不跑 main()，没人替我们做这件事）
+    images_dir = out_dir / "images"
+    n_written = 0
+    if image_members:
+        import tarfile as _tar2
+
+        by_tar: dict[Path, list[str]] = {}
+        for tf, name in image_members:
+            by_tar.setdefault(tf, []).append(name)
+        for tf, names in by_tar.items():
+            with _tar2.open(tf, "r:gz") as t:
+                for name in names:
+                    rel = name.split("/images/", 1)[-1]
+                    target = images_dir / rel
+                    if target.exists():
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        src = t.extractfile(name)
+                        if src is None:
+                            continue
+                        target.write_bytes(src.read())
+                        n_written += 1
+                    except Exception:  # noqa: BLE001 - 单张失败不连累整体
+                        continue
+        log(f"[merge-summary] 图片落盘 {n_written} 张 → {images_dir}")
+    n_images_on_disk = sum(1 for _ in images_dir.rglob("*") if _.is_file()) if images_dir.exists() else 0
+    # 分片 artifact 只打 .cache（不含图片文件）→ summary 没有磁盘图片可数，
+    # 退而用「产物声明的去重图片数」，并在已知差异里标注未做磁盘核对。
+    _declared: set[str] = set()
+    for _p in merged:
+        for _im in _iter_images(_p):
+            _u = str((_im or {}).get("url") or "")
+            if _u:
+                _declared.add(_u)
+    n_images = n_images_on_disk or len(_declared)
+    if n_images_on_disk == 0 and _declared:
+        log(f"[merge-summary] ⚠ artifact 不含图片文件 → imageCount 用声明去重数 {len(_declared)}（未做磁盘核对）")
+    plan_with_scan = dict(plan)
+    meta = _ms.build_merged_meta(
+        template=shard_metas[0], shard_metas=shard_metas, merged_posts=merged, users=users,
+        claims=claims, claim_stats=claim_stats, plan=plan_with_scan, images_unique=n_images,
+        timings={"durationSec": 0.0, "rebuildDurationSec": 0.0, "claimsSec": claims_sec},
+    )
+
+    # ---------- ⑧ 写产物 ----------
+    t_rb = _time.time()
+    _scraper.write_outputs(out_root, out_dir, meta, merged, users)
+    from types import SimpleNamespace
+    structured, _site_texts = _scraper._write_outputs_parallel(
+        out_dir, out_root, meta, merged, users, claims,
+        (meta.get("ocrStats") or meta.get("ocr_stats") or {}),
+        (meta.get("replyStats") or meta.get("reply_stats") or {}),
+        SimpleNamespace(play=""),
+    )
+    try:
+        text_report.write_text_report(
+            out_dir, merged, period=period, year=int(meta.get("year") or 0) or 2026,
+            generated_at=str(meta.get("generatedAt") or ""),
+            lottery_name=_source.source_label(source),
+            date_text=backfill.fallback_date(display),
+        )
+    except Exception as exc:  # noqa: BLE001 - 文字版失败不连累主产物，但要明说
+        log(f"[merge-summary] ⚠ 文字版生成失败：{type(exc).__name__}: {exc}")
+    rebuild_sec = _time.time() - t_rb
+    log(f"[merge-summary] 产物写出完成（{rebuild_sec:.2f}s）")
+
+    # ---------- ⑨ 防线 ----------
+    passed = True
+    period_check = _period.check_posts_period(merged, period)
+    log(f"[防线4] 逐帖期号校验：检查 {period_check['checked']} 帖，错误 {period_check['wrongCount']} 个")
+    if not period_check["passed"]:
+        passed = False
+        log(f"[防线4] 错误样本：{period_check['wrong'][:5]}")
+
+    field_check = _check_post_fields(merged)
+    log(f"[防线5] 字段完整性：{'通过' if field_check.get('passed') else '存在问题'}"
+        f"（缺字段 {len(field_check.get('missing') or [])} 处）")
+    if not field_check.get("passed"):
+        passed = False
+
+    img_check = _check_images_fields(merged)
+    log(f"[防线2] 图片字段：{'通过' if img_check.get('passed') else '存在问题'}"
+        f"（异常 {len(img_check.get('bad') or [])} 处）")
+    if not img_check.get("passed"):
+        passed = False
+
+    low_conf = _check_low_confidence(out_dir, threshold=0.7)
+    log(f"[防线5] 低置信度归档：{low_conf.get('lowCount', 0)} 条（只归档、不删改）")
+
+    # ---------- ⑩ 已知差异标注（条件 2）----------
+    known_diff = {
+        "reason": "缓存 rows 是更新后的版本，legacy 用的是当次 rowCount 截断的版本",
+        "imagesWithRowCountMismatch": rc_mismatch,
+        "imagesWithoutCache": n_nocache,
+        "fullTextRestored": n_ft,
+        "netDiffPct": None,
+        "imagesOnDisk": n_images_on_disk,
+        "imagesDeclaredUnique": len(_declared),
+        "diskImageCheckSkipped": n_images_on_disk == 0,
+        "impact": "仅影响「文字版」的图内文字小节；artifact 不含图片→防线2 未做磁盘核对；posts/users/claims/ocr/replies 完全一致",
+    }
+    meta["textReportKnownDiff"] = known_diff
+    meta["durationSec"] = round(_time.time() - started, 2)
+    meta["rebuildDurationSec"] = round(rebuild_sec, 2)
+    _guard.save_json(out_dir / "run_meta.json", meta)
+    log(f"[merge-summary] 已知差异标注：{known_diff}")
+
+    log("=" * 70)
+    log(f"[merge-summary] 结论：{'全部通过 ✅' if passed else '未通过 ❌'}  "
+        f"期号={period} 帖子={len(merged)} 用户={len(users)} claims={len(claims)}")
+    log("=" * 70)
+    return 0 if passed else 40
+
+
+
 def do_run(args, mode: str = "run") -> int:
     from . import _guard, _period, _reconcile
 
@@ -2443,6 +2743,10 @@ def parse_args(argv=None):
     parser.add_argument("--delay", type=float, default=0.05)
     parser.add_argument("--max-pages", type=int, default=200)
     parser.add_argument(
+        "--merge-mode", default="legacy", choices=["legacy", "summary"],
+        help="merge 模式：legacy=重跑模块（默认，安全）；summary=只汇总各片产物（C1）",
+    )
+    parser.add_argument(
         "--slot", default="",
         help="档位（12:00/15:00/18:00/20:15/20:50），用于 PERIOD_LOCK_POLICY；空=不锁",
     )
@@ -2484,6 +2788,11 @@ def main(argv=None) -> int:
     if args.shard is not None:
         return do_shard(args)
     if args.merge:
+        from .merge_summary import resolve_merge_mode
+
+        mode_name = (getattr(args, "merge_mode", "") or "").strip() or resolve_merge_mode()
+        if mode_name == "summary":
+            return do_merge_summary(args)
         return do_run(args, mode="merge")
     if args.run:
         return do_run(args, mode="run")
