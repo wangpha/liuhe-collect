@@ -1242,7 +1242,11 @@ jobs:
           REPO="${{ github.repository }}"
           RUN="${{ github.run_id }}"
 
-          # 步骤软超时（分钟）= 实测正常 × 1.5；未列出的按 15 分
+          # 步骤软超时（分钟）
+          # ⚠ 规则：必须 **大于所属 job 的 timeout-minutes**，否则 watchdog 会抢在
+          #   GitHub 的 job timeout 之前 cancel 整个 run（2026-11-18 run 44335605899 事故：
+          #   分片预热软超时 21 < job timeout 25 → tuku#1 跑到 22.4 分被 watchdog cancel，
+          #   连累 merge 从未启动）。job timeout 只 kill 单个 job（有 continue-on-error 保护）。
           soft_limit() {
             case "$1" in
               "Set up job") echo 3 ;;
@@ -1265,9 +1269,9 @@ jobs:
               "缓存体积检查"*) echo 5 ;;
               "打包本片缓存") echo 8 ;;
               "上传本片缓存") echo 8 ;;
-              "生成 plan"*) echo 9 ;;
-              "分片预热"*) echo 21 ;;
-              "完整跑一次"*) echo 21 ;;
+              "生成 plan"*) echo 16 ;;
+              "分片预热"*) echo 26 ;;
+              "完整跑一次"*) echo 26 ;;
               "上传产物"*) echo 8 ;;
               "上传日志与审计证据") echo 5 ;;
               "上传 plan") echo 5 ;;
