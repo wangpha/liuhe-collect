@@ -1281,10 +1281,18 @@ def _cpu_ocr_probe() -> float:
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 analyze(str(probes[0]), 0, str(cache_dir), force=True)      # 预热（含模型加载）
                 times: list[float] = []
-                for pr in probes[1:] or probes[:1]:
+                for pr in probes:
                     t0 = time.perf_counter()
-                    analyze(str(pr), 0, str(cache_dir), force=True)
-                    times.append(time.perf_counter() - t0)
+                    res = analyze(str(pr), 0, str(cache_dir), force=True)
+                    dt = time.perf_counter() - t0
+                    # ⚠ analyze_image 返回的是 rowCount / fullText，**没有 rows/items**
+                    # （rows/items 是缓存 payload 的键，不是分析结果的键）
+                    rc = int((res or {}).get("rowCount") or 0)
+                    ft = str((res or {}).get("fullText") or "")
+                    if rc <= 0 or not ft.strip():
+                        log(f"[shard] ⚠ 探针图 {pr.name} 无文字（rowCount={rc}），跳过")
+                        continue
+                    times.append(dt)
                 if times:
                     times.sort()
                     median = times[len(times) // 2]
@@ -1295,8 +1303,9 @@ def _cpu_ocr_probe() -> float:
         except Exception as exc:  # noqa: BLE001 - 探针失败不阻断
             log(f"[shard] ⚠ 真实图探针失败（{type(exc).__name__}: {exc}），改用保守值")
 
-    _CPU_PROBE_CACHE = 1.0
-    log(f"[shard] ⚠ 未知 CPU {cpu} 且无探针图 → 保守值 1.0 秒/张（会倾向触发 unfinished 转移）")
+    _CPU_PROBE_CACHE = 1.5
+    log(f"[shard] ⚠ 未知 CPU {cpu} 且无有效探针图 → 慢机下限 1.5 秒/张"
+        f"（宁可过度转移 unfinished，也不超时）")
     return _CPU_PROBE_CACHE
 
 def _pick_within_budget(ids: list[int], cost: dict, per_image_seconds: float, budget_seconds: float) -> tuple[list[int], list[int]]:
@@ -1924,6 +1933,36 @@ def do_merge_summary(args) -> int:
     merged, mstats = _ms.merge_posts(shard_posts)
     log(f"[merge-summary] 读 {mstats['shards']} 片，共 {mstats['inputTotal']} 帖；"
         f"去重 {mstats['duplicates']} 帖 → {len(merged)} 帖")
+
+    # P1：缺帖时打印「各片上报数」+「缺失 ID」，便于定位是分页抖动还是分配漏
+    per_shard = [len(ps or []) for ps in shard_posts]
+    if expected and len(merged) != expected:
+        got_ids = set()
+        for _p in merged:
+            try:
+                got_ids.add(int(_p.get("articleId") or 0))
+            except (TypeError, ValueError):
+                continue
+        planned = set()
+        for _g in ((plan.get("shardPlan") or {}).get("groups") or {}).values():
+            pass
+        # plan 里的 id 列表（若有）用于算缺失；没有就只报数量与各片上报
+        for _key in ("plannedIds", "planned_ids", "unionIds", "union_ids"):
+            for _aid in (plan.get(_key) or []):
+                try:
+                    planned.add(int(_aid))
+                except (TypeError, ValueError):
+                    continue
+        missing = sorted(planned - got_ids) if planned else []
+        shard_desc = ", ".join(f"shard{i}={n}" for i, n in enumerate(per_shard))
+        log(f"[merge-summary] ❌ 汇总后 {len(merged)} 帖 != plan 预期 {expected} 帖")
+        log(f"[merge-summary]    各片上报: {shard_desc}（合计 {sum(per_shard)}）")
+        if missing:
+            log(f"[merge-summary]    缺失 ID（{len(missing)} 个）: {missing[:20]}"
+                f"{'…' if len(missing) > 20 else ''}")
+        else:
+            log("[merge-summary]    plan 里没有 id 列表 → 无法算缺失 ID，只能看各片上报数")
+        raise SystemExit(41)
 
     # ---------- ④ 排序（list.json 原始顺序）----------
     merged = _ms.order_posts_by_list(merged, list_order)
