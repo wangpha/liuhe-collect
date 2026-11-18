@@ -1213,6 +1213,51 @@ def _ocr_micro_benchmark(out_root: Path, limit: int = 3) -> dict:
 
 
 #: 探针结果缓存（同进程只测一次）
+def _find_ocr_cache_dir(work: Path, out_root: Path) -> Path | None:
+    """找本源本期的 `.cache` 目录（分片启动时只有本期缓存被铺回）。
+
+    返回 `.../.cache`（其下有 `ocr/`），找不到返回 None。
+    多期并存时取「ocr 里 json 最多」的那个 —— 命中当期的概率最大。
+    """
+    best: Path | None = None
+    best_n = -1
+    for cand in Path(out_root).rglob(".cache"):
+        if not cand.is_dir():
+            continue
+        ocr_dir = cand / "ocr"
+        n = sum(1 for q in ocr_dir.glob("*.json")) if ocr_dir.exists() else 0
+        if n > best_n:
+            best, best_n = cand, n
+    return best
+
+
+def _pick_within_budget(
+    ids: list[int], cost: dict, per_image_seconds: float, budget_seconds: float
+) -> tuple[list[int], list[int]]:
+    """按预算挑出本机要处理的帖子，其余留给 merge。
+
+    cost: {articleId: 预计图片数}（来自 plan 的 postCost）
+    估算：每帖耗时 ≈ 图片数 × 本机秒/张；另留 60s 固定开销（启动/扫描/收尾）。
+
+    ⚠ 2026-11-19：本函数曾被「按行号区间删除旧探针代码」误删（它正好在区间内），
+    导致 20/20 分片 NameError。`work/cloud_build/check_undefined_calls.py` 是防回归检查。
+    """
+    if per_image_seconds <= 0 or budget_seconds <= 0 or not ids:
+        return list(ids), []
+    usable = max(0.0, budget_seconds - 60.0)
+    taken: list[int] = []
+    rest: list[int] = []
+    acc = 0.0
+    for aid in sorted(ids, key=lambda x: cost.get(x, 1)):
+        est = max(1, cost.get(aid, 1)) * per_image_seconds
+        if acc + est > usable:
+            rest.append(aid)
+            continue
+        acc += est
+        taken.append(aid)
+    return taken, rest
+
+
 def _collect_unfinished(work: Path, source: str, log) -> list[int]:
     """收集本源的 unfinished 清单（分片因预算到点留下的未处理帖子）。
 
