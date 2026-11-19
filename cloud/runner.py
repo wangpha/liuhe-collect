@@ -711,6 +711,17 @@ def do_plan(args) -> int:
         if len(flat_users) != len(set(flat_users)):
             raise SystemExit(f"[plan] ❌ 断言②失败：有用户被分配到多个分片")
         groups = [[aid for uid in g for aid in aid_by_user.get(uid, [])] for g in user_groups]
+        # 帖子层面再平衡（修「单个超大用户不可拆」导致的 400 倍失衡，见 _rebalance_groups docstring）
+        _before = [sum(max(1, weights.get(a, 1)) for a in g) for g in groups]
+        groups = _rebalance_groups(groups, weights)
+        _after = [sum(max(1, weights.get(a, 1)) for a in g) for g in groups]
+        if _before != _after:
+            print(
+                f"[plan] 帖子层面再平衡：权重 {_before} → {_after}"
+                f"（极差 {max(_before) / max(1, min(_before)):.2f} → "
+                f"{max(_after) / max(1, min(_after)):.2f} 倍）",
+                flush=True,
+            )
         total_posts_in_groups = sum(len(g) for g in groups)
         if total_posts_in_groups != len(union_ids):
             raise SystemExit(
@@ -911,6 +922,55 @@ def _sender_of(item: dict, source: str | None = None) -> str:
     return ""
 
 
+def _rebalance_groups(groups: list[list[int]], weights: dict[int, int],
+                      max_ratio: float = 1.35, max_moves: int = 400) -> list[list[int]]:
+    """在**帖子层面**再平衡分片负载（2026-11-19 修 400 倍失衡）。
+
+    ## 为什么需要（run 44470578706 实测）
+      [shard] 本片   4 图 → 估算  0.1 分钟
+      [shard] 本片 1605 图 → 估算 52.7 分钟（上限 15）→ 转移 72% → merge 25.8 分钟 → 整轮 55 分
+
+    LPT 按「用户」分组，而**单个超大用户不可拆** → 必造出极端失衡。
+    这里在 aid 层面做局部搜索：反复把「最重片里最重的那帖」搬到「最轻片」，
+    直到极差 <= max_ratio 或搬够 max_moves 次。
+
+    安全性：搬帖不破坏完整性（每个 aid 仍在恰好一个片里），
+    `_slice_items` 已改成「by-user ∪ planned-ids」，所以作者被拆到多片也能正确落位。
+    """
+    if not groups or len(groups) < 2:
+        return groups
+
+    def _load(g: list[int]) -> int:
+        return sum(max(1, int(weights.get(a, 1))) for a in g)
+
+    loads = [_load(g) for g in groups]
+    moves = 0
+    while moves < max_moves:
+        hi = max(range(len(groups)), key=lambda i: (loads[i], -i))
+        lo = min(range(len(groups)), key=lambda i: (loads[i], i))
+        if hi == lo or loads[lo] <= 0:
+            break
+        if loads[hi] <= loads[lo] * max_ratio:
+            break
+        src = groups[hi]
+        if len(src) <= 1:
+            # 该片只有一帖（超大帖），搬不动
+            break
+        # 搬「最重且不超过 lo 目标」的一帖：优先搬最大的
+        aid = max(src, key=lambda a: max(1, int(weights.get(a, 1))))
+        w = max(1, int(weights.get(aid, 1)))
+        if w > loads[hi] - loads[lo]:
+            # 搬最大的会让天平反向，退而搬最小的
+            aid = min(src, key=lambda a: max(1, int(weights.get(a, 1))))
+            w = max(1, int(weights.get(aid, 1)))
+        src.remove(aid)
+        groups[lo].append(aid)
+        loads[hi] -= w
+        loads[lo] += w
+        moves += 1
+    return groups
+
+
 def _group_by_user(user_weights: dict[str, int], n: int, prev: dict[str, int] | None = None):
     """按**用户**做 LPT 分组，并尽量保持上一轮的归属（跨轮稳定）。
 
@@ -994,8 +1054,21 @@ def _slice_items(items, shard: int, total: int, sink: dict, planned_ids: set[int
     sink["imagesTotal"] = sum(_item_image_weight(it) for it in seq)
     if mine_users is not None:
         # 按用户分片（方案 3）：一个作者的所有帖子都进同一片；新帖因作者已在本片而自动跟随。
-        picked = [it for it in seq if _sender_of(it, source) in mine_users]
-        sink["mode"] = "by-user"
+        #
+        # ⚠ 2026-11-19 补丁：并上「本片分到的 id」。
+        # 原因：单个超大作者（实测 1605 图）LPT 无法拆分 → 该片估算 52.7 分钟（上限 15）
+        # → 转移 72% → merge 全量重采 25.8 分钟 → 整轮 55 分。
+        # 现在 plan 会把超大作者拆到多片（splitUsers），这些帖靠 planned_ids 落到正确的片，
+        # 所以这里必须做并集（否则被拆的帖会被 by-user 过滤掉）。
+        _by_user = [it for it in seq if _sender_of(it, source) in mine_users]
+        if planned_ids:
+            _ids = {int(x) for x in planned_ids}
+            _by_id = [it for it in seq if _plan_item_id(it) in _ids and it not in _by_user]
+            if _by_id:
+                _by_user.extend(_by_id)
+                sink["mode"] = "by-user+split"
+        picked = _by_user
+        sink["mode"] = sink.get("mode") or "by-user"
         if not picked and seq and planned_ids:
             # 兜底（2026-11-17 事故）：按用户取到空片时，若 plan 里有本片的帖子 id 列表，就退回按 id 取。
             # 否则空列表会让模块直接报「列表里没有 X 期的帖子」并让整个分片 job 失败。
