@@ -1018,9 +1018,172 @@ def _slice_items(items, shard: int, total: int, sink: dict, planned_ids: set[int
             "[shard] ❌ 没有分片依据：plan 里既没有按用户分组（shards）也没有分组（shardPlan.groups）。"
             "拒绝用「按 ID 取模」兜底（会静默漂移）。请检查 plan 阶段。"
         )
+    # ---- T2：补齐「plan 里有、扫列表没返回」的漏帖（分页抖动）----
+    # 依据 T0 实测：按 id 抓详情即可构造出同形状的列表行，不必等 merge。
+    if planned_ids:
+        period_hint = 0
+        for _it in seq:
+            period_hint = int((_it or {}).get("period") or (_it or {}).get("qs") or 0)
+            if period_hint:
+                break
+        picked, _failed_ids = _fill_missing_items(
+            source or "", picked, planned_ids, period_hint, log
+        )
+        if _failed_ids:
+            # 补不上的交 merge（unfinished 机制），不在这里死磕
+            sink["missingIds"] = _failed_ids
+
     sink["picked"] = len(picked)
     sink["imagesPicked"] = sum(_item_image_weight(it) for it in picked)
     return (picked, *meta) if meta else picked
+
+
+# 补齐漏帖的上限（异常情况保护：漏帖通常 <10，若上百帖说明别处有问题，不在这里死磕）
+_MISSING_FIX_MAX = 50
+
+
+def _row_dahkg(raw: dict, period: int) -> dict:
+    """dahkg：顶层 11 字段 + `_raw`（27 字段，T0 实测）。"""
+    def ai(v, d=0):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return d
+
+    return {
+        "tid": ai(raw.get("singaporeId")),
+        "userid": ai(raw.get("senderId")),
+        "qs": ai(raw.get("periods"), period) or int(period or 0),
+        "title": raw.get("title") or "",
+        "zhaiyao": raw.get("content") or "",
+        "readNum": ai(raw.get("browsePoint")),
+        "huifushu": ai(raw.get("replyPoint")),
+        "time": "",
+        "head": raw.get("headImg") or "",
+        "username": raw.get("nickname") or "",
+        "_raw": dict(raw),
+    }
+
+
+def _row_aocai(tiezi: dict, period: int) -> dict:
+    """aocai：20 字段（`imgs` 是 **str**，不是 list —— T0 实测）。"""
+    def ai(v, d=0):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return d
+
+    return {
+        "tid": ai(tiezi.get("tid")),
+        "userid": ai(tiezi.get("userid")),
+        "qs": ai(tiezi.get("qs"), period) or int(period or 0),
+        "title": tiezi.get("title") or "",
+        "imgs": tiezi.get("imgs") if isinstance(tiezi.get("imgs"), str) else "[]",
+        "imgurl": tiezi.get("imgurl") or "",
+        "zhaiyao": tiezi.get("zhaiyao") or "",
+        "readNum": ai(tiezi.get("readNum")),
+        "huifushu": ai(tiezi.get("huifushu")),
+        "time": tiezi.get("time") or "",
+        "head": tiezi.get("head") or "",
+        "username": tiezi.get("username") or "",
+    }
+
+
+def _row_tuku(raw: dict, period: int) -> dict:
+    """tuku：43 字段全集；`picture`(dict) 必须转成 `pictureList`(list) —— build_post 读后者。"""
+    row = dict(raw)
+    pic = raw.get("picture")
+    row["pictureList"] = [pic] if isinstance(pic, dict) else (raw.get("pictureList") or [])
+    if not int(row.get("period") or 0):
+        row["period"] = int(period or 0)      # 期号必须有效，否则 main 会当非本期丢掉
+    row["periodStr"] = str(row.get("period") or period)
+    row.setdefault("isCompete", 0)
+    row.setdefault("updateTime", raw.get("createTime") or "")
+    row.setdefault("commentCount", raw.get("commentCount") or 0)
+    row.setdefault("clickCount", raw.get("clickCount") or 0)
+    row.setdefault("top", raw.get("top") or 0)
+    row.setdefault("highQuality", raw.get("highQuality") or 0)
+    return row
+
+
+def _fetch_missing_row(source: str, aid: int, period: int) -> dict | None:
+    """按 id 抓详情，构造一条与 `_patch_shard` 的 items 同形状的列表行。
+
+    失败（网络/404/解析）返回 None —— 调用方会把该 id 写进 unfinished 交 merge 再试。
+    """
+    try:
+        if source == "dahkg":
+            from core import dahkg
+
+            raw = dahkg.fetch_detail(int(aid)) or {}
+            return _row_dahkg(raw, period) if raw else None
+
+        if source == "aocai":
+            from core import forum as _fm
+
+            detail = _fm.fetch_thread_detail(
+                int(aid), 0, include_replies=True, delay=0.0, max_pages=50
+            ) or {}
+            tiezi = detail.get("tiezi") or {}
+            return _row_aocai(tiezi, period) if tiezi else None
+
+        from core import scraper as _sm
+
+        raw = _sm.api_get("/unite49/h5/article/detail", {"articleId": int(aid)}) or {}
+        for wrapper in ("data", "result", "article"):
+            if isinstance(raw.get(wrapper), dict):
+                raw = raw[wrapper]
+                break
+        return _row_tuku(raw, period) if raw else None
+    except Exception as exc:  # noqa: BLE001 - 单帖补齐失败不该拖垮分片
+        log_line = f"[shard] ⚠ 补齐 {source}#{aid} 失败：{type(exc).__name__}: {exc}"
+        try:
+            print(log_line, flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+
+def _fill_missing_items(source: str, picked: list[dict], planned_ids, period: int, log) -> tuple[list[dict], list[int]]:
+    """把「planned_ids 里有、picked 里没有」的帖按 id 补齐。返回 (新 items, 补不上的 id 列表)。"""
+    if not planned_ids:
+        return picked, []
+
+    def _id_of(it: dict) -> int:
+        for k in ("articleId", "tid", "singaporeId", "id"):
+            v = (it or {}).get(k)
+            try:
+                if v is not None:
+                    return int(v)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    got = {_id_of(it) for it in picked}
+    missing = sorted(int(x) for x in planned_ids if int(x) not in got)
+    if not missing:
+        log(f"[shard] ✅ 扫列表 {len(picked)} 帖 = plan 本片 {len(planned_ids)} 帖（无漏帖）")
+        return picked, []
+
+    if len(missing) > _MISSING_FIX_MAX:
+        log(f"[shard] ⚠ 扫列表漏 {len(missing)} 帖（超过补齐上限 {_MISSING_FIX_MAX}），"
+            f"只补前 {_MISSING_FIX_MAX} 帖，其余交 merge")
+    todo = missing[:_MISSING_FIX_MAX]
+    log(f"[shard] ⚠ 扫列表漏 {len(missing)} 帖（分页抖动），按 id 抓详情补齐：{todo[:8]}")
+
+    fixed = 0
+    failed: list[int] = []
+    for aid in todo:
+        row = _fetch_missing_row(source, aid, period)
+        if row:
+            picked.append(row)
+            fixed += 1
+        else:
+            failed.append(aid)
+    failed += missing[_MISSING_FIX_MAX:]
+    log(f"[shard] ✅ 已补齐 {fixed}/{len(todo)} 帖"
+        + (f"；补不上 {len(failed)} 帖交 merge：{failed[:8]}" if failed else ""))
+    return picked, failed
 
 
 def _patch_shard(source: str, shard: int, total: int, sink: dict, planned_ids: set[int] | None = None,
@@ -1810,6 +1973,20 @@ def do_shard(args) -> int:
             f"完整性由 merge 全量重采保证"
         )
         code = 0
+
+    # 补齐失败的帖写进 unfinished，交 merge 补抓（不静默丢）
+    _miss = sink.get("missingIds") or []
+    if _miss:
+        _guard.save_json(
+            work / "unfinished" / f"unfinished_{source}_{shard_index}.json",
+            {
+                "source": source, "shard": shard_index,
+                "ids": sorted(int(x) for x in _miss),
+                "reason": f"扫列表漏帖且按 id 补详情失败 {len(_miss)} 帖（分页抖动）",
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        )
+        log(f"[shard] ⚠ {len(_miss)} 帖补不上，已写 unfinished 交 merge：{sorted(_miss)[:8]}")
 
     log(
         f"[shard] {source} 本片：源站本期共 {sink.get('total', 0)} 帖 / {sink.get('imagesTotal', 0)} 图，"
