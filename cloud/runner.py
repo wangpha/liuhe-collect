@@ -2517,6 +2517,9 @@ def do_merge_summary(args) -> int:
         (meta.get("replyStats") or meta.get("reply_stats") or {}),
         SimpleNamespace(play=""),
     )
+    # ⚠ 2026-11-20：文字版**失败必须让 merge 失败**（不再 try/except 吞掉）。
+    # 原因：吞掉后产物少 4 个（当期文字版.txt / 文字版.html/.txt / 论坛原帖.html），
+    # 违反「产物完整无缺失」。宁可整轮失败重跑，也不交付残缺产物。
     try:
         text_report.write_text_report(
             out_dir, merged, period=period, year=int(meta.get("year") or 0) or 2026,
@@ -2524,8 +2527,9 @@ def do_merge_summary(args) -> int:
             lottery_name=_source.source_label(source),
             date_text=backfill.fallback_date(display),
         )
-    except Exception as exc:  # noqa: BLE001 - 文字版失败不连累主产物，但要明说
-        log(f"[merge-summary] ⚠ 文字版生成失败：{type(exc).__name__}: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        log(f"[merge-summary] ❌ 文字版生成失败（拒绝交付残缺产物）：{type(exc).__name__}: {exc}")
+        raise SystemExit(42) from exc
     rebuild_sec = _time.time() - t_rb
     log(f"[merge-summary] 产物写出完成（{rebuild_sec:.2f}s）")
 
@@ -2551,6 +2555,31 @@ def do_merge_summary(args) -> int:
 
     low_conf = _check_low_confidence(out_dir, threshold=0.7)
     log(f"[防线5] 低置信度归档：{low_conf.get('lowCount', 0)} 条（只归档、不删改）")
+
+    # ---------- ⑨b 产物齐全硬校验（21 个，缺一即失败）----------
+    # 清单来源：数据仓 322 期 tar 实测（21 个文件）
+    _REQUIRED_PRODUCTS = (
+        "claims.csv", "claims.json", "manifest.json",
+        "ocr.csv", "ocr.json",
+        "posts.csv", "posts.json",
+        "replies.csv", "replies.json",
+        "report.md", "run_meta.json",
+        "users.csv", "users.json",
+        "validation.json",
+        "全站文字版.html", "全站文字版.json", "全站文字版.txt",
+        "六合_看板.html", "六合_结构化.xlsx",
+        "当期文字版.txt", "文字版.html", "文字版.txt", "论坛原帖.html",
+    )
+    _missing_products = [n for n in _REQUIRED_PRODUCTS if not (out_dir / n).exists()]
+    log(f"[merge-summary] 产物清单：{len(_REQUIRED_PRODUCTS) - len(_missing_products)}"
+        f"/{len(_REQUIRED_PRODUCTS)} 齐全"
+        + (f"；缺 {_missing_products}" if _missing_products else ""))
+    if _missing_products:
+        raise SystemExit(
+            f"[merge-summary] ❌ 产物缺失 {len(_missing_products)} 个：{_missing_products}"
+            f"（拒绝交付残缺产物）"
+        )
+    passed = bool(passed)
 
     # ---------- ⑩ 已知差异标注（条件 2）----------
     known_diff = {
