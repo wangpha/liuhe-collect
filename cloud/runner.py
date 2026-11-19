@@ -1822,6 +1822,101 @@ def _check_low_confidence(out_dir: Path, threshold: float = 0.7) -> dict:
     }
 
 
+#: 一个完整期产物应有的 21 个文件（来源：数据仓 322/323 期 tar 实测）
+REQUIRED_PRODUCTS = (
+    "claims.csv", "claims.json", "manifest.json",
+    "ocr.csv", "ocr.json",
+    "posts.csv", "posts.json",
+    "replies.csv", "replies.json",
+    "report.md", "run_meta.json",
+    "users.csv", "users.json",
+    "validation.json",
+    "全站文字版.html", "全站文字版.json", "全站文字版.txt",
+    "六合_看板.html", "六合_结构化.xlsx",
+    "当期文字版.txt", "文字版.html", "文字版.txt",
+)
+
+#: 文字版相关产物（dahkg 的 run_dahkg_report 不生成，需要补）
+TEXT_PRODUCTS = (
+    "全站文字版.html", "全站文字版.json", "全站文字版.txt",
+    "当期文字版.txt", "文字版.html", "文字版.txt",
+)
+
+
+def _ensure_text_products(out_dir: Path, source: str, period: int, log) -> list[str]:
+    """确保文字版产物存在；缺失就用 text_report 补生成。返回补生成的清单。
+
+    ## 为什么需要（2026-11-20 run 44597918831 实测）
+    `dahkg.run_dahkg_report` 只调 `forum.write_outputs`，**没有文字版生成**，
+    所以 dahkg 产物只有 17 个（缺 6 个文字版）。而 aocai/tuku 的入口里有，
+    所以它们 22-23 个。这是 core 三源的历史差异，属编排层职责，在 runner 里补齐。
+    """
+    missing = [n for n in TEXT_PRODUCTS if not (out_dir / n).exists()]
+    if not missing:
+        return []
+
+    log(f"[merge] 文字版缺 {len(missing)} 个（{missing}）→ 调 text_report 补生成")
+    try:
+        from core import backfill, scraper as _scraper, source as _source, text_report
+
+        posts: list[dict] = []
+        meta: dict = {}
+        from . import _reconcile
+
+        meta, posts = _reconcile.load_products(out_dir)
+        if not posts:
+            log("[merge] ⚠ 补文字版失败：读不到 posts")
+            return []
+        text_report.write_text_report(
+            out_dir, posts,
+            period=int(period),
+            year=int(meta.get("year") or 0) or 2026,
+            generated_at=str(meta.get("generatedAt") or ""),
+            lottery_name=_source.source_label(source),
+            date_text=backfill.fallback_date(period),
+        )
+        # 全站文字版由 core.user_text.write_site_texts 生成（write_text_report 不含）
+        try:
+            from core.user_text import write_site_texts
+
+            users2: list[dict] = []
+            from . import _reconcile as _rec2
+
+            meta2, posts2 = _rec2.load_products(out_dir)
+            users2 = _scraper.build_users(posts2) if posts2 else []
+            if users2:
+                st = write_site_texts(out_dir, users2, meta2)
+                log(f"[merge] 全站文字版补生成：{st.get('count', 0)} 位用户")
+        except Exception as exc:  # noqa: BLE001
+            log(f"[merge] ⚠ 全站文字版补生成失败：{type(exc).__name__}: {exc}")
+
+        still = [n for n in TEXT_PRODUCTS if not (out_dir / n).exists()]
+        ok_list = [n for n in missing if n not in still]
+        log(f"[merge] 文字版补生成：成功 {len(ok_list)} 个"
+            + (f"，仍缺 {still}" if still else ""))
+        return ok_list
+    except Exception as exc:  # noqa: BLE001
+        log(f"[merge] ❌ 补文字版失败：{type(exc).__name__}: {exc}")
+        return []
+
+
+def _check_products_complete(out_dir: Path, source: str, log) -> None:
+    """校验 21 个产物齐全；缺任一 → SystemExit(42)（拒绝交付残缺产物）。
+
+    ## 为什么必须有（2026-11-20 实测）
+    run 44597918831：`merge dahkg: success`，但产物只有 17 个（缺 6 个文字版）。
+    「merge 成功」不等于「产物完整」—— 因为没有任何地方校验产物清单。
+    """
+    missing = [n for n in REQUIRED_PRODUCTS if not (out_dir / n).exists()]
+    have = len(REQUIRED_PRODUCTS) - len(missing)
+    log(f"[merge] 产物清单：{have}/{len(REQUIRED_PRODUCTS)} 齐全"
+        + (f"；缺 {missing}" if missing else ""))
+    if missing:
+        raise SystemExit(
+            f"[merge] ❌ {source} 产物缺失 {len(missing)} 个：{missing}（拒绝交付残缺产物）"
+        )
+
+
 def _annotate_hit_rate(out_dir: Path, meta: dict, shard_stats: dict, log) -> None:
     """把分片上报的缓存命中率写进 run_meta（A''：校准 HIT_RATE_HISTORY 的数据来源）。
 
@@ -2693,6 +2788,10 @@ def do_run(args, mode: str = "run") -> int:
     # A'' 命中率写进 run_meta（用户 2026-11-19 条件②：供下一轮校准 HIT_RATE_HISTORY）
     if mode == "merge":
         _annotate_hit_rate(out_dir, meta, shard_stats, log)
+        # ① 补文字版（dahkg 的 run_dahkg_report 不生成）
+        _ensure_text_products(out_dir, source, period, log)
+        # ② 21 产物齐全硬校验（缺任一即失败）
+        _check_products_complete(out_dir, source, log)
     got_period = int(meta.get("period") or 0)
     if not period:
         period = got_period
