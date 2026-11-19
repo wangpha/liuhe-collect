@@ -1261,7 +1261,7 @@ jobs:
 
   # ---------------- 整轮 watchdog：步骤级软超时（主）+ 40 分钟兜底（副） ----------------
   watchdog:
-    name: "Watchdog 整轮 40 分钟上限"
+    name: "Watchdog 整轮 50 分钟上限"
     needs: [plan]
     if: always()
     # 取消整轮需要 actions: write；默认 GITHUB_TOKEN 没有该权限（实测 403）
@@ -1274,7 +1274,7 @@ jobs:
       - name: 整轮监控（步骤级软超时 + 40 分钟兜底）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MAX_MIN: "40"
+          MAX_MIN: "50"
         run: |
           START=$(date +%s)
           TMP=$(mktemp)
@@ -1330,7 +1330,7 @@ jobs:
               #    merge dahkg 跑到 14.3 分」时 watchdog 在 40.4 分 cancel → publish 被 skip → 数据没入库。
               #    watchdog 的意图是防「卡死」不是防「慢」；数据安全 > 效率。
             PENDING=$(gh api "repos/$REPO/actions/runs/$RUN/jobs" \
-              --jq '[.jobs[] | select(.name != "Watchdog 整轮 40 分钟上限") | select(.name | test("publish") | not) | select(.status != "completed")] | length' \
+              --jq '[.jobs[] | select(.name != "Watchdog 整轮 50 分钟上限") | select(.name | test("publish") | not) | select(.status != "completed")] | length' \
               2>/dev/null || echo 99)
             echo "=== 已跑 ${ELAPSED} 分（兜底 ${MAX_MIN}）；未完成 job 数 ${PENDING} ==="
             if [ "$PENDING" = "0" ]; then
@@ -1341,7 +1341,7 @@ jobs:
             # ② 步骤级软超时
             OVER=""
             gh api "repos/$REPO/actions/runs/$RUN/jobs" \
-              --jq '.jobs[] | select(.name != "Watchdog 整轮 40 分钟上限") | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "\($j)\t\(.name)\t\(.started_at)"' \
+              --jq '.jobs[] | select(.name != "Watchdog 整轮 50 分钟上限") | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "\($j)\t\(.name)\t\(.started_at)"' \
               2>/dev/null > "$TMP.steps" || true
             while IFS="$(printf '\t')" read -r JN SN ST; do
               [ -n "${ST:-}" ] || continue
@@ -1368,7 +1368,7 @@ jobs:
                 echo "| job | 当前步骤 | 状态 |"
                 echo "|---|---|---|"
                 gh api "repos/$REPO/actions/runs/$RUN/jobs" \
-                  --jq '.jobs[] | select(.name != "Watchdog 整轮 40 分钟上限") | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "| \($j) | \(.name) | \(.status) |"' \
+                  --jq '.jobs[] | select(.name != "Watchdog 整轮 50 分钟上限") | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "| \($j) | \(.name) | \(.status) |"' \
                   2>/dev/null || true
               } >> "$GITHUB_STEP_SUMMARY"
               gh run cancel "$RUN" --repo "$REPO" || true
