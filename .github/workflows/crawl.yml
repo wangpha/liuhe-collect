@@ -332,10 +332,13 @@ jobs:
           NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
         run: |
           set -o pipefail
-          # SIGTERM 优雅投降（2026-11-19）：1440s(24 分) < job timeout 1500s(25 分)
-          # → 分片「自己退出」而不是被 GitHub SIGKILL，能写 unfinished 并判 success。
+          # SIGTERM 优雅投降（2026-11-19）：1200s(20 分) 远小于 job timeout 1500s(25 分)
+          # ⚠ 2026-11-19 实测教训：原写 1440s(24 分)，但 timeout 是**相对本 step 开始**算的，
+          #   而前置步骤（检出/装依赖/恢复缓存）占 ~1 分钟 → 1+24 ≈ 25 = job timeout，两者竞争，
+          #   有时 job timeout 先 SIGKILL → handler 没机会跑（日志里连「收到 SIGTERM」都没有）。
+          #   改成 1200s(20 分) → 1+20 = 21 分 < 25 分，稳。分片容量 15 分钟（USABLE_RATIO=0.6）也够。
           # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
-          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1440"
+          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1200"
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
@@ -529,10 +532,13 @@ jobs:
           NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
         run: |
           set -o pipefail
-          # SIGTERM 优雅投降（2026-11-19）：1440s(24 分) < job timeout 1500s(25 分)
-          # → 分片「自己退出」而不是被 GitHub SIGKILL，能写 unfinished 并判 success。
+          # SIGTERM 优雅投降（2026-11-19）：1200s(20 分) 远小于 job timeout 1500s(25 分)
+          # ⚠ 2026-11-19 实测教训：原写 1440s(24 分)，但 timeout 是**相对本 step 开始**算的，
+          #   而前置步骤（检出/装依赖/恢复缓存）占 ~1 分钟 → 1+24 ≈ 25 = job timeout，两者竞争，
+          #   有时 job timeout 先 SIGKILL → handler 没机会跑（日志里连「收到 SIGTERM」都没有）。
+          #   改成 1200s(20 分) → 1+20 = 21 分 < 25 分，稳。分片容量 15 分钟（USABLE_RATIO=0.6）也够。
           # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
-          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1440"
+          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1200"
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
@@ -726,10 +732,13 @@ jobs:
           NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
         run: |
           set -o pipefail
-          # SIGTERM 优雅投降（2026-11-19）：1440s(24 分) < job timeout 1500s(25 分)
-          # → 分片「自己退出」而不是被 GitHub SIGKILL，能写 unfinished 并判 success。
+          # SIGTERM 优雅投降（2026-11-19）：1200s(20 分) 远小于 job timeout 1500s(25 分)
+          # ⚠ 2026-11-19 实测教训：原写 1440s(24 分)，但 timeout 是**相对本 step 开始**算的，
+          #   而前置步骤（检出/装依赖/恢复缓存）占 ~1 分钟 → 1+24 ≈ 25 = job timeout，两者竞争，
+          #   有时 job timeout 先 SIGKILL → handler 没机会跑（日志里连「收到 SIGTERM」都没有）。
+          #   改成 1200s(20 分) → 1+20 = 21 分 < 25 分，稳。分片容量 15 分钟（USABLE_RATIO=0.6）也够。
           # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
-          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1440"
+          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1200"
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"

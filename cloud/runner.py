@@ -2085,6 +2085,7 @@ def _extract_shard_artifacts(work: Path, source: str, log) -> tuple[list[list[di
     incoming = work / "incoming-cache"
     shard_posts: list[list[dict]] = []
     shard_metas: list[dict] = []
+    skipped_products: list[str] = []
     ocr_rows: dict[str, list[dict]] = {}
     list_order: dict[int, int] = {}
 
@@ -2103,7 +2104,12 @@ def _extract_shard_artifacts(work: Path, source: str, log) -> tuple[list[list[di
                 elif name.endswith("/run_meta.json"):
                     meta = _json.loads(t.extractfile(name).read())
             if posts is None:
-                raise SystemExit(f"[merge-summary] ❌ {tf.name} 里没有 posts.json")
+                # 2026-11-19 实测：分片被 job timeout kill 时，`if: always()` 仍会打一个**空** products 包
+                # （`work/out` 里没有产物）。这不是错误配置，而是「该片没跑完」——跳过并告警，
+                # 让它由「缺帖」逻辑处理（若缺得多会触发 groups 并集断言；缺得少会写进 knownDiff）。
+                log(f"[merge-summary] ⚠ {tf.name} 里没有 posts.json（该片可能被 timeout kill），跳过")
+                skipped_products.append(tf.name)
+                continue
             shard_posts.append(posts)
             if meta:
                 shard_metas.append(meta)
@@ -2142,6 +2148,8 @@ def _extract_shard_artifacts(work: Path, source: str, log) -> tuple[list[list[di
 
     log(f"[merge-summary] OCR rows 索引 {len(ocr_rows)} 条 / list 原始位置 {len(list_order)} 条 / "
         f"图片成员 {len(image_members)} 个")
+    if skipped_products:
+        log(f"[merge-summary] ⚠ 跳过的空产物包 {len(skipped_products)} 个：{skipped_products}")
     return shard_posts, shard_metas, ocr_rows, list_order, image_members
 
 
