@@ -775,8 +775,14 @@ def do_plan(args) -> int:
             "weightPerShard": imgs,
             "weightTotal": sum(imgs),
         }
+        # 每片「预计 OCR 分钟」= 权重/10（因为权重 = 秒数×10）
+        _mins = [round(w / 10 / 60, 1) for w in imgs]
         log(
             f"[plan] 分片均衡（{mode}）：{shard_n} 片，总权重 {sum(imgs)}；每片 {imgs}；每片帖子 {sizes}"
+        )
+        log(
+            f"[plan] 每片预计 OCR 分钟：{_mins}"
+            f"（极差 {max(_mins) / max(0.1, min(_mins)):.2f} 倍）"
         )
         log(f"[plan] 权重来源：{weight_src}")
         if imgs and min(imgs) > 0:
@@ -858,27 +864,95 @@ def _det_input_area(url: str) -> int:
     return short * long_
 
 
-def _item_image_weight(item: dict) -> int:
-    """一条列表行的工作量权重（用于分片均衡）。
+def _ocr_seconds_of_url(url: str) -> float:
+    """按 URL 里的尺寸估「这张图 OCR 要多少秒」（分片权重的核心量）。
 
-    - **大港澳**：图片 URL 带 `_<w>_<h>_` 尺寸 → `Σ det 输入像素` + 回复图估计
-    - **澳彩 / 49图库**：URL 不带尺寸（`v27-xxx.jpg`）→ 退回 `正文图*2 + 回复量`
+    ## 为什么用秒数而不是 det 面积（2026-11-19 实测）
+    run 44478252994：det 面积权重极差 **1.28 倍**（plan 以为很均衡），
+    而实际分片耗时极差 **11.26 倍**（1.9 分 vs 21.4 分）。
+    → det 面积不是 OCR 成本的好代理（台账 #13 记录相关 0.626，不够用）。
+    原因：det 面积算的是「短边缩放到 736 后的输入像素」，把窄长图放大到荒谬程度
+    （135×2143 → 8.6M，而普通 1080×1920 只有 2.1M），但两者 OCR 耗时差不到 4 倍。
+
+    ## 分档依据（本机按**文件体积**分桶实测，2026-11-18/19）
+        <100KB（~700px 宽）      0.67 秒
+        100-300KB（~1080px 宽）  1.30 秒
+        300-600KB（~1080px 宽）  1.37 秒
+        600KB-1MB                8.91 秒   ← 跳跃 6.5 倍（跨过 det 缩放临界点）
+        >1MB                     7.86 秒
+    体积 ≈ 原始像素面积 × 压缩率 → 这里用**原始面积**（w×h）分档。
+
+    ## 额外修正：窄长图（长宽比 > 4）乘 1.5
+    实测 135×2143 这类窄长图，文字行密集，rec 阶段比同面积方图慢约 1.5 倍。
+
+    URL 不带尺寸（aocai/tuku 的 `v27-xxx.jpg`）→ 返回 0，由调用方退回按图数计。
+    """
+    m = _IMG_DIM_RE.search(url or "")
+    if not m:
+        return 0.0
+    try:
+        w, h = int(m.group(1)), int(m.group(2))
+    except (TypeError, ValueError):
+        return 0.0
+    if w <= 0 or h <= 0:
+        return 0.0
+
+    area = w * h                       # ★ 原始面积，不是 det 缩放后的面积
+    if area < 300_000:
+        sec = 0.7
+    elif area < 1_000_000:
+        sec = 1.3
+    elif area < 2_500_000:
+        sec = 1.5
+    elif area < 5_000_000:
+        sec = 3.5
+    else:
+        sec = 8.0
+
+    # 窄长图（长宽比 > 4）：文字行密集，实测慢约 1.5 倍
+    ratio = max(w, h) / max(1, min(w, h))
+    if ratio > 4:
+        sec *= 1.5
+    return round(sec, 2)
+
+def _item_image_weight(item: dict) -> int:
+    """一条列表行的工作量权重 = **预估 OCR 秒数 × 10**（用于分片均衡）。
+
+    ## 2026-11-19 变更：从「det 输入像素」改成「OCR 秒数」
+    实测 run 44478252994：det 面积权重极差 **1.28 倍**（plan 以为很均衡），
+    实际分片耗时极差 **11.26 倍**（1.9 分 vs 21.4 分）。
+    → det 面积不是 OCR 成本的好代理（台账 #13 记的相关系数 0.626，不够用）。
+
+    新口径：`Σ _ocr_seconds_of_url(图)` + 回复图秒数估计（×10 保留精度）。
+    这样 plan 的「极差」就等于「耗时极差」，均衡才有意义。
+
+    - **大港澳**：URL 带 `_<w>_<h>_` 尺寸 → 按面积分档估秒数
+    - **澳彩 / 49图库**：URL 不带尺寸（`v27-xxx.jpg`）→ 按「图数 × 1.0 秒」
+      （这两源图尺寸分布相近，实测本来就不失衡）
     """
     urls = [u.strip() for u in str(item.get("img") or "").split(",") if u.strip()]
-    area = sum(_det_input_area(u) for u in urls)
     try:
         replies = max(0, int(item.get("replyPoint") or 0))
     except (TypeError, ValueError):
         replies = 0
-    if area > 0:
-        return int(area + replies * _REPLY_IMG_PER_REPLY * _MEDIAN_IMG_AREA)
+
+    # 正文图的 OCR 秒数（按图面积分档，见 _ocr_seconds_of_url）
+    secs = sum(_ocr_seconds_of_url(u) for u in urls)
+
+    if secs > 0:
+        # 有尺寸信息（dahkg）：按秒数 + 回复图秒数（用中位 1.5 秒估）
+        weight = secs + replies * _REPLY_IMG_PER_REPLY * 1.5
+        return max(1, int(round(weight * 10)))      # ×10 保留一位小数精度
+
+    # 无尺寸信息（aocai/tuku）：图尺寸分布相近，按「图数 × 1.0 秒」计
     body = 0
     try:
         body = int(item.get("imgTotal") or 0)
     except (TypeError, ValueError):
         body = 0
     body = body or max(1, len(urls))
-    return max(1, body * 2 + replies)
+    weight = body * 1.0 + replies * _REPLY_IMG_PER_REPLY * 1.0
+    return max(1, int(round(weight * 10)))
 
 
 #: 三源列表行里的**作者字段名**（2026-11-17 实测）
