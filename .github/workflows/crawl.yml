@@ -1325,8 +1325,12 @@ jobs:
             ELAPSED=$(( ($(date +%s) - START) / 60 ))
 
             # ① 业务是否全部完成（gh 内嵌 jq，不依赖外部 jq 二进制）
+#    ⚠ 2026-11-19：PENDING **排除 publish** —— publish 是最后一步，一旦开始就让它跑完。
+#    原因：run 44451294477 实测「分片 20/20 全 success、merge aocai/tuku success、
+#    merge dahkg 跑到 14.3 分」时 watchdog 在 40.4 分 cancel → publish 被 skip → 数据没入库。
+#    watchdog 的意图是防「卡死」不是防「慢」；数据安全 > 效率。
             PENDING=$(gh api "repos/$REPO/actions/runs/$RUN/jobs" \
-              --jq '[.jobs[] | select(.name != "Watchdog 整轮 40 分钟上限") | select(.status != "completed")] | length' \
+              --jq '[.jobs[] | select(.name != "Watchdog 整轮 40 分钟上限") | select(.name | test("publish") | not) | select(.status != "completed")] | length' \
               2>/dev/null || echo 99)
             echo "=== 已跑 ${ELAPSED} 分（兜底 ${MAX_MIN}）；未完成 job 数 ${PENDING} ==="
             if [ "$PENDING" = "0" ]; then
