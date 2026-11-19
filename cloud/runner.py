@@ -1843,6 +1843,42 @@ TEXT_PRODUCTS = (
 )
 
 
+def _count_all_images(posts: list[dict]) -> dict:
+    """统计**所有位置**的图片数（正文/回复/楼中楼/评论/评论楼中楼）。
+
+    ## 为什么需要（2026-11-20 实测）
+    core 的 `imageCount` 只算 `images + replies[].images` = 9208，
+    而产物里实际有 19437 张（评论图 9714 + 楼中楼 257 未计入）。
+    用户看到「才 1000+」误以为漏抓 —— 其实是字段口径不对。
+
+    返回：{total, 正文, 回复, 楼中楼, 评论, 评论楼中楼, unique_urls}
+    """
+    stat = {"total": 0, "正文": 0, "回复": 0, "楼中楼": 0, "评论": 0, "评论楼中楼": 0}
+    urls: set[str] = set()
+
+    def _take(pos: str, ims) -> None:
+        for im in (ims or []):
+            stat[pos] += 1
+            stat["total"] += 1
+            u = str((im or {}).get("url") or "")
+            if u:
+                urls.add(u)
+
+    for p_ in posts:
+        _take("正文", p_.get("images"))
+        for r in (p_.get("replies") or []):
+            _take("回复", r.get("images"))
+            for s2 in (r.get("secondLevelComments") or []):
+                _take("楼中楼", s2.get("images"))
+        for c in (p_.get("commentsAll") or []):
+            _take("评论", c.get("images"))
+            for s2 in (c.get("secondLevelComments") or []):
+                _take("评论楼中楼", s2.get("images"))
+
+    stat["unique_urls"] = len(urls)
+    return stat
+
+
 def _ensure_text_products(out_dir: Path, source: str, period: int, log) -> list[str]:
     """确保文字版产物存在；缺失就用 text_report 补生成。返回补生成的清单。
 
@@ -2790,7 +2826,29 @@ def do_run(args, mode: str = "run") -> int:
         _annotate_hit_rate(out_dir, meta, shard_stats, log)
         # ① 补文字版（dahkg 的 run_dahkg_report 不生成）
         _ensure_text_products(out_dir, source, period, log)
-        # ② 21 产物齐全硬校验（缺任一即失败）
+        # ② imageCount 口径修正：统计所有位置的图（含评论图/楼中楼图）
+        _img = _count_all_images(meta.get("_posts_for_count") or [])
+        # meta 里没有 posts，重新读一遍（load_products 已读过）
+        try:
+            from . import _reconcile as _rec3
+
+            _meta3, _posts3 = _rec3.load_products(out_dir)
+            _img = _count_all_images(_posts3)
+            _old_ic = int(meta.get("imageCount") or 0)
+            meta["imageCount"] = _img["total"]
+            meta["imageCountByPosition"] = {
+                k: v for k, v in _img.items() if k not in ("total",)
+            }
+            from . import _guard as _g3
+
+            _g3.save_json(out_dir / "run_meta.json", meta)
+            log(f"[merge] imageCount 口径修正：{_old_ic} → {_img['total']}"
+                f"（正文 {_img['正文']} / 回复 {_img['回复']} / 楼中楼 {_img['楼中楼']}"
+                f" / 评论 {_img['评论']} / 评论楼中楼 {_img['评论楼中楼']}；"
+                f"去重 URL {_img['unique_urls']}）")
+        except Exception as exc:  # noqa: BLE001
+            log(f"[merge] ⚠ imageCount 修正失败：{type(exc).__name__}: {exc}")
+        # ③ 21 产物齐全硬校验（缺任一即失败）
         _check_products_complete(out_dir, source, log)
     got_period = int(meta.get("period") or 0)
     if not period:
