@@ -2205,8 +2205,30 @@ def do_merge_summary(args) -> int:
         f"去重 {mstats['duplicates']} 帖 → {len(merged)} 帖")
 
     # P1：缺帖时打印「各片上报数」+「缺失 ID」，便于定位是分页抖动还是分配漏
+    # 【2026-11-19 修订】断言基准改为「plan 的 shardPlan.groups 并集」——
+    # 因为分片只能处理「被分配进 groups 的帖」：
+    #   plan 内部有断言①③保证 groups 并集 == union_ids（本次扫描结果），
+    #   而 `counts.expectedPosts` 来自另一次独立扫描，两者可能差 1-2 帖（分页抖动）。
+    #   那种「没被分配进任何分片」的帖，summary 永远拿不到（legacy 的 merge 全量重采能拿到）。
+    #   → 断言用可达上限（groups 并集），并把 plan 内部差异**明确告警**（不静默）。
+    planned_set: set[int] = set()
+    for _g in ((plan.get("shardPlan") or {}).get("groups") or {}).values():
+        for _x in (_g or []):
+            try:
+                planned_set.add(int(_x))
+            except (TypeError, ValueError):
+                continue
+    target = len(planned_set) if planned_set else expected
+    if planned_set and expected and len(planned_set) != expected:
+        log(
+            f"[merge-summary] ⚠ plan 内部不一致：shardPlan.groups 并集 {len(planned_set)}"
+            f" != counts.expectedPosts {expected}"
+            f"（差 {abs(expected - len(planned_set))} 帖未被分配到任何分片；"
+            f"summary 无法产出，legacy 全量重采可补上）"
+        )
+
     per_shard = [len(ps or []) for ps in shard_posts]
-    if expected and len(merged) != expected:
+    if target and len(merged) != target:
         got_ids = set()
         for _p in merged:
             try:
@@ -2223,9 +2245,10 @@ def do_merge_summary(args) -> int:
                     planned.add(int(_aid))
                 except (TypeError, ValueError):
                     continue
-        missing = sorted(planned - got_ids) if planned else []
+        missing = sorted(planned_set - got_ids) if planned_set else []
         shard_desc = ", ".join(f"shard{i}={n}" for i, n in enumerate(per_shard))
-        log(f"[merge-summary] ❌ 汇总后 {len(merged)} 帖 != plan 预期 {expected} 帖")
+        log(f"[merge-summary] ❌ 汇总后 {len(merged)} 帖 != 可达上限 {target} 帖"
+            f"（groups 并集）")
         log(f"[merge-summary]    各片上报: {shard_desc}（合计 {sum(per_shard)}）")
         if missing:
             log(f"[merge-summary]    缺失 ID（{len(missing)} 个）: {missing[:20]}"
