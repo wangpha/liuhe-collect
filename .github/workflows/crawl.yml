@@ -330,6 +330,8 @@ jobs:
         env:
           NO_OCR: ${{ github.event.inputs.no_ocr || 'false' }}
           NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
+          # OCR 进程数（2026-11-20 A/B 验证）：1=串行（安全），2=双进程（1.40x，需 core/ocr.py 的 fork reset 修复）
+          QODE_OCR_PROCS: ${{ github.event.inputs.ocr_procs || '2' }}
         run: |
           set -o pipefail
           # SIGTERM 优雅投降（2026-11-19）：1200s(20 分) 远小于 job timeout 1500s(25 分)
@@ -530,6 +532,8 @@ jobs:
         env:
           NO_OCR: ${{ github.event.inputs.no_ocr || 'false' }}
           NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
+          # OCR 进程数（2026-11-20 A/B 验证）：1=串行（安全），2=双进程（1.40x，需 core/ocr.py 的 fork reset 修复）
+          QODE_OCR_PROCS: ${{ github.event.inputs.ocr_procs || '2' }}
         run: |
           set -o pipefail
           # SIGTERM 优雅投降（2026-11-19）：1200s(20 分) 远小于 job timeout 1500s(25 分)
@@ -730,6 +734,8 @@ jobs:
         env:
           NO_OCR: ${{ github.event.inputs.no_ocr || 'false' }}
           NO_IMAGES: ${{ github.event.inputs.no_images || 'false' }}
+          # OCR 进程数（2026-11-20 A/B 验证）：1=串行（安全），2=双进程（1.40x，需 core/ocr.py 的 fork reset 修复）
+          QODE_OCR_PROCS: ${{ github.event.inputs.ocr_procs || '2' }}
         run: |
           set -o pipefail
           # SIGTERM 优雅投降（2026-11-19）：1200s(20 分) 远小于 job timeout 1500s(25 分)

@@ -18,14 +18,25 @@ from pathlib import Path
 #: 云端只用 CPU（文档 3.6：GPU/CPU 识别结果逐字段一致；3.1：runner 无 GPU）
 FORCE_ENV = {
     "QODE_OCR_DML": "0",          # 关掉 DirectML，走 rapidocr CPU
-    # 进程数保持 1：`ocr_parallel_plan()` 在 QODE_OCR_PROCS=N 时返回 (N, 2)，
-    # 设 4 会变成 **4 进程 × 2 线程**。2026-11-16 实测（Gate1 分片版 run 43817560024）：
+    # 进程数：**默认 1，但允许环境变量覆盖**（2026-11-20 变更）。
+    #
+    # ## 历史（2026-11-16 实测，run 43817560024）
     #   QODE_OCR_PROCS=4 → OCR 批次 **全失败**（110/281/91/124 张：新识别 0、成功 0、失败 N）
-    #   QODE_OCR_PROCS=1 → 所有串行 run 均 0 失败
-    # 用户给的 8 线程基准（run 43808226501）测的是**单进程内 ONNX 线程数**，
-    # 与"多进程"不是一回事；要真正拿到 8 线程需要改 core 的 configure_onnx_threads 调用，
-    # 属核心改动，未做。这里取"实测 0 失败"的配置优先。
-    "QODE_OCR_PROCS": "1",
+    #   QODE_OCR_PROCS=1 → 全部 0 失败
+    # 所以当时硬编码 1 是「用串行换正确性」的取舍。
+    #
+    # ## 根因已查清并修复（2026-11-20）
+    #   core/ocr.py L1204 `configure_onnx_threads()`：
+    #       if _ONNX_THREADS == threads or _ENGINE is not None: return
+    #   Linux 下 ProcessPoolExecutor 默认 **fork**，子进程继承父进程的 `_ENGINE`
+    #   （ONNX InferenceSession 在 fork 后不可用）→ 早退 → 沿用坏引擎 → 推理全失败。
+    #   已修：core/ocr.py 加 `reset_worker_state()`，`ocr_worker_initializer()` 在 fork 时调用。
+    #   本地实测（Windows/spawn）：PROCS=1 → 3.07 秒/张，PROCS=2 → 2.19 秒/张（1.40x）。
+    #
+    # ## 现在的策略
+    #   默认仍是 1（安全）；workflow 可设 `QODE_OCR_PROCS=2` 做云端 A/B，
+    #   失败就删掉该环境变量即回到安全值。
+    "QODE_OCR_PROCS": os.environ.get("QODE_OCR_PROCS") or "1",
     "PYTHONIOENCODING": "utf-8",
     "PYTHONUTF8": "1",
     "PYTHONUNBUFFERED": "1",
