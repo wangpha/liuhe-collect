@@ -1,0 +1,35 @@
+# cron 探针（临时）：验证 GitHub 定时触发是否正常
+# 创建于 2026-11-20 15:11:52 UTC
+# 目标触发：2026-11-20 15:13 UTC（北京 23:13）
+# 验证通过后删除
+name: cron探针
+
+on:
+  schedule:
+    - cron: '13 15 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: cron 触发验证
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: 记录触发信息
+        run: |
+          echo "## cron 探针结果"
+          echo ""
+          echo "| 项目 | 值 |"
+          echo "|---|---|"
+          echo "| 触发事件 | ${{ github.event_name }} |"
+          echo "| 触发时间(UTC) | $(date -u +'%Y-%m-%d %H:%M:%S') |"
+          echo "| 触发时间(北京) | $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S') |"
+          echo "| commit | ${{ github.sha }} |"
+          echo "| run_id | ${{ github.run_id }} |"
+          echo ""
+          echo "EVENT=${{ github.event_name }}"
+          echo "RAN_AT_UTC=$(date -u +%s)"
+          echo ">>> cron 探针执行成功 <<<"
