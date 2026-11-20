@@ -1483,7 +1483,11 @@ jobs:
           git config user.email "liuhe-bot@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then echo "无变化"; exit 0; fi
-          git commit -m "data: 云端采集(分片) $(date -u +%Y-%m-%dT%H:%M:%SZ) run#${{ github.run_number }}"
+          # ⚠ 2026-11-21：commit message 里带上期号，供本地软件反查
+          #   （artifact 名只有 run_id，本地要显示「第X期」只能靠这里）
+          PERIODS=$(git diff --cached --name-only | grep -oP '澳门_[0-9]{4}_\K[0-9]{3,7}(?=期)' | sort -u | paste -sd, -)
+          [ -z "$PERIODS" ] && PERIODS="?"
+          git commit -m "data: 云端采集(分片) 期${PERIODS} $(date -u +%Y-%m-%dT%H:%M:%SZ) run#${{ github.run_number }}"
           git push
       - name: 上传合并结果
         if: always()
