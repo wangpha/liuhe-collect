@@ -133,7 +133,11 @@ jobs:
       - name: 计算源列表与分片数
         id: pick
         env:
-          REQ: ${{ github.event.inputs.source || 'tuku' }}
+          # ⚠ 2026-11-20 根因修复：`github.event.inputs.source` 只在 workflow_dispatch 时有值，
+          # schedule 触发时为空 → 原来的 `|| 'tuku'` 会让 cron 只跑 tuku 一个源
+          # （实测 schedule run 44767982757：dahkg/aocai 全部 skipped）。
+          # 改成：定时触发跑全部三源，手动触发用用户选的。
+          REQ: ${{ github.event_name == 'schedule' && 'all' || github.event.inputs.source || 'all' }}
         run: |
           echo "请求源: $REQ"
           case "$REQ" in

@@ -1823,6 +1823,7 @@ def _check_low_confidence(out_dir: Path, threshold: float = 0.7) -> dict:
 
 
 #: 一个完整期产物应有的 21 个文件（来源：数据仓 322/323 期 tar 实测）
+#: **所有源都应有**的产物（21 个）
 REQUIRED_PRODUCTS = (
     "claims.csv", "claims.json", "manifest.json",
     "ocr.csv", "ocr.json",
@@ -1835,6 +1836,24 @@ REQUIRED_PRODUCTS = (
     "六合_看板.html", "六合_结构化.xlsx",
     "当期文字版.txt", "文字版.html", "文字版.txt",
 )
+
+#: **只有论坛类源**（aocai / dahkg）才产出的产物。
+#: ⚠ 2026-11-20 根因修复：`论坛原帖.html` 只有 aocai/dahkg 产出，
+#: tuku（图库源）没有。之前把它列进通用必需清单，导致
+#: `[merge-summary] ❌ 产物缺失 1 个：['论坛原帖.html']` → 合并 tuku 失败
+#: （schedule run 44767982757 实测）。
+FORUM_ONLY_PRODUCTS = ("论坛原帖.html",)
+
+
+def required_products_of(source: str) -> tuple[str, ...]:
+    """该源应有的完整产物清单。
+
+    aocai / dahkg：21 + 1（论坛原帖.html）= 22 个
+    tuku         ：21 个
+    """
+    if source in ("aocai", "dahkg"):
+        return REQUIRED_PRODUCTS + FORUM_ONLY_PRODUCTS
+    return REQUIRED_PRODUCTS
 
 #: 文字版相关产物（dahkg 的 run_dahkg_report 不生成，需要补）
 TEXT_PRODUCTS = (
@@ -1943,9 +1962,10 @@ def _check_products_complete(out_dir: Path, source: str, log) -> None:
     run 44597918831：`merge dahkg: success`，但产物只有 17 个（缺 6 个文字版）。
     「merge 成功」不等于「产物完整」—— 因为没有任何地方校验产物清单。
     """
-    missing = [n for n in REQUIRED_PRODUCTS if not (out_dir / n).exists()]
-    have = len(REQUIRED_PRODUCTS) - len(missing)
-    log(f"[merge] 产物清单：{have}/{len(REQUIRED_PRODUCTS)} 齐全"
+    required = required_products_of(source)
+    missing = [n for n in required if not (out_dir / n).exists()]
+    have = len(required) - len(missing)
+    log(f"[merge] 产物清单：{have}/{len(required)} 齐全"
         + (f"；缺 {missing}" if missing else ""))
     if missing:
         raise SystemExit(
@@ -2687,20 +2707,10 @@ def do_merge_summary(args) -> int:
     low_conf = _check_low_confidence(out_dir, threshold=0.7)
     log(f"[防线5] 低置信度归档：{low_conf.get('lowCount', 0)} 条（只归档、不删改）")
 
-    # ---------- ⑨b 产物齐全硬校验（21 个，缺一即失败）----------
-    # 清单来源：数据仓 322 期 tar 实测（21 个文件）
-    _REQUIRED_PRODUCTS = (
-        "claims.csv", "claims.json", "manifest.json",
-        "ocr.csv", "ocr.json",
-        "posts.csv", "posts.json",
-        "replies.csv", "replies.json",
-        "report.md", "run_meta.json",
-        "users.csv", "users.json",
-        "validation.json",
-        "全站文字版.html", "全站文字版.json", "全站文字版.txt",
-        "六合_看板.html", "六合_结构化.xlsx",
-        "当期文字版.txt", "文字版.html", "文字版.txt", "论坛原帖.html",
-    )
+    # ---------- ⑨b 产物齐全硬校验（按源，缺一即失败）----------
+    # ⚠ 2026-11-20 根因修复：原来把 aocai 特有的「论坛原帖.html」列进通用清单，
+    # 导致 tuku 合并误报「产物缺失」→ 合并 tuku 失败（run 44767982757）。
+    _REQUIRED_PRODUCTS = required_products_of(source)
     _missing_products = [n for n in _REQUIRED_PRODUCTS if not (out_dir / n).exists()]
     log(f"[merge-summary] 产物清单：{len(_REQUIRED_PRODUCTS) - len(_missing_products)}"
         f"/{len(_REQUIRED_PRODUCTS)} 齐全"
