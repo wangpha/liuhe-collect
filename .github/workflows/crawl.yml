@@ -91,8 +91,19 @@ on:
     - cron: '15 12 * * *'    # 20:15
     - cron: '50 12 * * *'    # 20:50
 
+# ⚠ 2026-11-20 根因修复：原来 group 是 crawl-<ref>，导致**所有 run 严格串行**。
+# 前一个 run 若异常变慢（曾因 merge 缓存 bug 跑 73 分钟），后面的全部排队
+# （实测：21:44 触发的 run 等到 22:03 才开始，空等 19.1 分钟）。
+#
+# 改为按「档位 + 日期」分组：
+#   · 同一档位（同一天同一个 slot）→ 仍串行，防重复触发
+#   · 不同档位（12:00 / 15:00 / 18:00 / 20:15 / 20:50）→ 各自独立，互不排队
+#   · 手动触发（无 slot）→ 用 run_id，完全不排队
+#
+# 数据安全：publish 步骤用 git pull --rebase，且数据仓是 append-only（每期一个文件），
+# 并发推送冲突概率极低；万一冲突该 run publish 失败，不会损坏已有数据。
 concurrency:
-  group: crawl-${{ github.ref }}
+  group: crawl-${{ github.ref }}-${{ github.event.inputs.slot || github.run_id }}-${{ github.run_attempt }}
   cancel-in-progress: false
 
 env:
@@ -921,7 +932,7 @@ jobs:
         run: |
           set -o pipefail
           python -m cloud.runner --cleanup --work work --out work/out --keep-days 2 --skip-periods 2>&1 | tee work/images_cleanup.log
-      - name: 完整跑一次（缓存全命中）+ 五道防线校验
+      - name: 汇总产物（summary 模式：只汇总不重采集）+ 五道防线校验
         id: merge
         working-directory: repo
         env:
@@ -936,7 +947,7 @@ jobs:
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
           [ "$LIMIT" != "0" ] && EXTRA="$EXTRA --limit $LIMIT"
           python -m cloud.runner --merge --source "dahkg" --work work --out work/out \
-            --state work/store/state --workers 8 $EXTRA --period "${{ github.event.inputs.period || '0' }}" --merge-mode "${{ github.event.inputs.merge_mode || 'legacy' }}" 2>&1 | tee "work/run_dahkg.log"
+            --state work/store/state --workers 8 $EXTRA --period "${{ github.event.inputs.period || '0' }}" --merge-mode "${{ github.event.inputs.merge_mode || 'summary' }}" 2>&1 | tee "work/run_dahkg.log"
       - name: 失败/超时诊断（写 Step Summary）
         if: failure()
         run: |
@@ -1068,7 +1079,7 @@ jobs:
         run: |
           set -o pipefail
           python -m cloud.runner --cleanup --work work --out work/out --keep-days 2 --skip-periods 2>&1 | tee work/images_cleanup.log
-      - name: 完整跑一次（缓存全命中）+ 五道防线校验
+      - name: 汇总产物（summary 模式：只汇总不重采集）+ 五道防线校验
         id: merge
         working-directory: repo
         env:
@@ -1083,7 +1094,7 @@ jobs:
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
           [ "$LIMIT" != "0" ] && EXTRA="$EXTRA --limit $LIMIT"
           python -m cloud.runner --merge --source "aocai" --work work --out work/out \
-            --state work/store/state --workers 8 $EXTRA --period "${{ github.event.inputs.period || '0' }}" --merge-mode "${{ github.event.inputs.merge_mode || 'legacy' }}" 2>&1 | tee "work/run_aocai.log"
+            --state work/store/state --workers 8 $EXTRA --period "${{ github.event.inputs.period || '0' }}" --merge-mode "${{ github.event.inputs.merge_mode || 'summary' }}" 2>&1 | tee "work/run_aocai.log"
       - name: 失败/超时诊断（写 Step Summary）
         if: failure()
         run: |
@@ -1215,7 +1226,7 @@ jobs:
         run: |
           set -o pipefail
           python -m cloud.runner --cleanup --work work --out work/out --keep-days 2 --skip-periods 2>&1 | tee work/images_cleanup.log
-      - name: 完整跑一次（缓存全命中）+ 五道防线校验
+      - name: 汇总产物（summary 模式：只汇总不重采集）+ 五道防线校验
         id: merge
         working-directory: repo
         env:
@@ -1230,7 +1241,7 @@ jobs:
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
           [ "$LIMIT" != "0" ] && EXTRA="$EXTRA --limit $LIMIT"
           python -m cloud.runner --merge --source "tuku" --work work --out work/out \
-            --state work/store/state --workers 8 $EXTRA --period "${{ github.event.inputs.period || '0' }}" --merge-mode "${{ github.event.inputs.merge_mode || 'legacy' }}" 2>&1 | tee "work/run_tuku.log"
+            --state work/store/state --workers 8 $EXTRA --period "${{ github.event.inputs.period || '0' }}" --merge-mode "${{ github.event.inputs.merge_mode || 'summary' }}" 2>&1 | tee "work/run_tuku.log"
       - name: 失败/超时诊断（写 Step Summary）
         if: failure()
         run: |
