@@ -1837,22 +1837,25 @@ REQUIRED_PRODUCTS = (
     "当期文字版.txt", "文字版.html", "文字版.txt",
 )
 
-#: **只有论坛类源**（aocai / dahkg）才产出的产物。
-#: ⚠ 2026-11-20 根因修复：`论坛原帖.html` 只有 aocai/dahkg 产出，
-#: tuku（图库源）没有。之前把它列进通用必需清单，导致
-#: `[merge-summary] ❌ 产物缺失 1 个：['论坛原帖.html']` → 合并 tuku 失败
-#: （schedule run 44767982757 实测）。
-FORUM_ONLY_PRODUCTS = ("论坛原帖.html",)
+#: **只有 dahkg 才产出**的产物。
+#: ⚠ 2026-11-21 二次修正（两次实测证据）：
+#:   · run 44767982757「合并 tuku」失败 → 缺 论坛原帖.html
+#:   · run 44809354181「合并 aocai」失败 → 缺 论坛原帖.html
+#: 说明 `论坛原帖.html` **只有 dahkg（大港澳）源生成**，
+#: aocai（澳彩交流）和 tuku（49图库）都不产出。
+#: 之前误以为 aocai 也有，导致 cron 里的 aocai 合并必然失败。
+DAHKG_ONLY_PRODUCTS = ("论坛原帖.html",)
 
 
 def required_products_of(source: str) -> tuple[str, ...]:
     """该源应有的完整产物清单。
 
-    aocai / dahkg：21 + 1（论坛原帖.html）= 22 个
-    tuku         ：21 个
+    dahkg：21 + 1（论坛原帖.html）= 22 个
+    aocai：21 个
+    tuku ：21 个
     """
-    if source in ("aocai", "dahkg"):
-        return REQUIRED_PRODUCTS + FORUM_ONLY_PRODUCTS
+    if source == "dahkg":
+        return REQUIRED_PRODUCTS + DAHKG_ONLY_PRODUCTS
     return REQUIRED_PRODUCTS
 
 #: 文字版相关产物（dahkg 的 run_dahkg_report 不生成，需要补）
