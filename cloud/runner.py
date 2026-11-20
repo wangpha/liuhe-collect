@@ -1864,6 +1864,15 @@ TEXT_PRODUCTS = (
     "当期文字版.txt", "文字版.html", "文字版.txt",
 )
 
+#: aocai / dahkg 还需要「论坛原帖.html」（tuku 不需要）
+#: ⚠ 2026-11-21 根因修复：summary 模式只调 text_report.write_text_report，
+#: 它不生成 论坛原帖.html，导致：
+#:   run 44767982757 合并 tuku  失败（tuku 本不需要，是我的必需清单写错）
+#:   run 44790922755 合并 aocai 失败（aocai 需要，summary 没生成）
+#:   run 44809354181 合并 dahkg 失败（dahkg 需要，summary 没生成）
+#: 正确做法：summary 模式**补齐**该产物，而不是从必需清单里删掉标准。
+FORUM_HTML_PRODUCTS = ("论坛原帖.html",)
+
 
 def _count_all_images(posts: list[dict]) -> dict:
     """统计**所有位置**的图片数（正文/回复/楼中楼/评论/评论楼中楼）。
@@ -1909,7 +1918,11 @@ def _ensure_text_products(out_dir: Path, source: str, period: int, log) -> list[
     所以 dahkg 产物只有 17 个（缺 6 个文字版）。而 aocai/tuku 的入口里有，
     所以它们 22-23 个。这是 core 三源的历史差异，属编排层职责，在 runner 里补齐。
     """
-    missing = [n for n in TEXT_PRODUCTS if not (out_dir / n).exists()]
+    # aocai / dahkg 需要「论坛原帖.html」；tuku 不需要
+    need = list(TEXT_PRODUCTS)
+    if source in ("aocai", "dahkg"):
+        need += list(FORUM_HTML_PRODUCTS)
+    missing = [n for n in need if not (out_dir / n).exists()]
     if not missing:
         return []
 
@@ -1947,6 +1960,26 @@ def _ensure_text_products(out_dir: Path, source: str, period: int, log) -> list[
                 log(f"[merge] 全站文字版补生成：{st.get('count', 0)} 位用户")
         except Exception as exc:  # noqa: BLE001
             log(f"[merge] ⚠ 全站文字版补生成失败：{type(exc).__name__}: {exc}")
+
+        # 论坛原帖.html：仅 aocai / dahkg 需要（tuku 无此产物）
+        # 正确签名（2026-11-21 核对）：
+        #   forum.write_outputs(out_root, out_dir, meta, posts, users, update_latest=True)
+        if source in ("aocai", "dahkg") and not (out_dir / "论坛原帖.html").exists():
+            try:
+                from core import forum as _forum
+
+                meta3, posts3 = _reconcile.load_products(out_dir)
+                users3 = _scraper.build_users(posts3) if posts3 else []
+                _forum.write_outputs(
+                    out_dir.parent, out_dir, meta3, posts3, users3,
+                    update_latest=False,
+                )
+                ok3 = (out_dir / "论坛原帖.html").exists()
+                log(f"[merge] 论坛原帖.html 补生成{'成功' if ok3 else '仍未产出'}"
+                    f"（users={len(users3)}）")
+            except Exception as exc:  # noqa: BLE001
+                log(f"[merge] ⚠ 论坛原帖.html 补生成失败：{type(exc).__name__}: {exc}")
+
 
         still = [n for n in TEXT_PRODUCTS if not (out_dir / n).exists()]
         ok_list = [n for n in missing if n not in still]
@@ -2684,6 +2717,30 @@ def do_merge_summary(args) -> int:
     except Exception as exc:  # noqa: BLE001
         log(f"[merge-summary] ❌ 文字版生成失败（拒绝交付残缺产物）：{type(exc).__name__}: {exc}")
         raise SystemExit(42) from exc
+
+    # ---------- ⑦b 论坛原帖.html（仅 aocai / dahkg 需要，tuku 无）----------
+    # ⚠ 2026-11-21 根因修复：summary 模式没有调 forum.write_outputs，
+    # 导致产物少 1 个 → 合并 aocai / dahkg 必然失败：
+    #   run 44790922755 / 44809354181 实测：[merge-summary] ❌ 产物缺失 ['论坛原帖.html']
+    # 正确签名：forum.write_outputs(out_root, out_dir, meta, posts, users, update_latest=True)
+    if source in ("aocai", "dahkg") and not (out_dir / "论坛原帖.html").exists():
+        try:
+            from core import forum as _forum
+
+            # 正确入口（core/forum.py L1181）：write_thread_html(out_dir, posts)
+            # forum.write_outputs 不生成这个文件，它在 run_forum_report 里单独调
+            _forum.write_thread_html(out_dir, merged)
+            _okf = (out_dir / "论坛原帖.html").exists()
+            log(f"[merge-summary] 论坛原帖.html "
+                f"{'✅ 已生成' if _okf else '❌ 仍未产出'}（{len(merged)} 帖）")
+            if not _okf:
+                raise SystemExit(42)
+        except SystemExit:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log(f"[merge-summary] ❌ 论坛原帖.html 生成失败：{type(exc).__name__}: {exc}")
+            raise SystemExit(42) from exc
+
     rebuild_sec = _time.time() - t_rb
     log(f"[merge-summary] 产物写出完成（{rebuild_sec:.2f}s）")
 
