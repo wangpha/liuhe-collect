@@ -902,13 +902,15 @@ jobs:
           done
           echo "共解开 $n 份分片缓存到 work/cache-in/"
           find work/cache-in -maxdepth 1 -mindepth 1 -type d | head -20
-      - name: 恢复 OCR 缓存（actions/cache 兜底；必须在合并分片缓存**之前**，否则会用旧快照覆盖合并结果）
-        uses: actions/cache@v4
-        with:
-          path: repo/work/out
-          key: ocr-merge-v3-dahkg-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
-          restore-keys: |
-            ocr-merge-v3-dahkg-${{ github.event.inputs.cache_buster || '0' }}-
+      # ⚠️ 2026-11-20 根因修复：这里原本是
+      #     uses: actions/cache@v4
+      #     with: { path: repo/work/out, key: ocr-merge-v3-dahkg-<bust>-<run_id> }
+      # 导致合并 job 稳定 25-26 分钟超时：
+      #   · work/out 是完整产物目录（含图片），几个 GB、几十万文件
+      #   · actions/cache 在 job 结束时要压缩上传 → 20+ 分钟
+      #   · key 带 run_id → 永远 miss，等于每次白等 + 白传
+      # 这一层缓存是多余的：分片产物已由 download-artifact 落到 work/cache-in，
+      # merge_caches.py 会重建 work/out。故整段删除。
       - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
         working-directory: repo
         run: |
@@ -1047,13 +1049,15 @@ jobs:
           done
           echo "共解开 $n 份分片缓存到 work/cache-in/"
           find work/cache-in -maxdepth 1 -mindepth 1 -type d | head -20
-      - name: 恢复 OCR 缓存（actions/cache 兜底；必须在合并分片缓存**之前**，否则会用旧快照覆盖合并结果）
-        uses: actions/cache@v4
-        with:
-          path: repo/work/out
-          key: ocr-merge-v3-aocai-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
-          restore-keys: |
-            ocr-merge-v3-aocai-${{ github.event.inputs.cache_buster || '0' }}-
+      # ⚠️ 2026-11-20 根因修复：这里原本是
+      #     uses: actions/cache@v4
+      #     with: { path: repo/work/out, key: ocr-merge-v3-dahkg-<bust>-<run_id> }
+      # 导致合并 job 稳定 25-26 分钟超时：
+      #   · work/out 是完整产物目录（含图片），几个 GB、几十万文件
+      #   · actions/cache 在 job 结束时要压缩上传 → 20+ 分钟
+      #   · key 带 run_id → 永远 miss，等于每次白等 + 白传
+      # 这一层缓存是多余的：分片产物已由 download-artifact 落到 work/cache-in，
+      # merge_caches.py 会重建 work/out。故整段删除。
       - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
         working-directory: repo
         run: |
@@ -1192,13 +1196,15 @@ jobs:
           done
           echo "共解开 $n 份分片缓存到 work/cache-in/"
           find work/cache-in -maxdepth 1 -mindepth 1 -type d | head -20
-      - name: 恢复 OCR 缓存（actions/cache 兜底；必须在合并分片缓存**之前**，否则会用旧快照覆盖合并结果）
-        uses: actions/cache@v4
-        with:
-          path: repo/work/out
-          key: ocr-merge-v3-tuku-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
-          restore-keys: |
-            ocr-merge-v3-tuku-${{ github.event.inputs.cache_buster || '0' }}-
+      # ⚠️ 2026-11-20 根因修复：这里原本是
+      #     uses: actions/cache@v4
+      #     with: { path: repo/work/out, key: ocr-merge-v3-dahkg-<bust>-<run_id> }
+      # 导致合并 job 稳定 25-26 分钟超时：
+      #   · work/out 是完整产物目录（含图片），几个 GB、几十万文件
+      #   · actions/cache 在 job 结束时要压缩上传 → 20+ 分钟
+      #   · key 带 run_id → 永远 miss，等于每次白等 + 白传
+      # 这一层缓存是多余的：分片产物已由 download-artifact 落到 work/cache-in，
+      # merge_caches.py 会重建 work/out。故整段删除。
       - name: 合并分片缓存（details/replies/threads/list 按 key 取并集，OCR 按文件名复制）
         working-directory: repo
         run: |
