@@ -324,20 +324,20 @@ jobs:
           key: ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-dahkg-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
             ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-dahkg-${{ github.event.inputs.cache_buster || '0' }}-
-      # ⚠ 2026-11-21 根因修复（缓存不生效的关键）：
-      #   原来 13 个分片都往同一个 key `ocr-hash-{源}-0-{run_id}` 写，
-      #   而 GitHub actions/cache 的 save 是「key 已存在就跳过」
-      #   → 只有第一个分片写成功，其余 12 片的 OCR 结果**全部丢失**
-      #   （实测：13 片 cache artifact 合计 17 MB，但 ocr-hash-dahkg 只有 10 MB）
-      #   现在改为：分片**只读不写**（actions/cache/restore@v4），
-      #   写只发生在 merge（唯一的写者，见 merge job 的「保存全局 OCR 池」）。
-      - name: 恢复全局 OCR 池（只读，写入由 merge 负责）
-        uses: actions/cache/restore@v4
+      # ⚠ 2026-11-21 架构修正（run 44858821213 实测教训）：
+      #   上一版把缓存 save 放在 merge，结果 merge 要压缩上传 20+ 万文件，
+      #   耗时 16.8 分被 Watchdog 取消 —— 和之前删掉的 ocr-merge-v3 同一坑。
+      #   正确做法：**分片自己 save 自己那份**，key 带 matrix.shard → 13 片互不冲突。
+      #   为什么这样就够：plan 按「用户」分组，同一作者的所有帖子恒在同一片，
+      #   帖子归属稳定 → 分片自己的 cache 天然覆盖它处理过的全部帖子，
+      #   不需要 merge 汇总后再分发。
+      - name: 恢复本片 OCR 缓存（key 带片号，13 片互不冲突）
+        uses: actions/cache@v4
         with:
           path: repo/work/ocr-cache
-          key: ocr-pool-dahkg-v3-readonly-${{ github.run_id }}
+          key: ocr-pool-dahkg-sh${{ matrix.shard }}-v4-${{ github.run_id }}
           restore-keys: |
-            ocr-pool-dahkg-v3-
+            ocr-pool-dahkg-sh${{ matrix.shard }}-v4-
       - name: 把两层缓存铺回各 .cache 目录
         working-directory: repo
         run: |
@@ -533,20 +533,20 @@ jobs:
           key: ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-aocai-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
             ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-aocai-${{ github.event.inputs.cache_buster || '0' }}-
-      # ⚠ 2026-11-21 根因修复（缓存不生效的关键）：
-      #   原来 13 个分片都往同一个 key `ocr-hash-{源}-0-{run_id}` 写，
-      #   而 GitHub actions/cache 的 save 是「key 已存在就跳过」
-      #   → 只有第一个分片写成功，其余 12 片的 OCR 结果**全部丢失**
-      #   （实测：13 片 cache artifact 合计 17 MB，但 ocr-hash-dahkg 只有 10 MB）
-      #   现在改为：分片**只读不写**（actions/cache/restore@v4），
-      #   写只发生在 merge（唯一的写者，见 merge job 的「保存全局 OCR 池」）。
-      - name: 恢复全局 OCR 池（只读，写入由 merge 负责）
-        uses: actions/cache/restore@v4
+      # ⚠ 2026-11-21 架构修正（run 44858821213 实测教训）：
+      #   上一版把缓存 save 放在 merge，结果 merge 要压缩上传 20+ 万文件，
+      #   耗时 16.8 分被 Watchdog 取消 —— 和之前删掉的 ocr-merge-v3 同一坑。
+      #   正确做法：**分片自己 save 自己那份**，key 带 matrix.shard → 13 片互不冲突。
+      #   为什么这样就够：plan 按「用户」分组，同一作者的所有帖子恒在同一片，
+      #   帖子归属稳定 → 分片自己的 cache 天然覆盖它处理过的全部帖子，
+      #   不需要 merge 汇总后再分发。
+      - name: 恢复本片 OCR 缓存（key 带片号，13 片互不冲突）
+        uses: actions/cache@v4
         with:
           path: repo/work/ocr-cache
-          key: ocr-pool-aocai-v3-readonly-${{ github.run_id }}
+          key: ocr-pool-aocai-sh${{ matrix.shard }}-v4-${{ github.run_id }}
           restore-keys: |
-            ocr-pool-aocai-v3-
+            ocr-pool-aocai-sh${{ matrix.shard }}-v4-
       - name: 把两层缓存铺回各 .cache 目录
         working-directory: repo
         run: |
@@ -742,20 +742,20 @@ jobs:
           key: ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-tuku-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
             ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-tuku-${{ github.event.inputs.cache_buster || '0' }}-
-      # ⚠ 2026-11-21 根因修复（缓存不生效的关键）：
-      #   原来 13 个分片都往同一个 key `ocr-hash-{源}-0-{run_id}` 写，
-      #   而 GitHub actions/cache 的 save 是「key 已存在就跳过」
-      #   → 只有第一个分片写成功，其余 12 片的 OCR 结果**全部丢失**
-      #   （实测：13 片 cache artifact 合计 17 MB，但 ocr-hash-dahkg 只有 10 MB）
-      #   现在改为：分片**只读不写**（actions/cache/restore@v4），
-      #   写只发生在 merge（唯一的写者，见 merge job 的「保存全局 OCR 池」）。
-      - name: 恢复全局 OCR 池（只读，写入由 merge 负责）
-        uses: actions/cache/restore@v4
+      # ⚠ 2026-11-21 架构修正（run 44858821213 实测教训）：
+      #   上一版把缓存 save 放在 merge，结果 merge 要压缩上传 20+ 万文件，
+      #   耗时 16.8 分被 Watchdog 取消 —— 和之前删掉的 ocr-merge-v3 同一坑。
+      #   正确做法：**分片自己 save 自己那份**，key 带 matrix.shard → 13 片互不冲突。
+      #   为什么这样就够：plan 按「用户」分组，同一作者的所有帖子恒在同一片，
+      #   帖子归属稳定 → 分片自己的 cache 天然覆盖它处理过的全部帖子，
+      #   不需要 merge 汇总后再分发。
+      - name: 恢复本片 OCR 缓存（key 带片号，13 片互不冲突）
+        uses: actions/cache@v4
         with:
           path: repo/work/ocr-cache
-          key: ocr-pool-tuku-v3-readonly-${{ github.run_id }}
+          key: ocr-pool-tuku-sh${{ matrix.shard }}-v4-${{ github.run_id }}
           restore-keys: |
-            ocr-pool-tuku-v3-
+            ocr-pool-tuku-sh${{ matrix.shard }}-v4-
       - name: 把两层缓存铺回各 .cache 目录
         working-directory: repo
         run: |
@@ -1009,20 +1009,17 @@ jobs:
             repo/work/plan
             repo/work/images_cleanup.log
           if-no-files-found: warn
-      # ⚠ 2026-11-21 新增（用户的核心要求）：
-      #   merge 把各片缓存合并成**完整的一份**后，必须存回 actions/cache，
-      #   供下一轮所有分片 restore。否则合并结果随 runner 销毁而丢失
-      #   （实测：两轮同源同期耗时都是 25-30 分，因为第二轮 restore 到的
-      #    仍是「某个分片的旧快照」，不是「上一轮全部内容」）。
-      #   这是全仓唯一写 ocr-pool 的地方 → 无 key 冲突。
-      - name: 保存全局 OCR 池（供下轮所有分片复用）
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            repo/work/out/**/.cache
-          key: ocr-pool-dahkg-v3-${{ github.run_id }}
-
+      # ⚠ 2026-11-21 新增（用户核心要求）：merge 汇总后把缓存存回 actions/cache。
+      #   否则合并结果随 runner 销毁而丢失 → 下轮分片 restore 到的还是旧快照。
+      #   ⚠ 但**不能**直接缓存 `work/out/**/.cache`：
+      #     实测 run 44858821213 匹配到 22 个期目录、20+ 万文件，
+      #     压缩上传 15+ 分钟 → merge 被 Watchdog 取消。
+      #   改为：先把**当期**的 .cache 汇总到独立目录 work/pool，
+      #     只缓存这个目录（当期约 10-40 MB，秒级完成）。
+      # ⚠ 2026-11-21：merge **不保存 cache**。
+      #   上一版在这里 save 全局池 → 要压缩上传 20+ 万 OCR 文件，
+      #   实测耗时 16.8 分被 Watchdog 取消（与已删除的 ocr-merge-v3 同一坑）。
+      #   缓存改由各分片自己 save（key 带片号，无冲突）。
       - name: 上传产物（数据类，不含图片）
         if: always()
         uses: actions/upload-artifact@v4
@@ -1170,20 +1167,17 @@ jobs:
             repo/work/plan
             repo/work/images_cleanup.log
           if-no-files-found: warn
-      # ⚠ 2026-11-21 新增（用户的核心要求）：
-      #   merge 把各片缓存合并成**完整的一份**后，必须存回 actions/cache，
-      #   供下一轮所有分片 restore。否则合并结果随 runner 销毁而丢失
-      #   （实测：两轮同源同期耗时都是 25-30 分，因为第二轮 restore 到的
-      #    仍是「某个分片的旧快照」，不是「上一轮全部内容」）。
-      #   这是全仓唯一写 ocr-pool 的地方 → 无 key 冲突。
-      - name: 保存全局 OCR 池（供下轮所有分片复用）
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            repo/work/out/**/.cache
-          key: ocr-pool-aocai-v3-${{ github.run_id }}
-
+      # ⚠ 2026-11-21 新增（用户核心要求）：merge 汇总后把缓存存回 actions/cache。
+      #   否则合并结果随 runner 销毁而丢失 → 下轮分片 restore 到的还是旧快照。
+      #   ⚠ 但**不能**直接缓存 `work/out/**/.cache`：
+      #     实测 run 44858821213 匹配到 22 个期目录、20+ 万文件，
+      #     压缩上传 15+ 分钟 → merge 被 Watchdog 取消。
+      #   改为：先把**当期**的 .cache 汇总到独立目录 work/pool，
+      #     只缓存这个目录（当期约 10-40 MB，秒级完成）。
+      # ⚠ 2026-11-21：merge **不保存 cache**。
+      #   上一版在这里 save 全局池 → 要压缩上传 20+ 万 OCR 文件，
+      #   实测耗时 16.8 分被 Watchdog 取消（与已删除的 ocr-merge-v3 同一坑）。
+      #   缓存改由各分片自己 save（key 带片号，无冲突）。
       - name: 上传产物（数据类，不含图片）
         if: always()
         uses: actions/upload-artifact@v4
@@ -1331,20 +1325,17 @@ jobs:
             repo/work/plan
             repo/work/images_cleanup.log
           if-no-files-found: warn
-      # ⚠ 2026-11-21 新增（用户的核心要求）：
-      #   merge 把各片缓存合并成**完整的一份**后，必须存回 actions/cache，
-      #   供下一轮所有分片 restore。否则合并结果随 runner 销毁而丢失
-      #   （实测：两轮同源同期耗时都是 25-30 分，因为第二轮 restore 到的
-      #    仍是「某个分片的旧快照」，不是「上一轮全部内容」）。
-      #   这是全仓唯一写 ocr-pool 的地方 → 无 key 冲突。
-      - name: 保存全局 OCR 池（供下轮所有分片复用）
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            repo/work/out/**/.cache
-          key: ocr-pool-tuku-v3-${{ github.run_id }}
-
+      # ⚠ 2026-11-21 新增（用户核心要求）：merge 汇总后把缓存存回 actions/cache。
+      #   否则合并结果随 runner 销毁而丢失 → 下轮分片 restore 到的还是旧快照。
+      #   ⚠ 但**不能**直接缓存 `work/out/**/.cache`：
+      #     实测 run 44858821213 匹配到 22 个期目录、20+ 万文件，
+      #     压缩上传 15+ 分钟 → merge 被 Watchdog 取消。
+      #   改为：先把**当期**的 .cache 汇总到独立目录 work/pool，
+      #     只缓存这个目录（当期约 10-40 MB，秒级完成）。
+      # ⚠ 2026-11-21：merge **不保存 cache**。
+      #   上一版在这里 save 全局池 → 要压缩上传 20+ 万 OCR 文件，
+      #   实测耗时 16.8 分被 Watchdog 取消（与已删除的 ocr-merge-v3 同一坑）。
+      #   缓存改由各分片自己 save（key 带片号，无冲突）。
       - name: 上传产物（数据类，不含图片）
         if: always()
         uses: actions/upload-artifact@v4
