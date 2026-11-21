@@ -1459,10 +1459,36 @@ def _fill_missing_items(source: str, picked: list[dict], planned_ids, period: in
     todo = missing[:_MISSING_FIX_MAX]
     log(f"[shard] ⚠ 扫列表漏 {len(missing)} 帖（分页抖动），按 id 抓详情补齐：{todo[:8]}")
 
+    # ⚠ 2026-11-21 根因修复（run 44913469222 实测缺 1 帖 3230714）：
+    #   分片扫列表漏 1 帖后按 id 补抓，但源站 `/getbbsreply` 那一刻返回非 JSON
+    #   （Expecting value: line 1 column 1 (char 0)）→ 只试一次就放弃 →
+    #   写 unfinished 交 merge → merge 是 summary 模式（MAG 只汇总，不采集）
+    #   → 补不了 → 缺 1 帖 → 整轮失败。
+    #
+    #   这是**源站瞬时故障**（不是我方逻辑错），正确做法是对「同一个已确认失败的
+    #   具体帖子」做**有限次**带退避的重试：
+    #     · 次数固定 3，不随失败增长
+    #     · 只重试失败的那几帖，不重跑整个分片
+    #     · 3 次仍失败 → 如实写 unfinished 并明确报错（不静默、不降级）
+    #   这不是「靠加重试掩盖结构性问题」，而是消化外部瞬时抖动；
+    #   结构性缺口仍有完整的上报与拦截路径。
+    _REFILL_TRIES = 3
+    _REFILL_BACKOFF = (1.0, 2.0)
+
     fixed = 0
     failed: list[int] = []
     for aid in todo:
-        row = _fetch_missing_row(source, aid, period)
+        row = None
+        for _try in range(_REFILL_TRIES):
+            row = _fetch_missing_row(source, aid, period)
+            if row:
+                break
+            if _try < _REFILL_TRIES - 1:
+                _wait = _REFILL_BACKOFF[min(_try, len(_REFILL_BACKOFF) - 1)]
+                log(f"[shard] 补抓 {source}#{aid} 第 {_try + 1} 次失败，{_wait:.0f}s 后重试（源站瞬时故障）")
+                time.sleep(_wait)
+        if not row:
+            log(f"[shard] ⚠ 补抓 {source}#{aid} 连续 {_REFILL_TRIES} 次失败（源站持续不可用）")
         if row:
             picked.append(row)
             fixed += 1
