@@ -762,6 +762,29 @@ def do_plan(args) -> int:
             user_weights=user_weights,
             split_ratio=2.0,
         )
+        # ⚠ 2026-11-22 根因修复（run 44923327016 实测：tuku 各片合计 930 > 上限 928）：
+        #   _rebalance_groups 会把「超大用户」的帖子拆到多个片，但它只改 groups（帖子归属），
+        #   没有同步 user_groups（plan["shards"]）。
+        #   而分片拿 mine_users=shards[i] 做 by-user 切片 →
+        #   原片仍认为该用户是自己的 → 收下他**全部**帖子；
+        #   目标片又从 planned_ids 拿到搬过去的帖子 → **两边重复计数**。
+        #   修法：凡是被拆过的用户，从所有片的 shards 里移除，
+        #   让它只能通过 planned_ids（精确的帖子级分配）落位。
+        _user_shard_now: dict[str, set[int]] = {}
+        for _i, _g in enumerate(groups):
+            for _aid in _g:
+                _u = sender_of_aid.get(_aid) or ""
+                if _u:
+                    _user_shard_now.setdefault(_u, set()).add(_i)
+        _split_users = {_u for _u, _ss in _user_shard_now.items() if len(_ss) > 1}
+        if _split_users:
+            user_groups = [
+                [u for u in g if str(u) not in _split_users] for g in user_groups
+            ]
+            log(
+                f"[plan] 超大用户被拆分 {len(_split_users)} 个，已从各片 shards 移除"
+                f"（改由帖子级 planned_ids 精确落位，避免重复计数）"
+            )
         _after = [sum(max(1, weights.get(a, 1)) for a in g) for g in groups]
         if _before != _after:
             print(
