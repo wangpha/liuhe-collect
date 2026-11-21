@@ -2787,6 +2787,15 @@ def do_merge_summary(args) -> int:
         )
 
     per_shard = [len(ps or []) for ps in shard_posts]
+    # ⚠ 2026-11-22 根因修复（run 44925221594 实测：aocai 228 帖 > 上限 226 帖）：
+    #   plan 生成时源站是 226 帖；分片扫描时源站已变成 228 帖（plan 之后新增了 2 帖）。
+    #   分片分片按 by-user 收下本片作者的新帖 → 汇总出 228 帖。
+    #   这不是重复/错抓，而是**合法的实时增量**（用户要求「老用户有新增内容也实时识别」）。
+    #   原逻辑 `len(merged) != target` 一律失败 → 把「只多不少」误判成错误。
+    #   正确判据：
+    #     · 有缺失（planned_set - got_ids 非空）        → 真缺帖，失败
+    #     · 只多不少（got_ids ⊇ planned_set 且有新增）  → 合法增量，通过并如实记录
+    #     · 少且多（两组都非空）                        → 异常，失败
     if target and len(merged) != target:
         got_ids = set()
         for _p in merged:
@@ -2805,16 +2814,60 @@ def do_merge_summary(args) -> int:
                 except (TypeError, ValueError):
                     continue
         missing = sorted(planned_set - got_ids) if planned_set else []
+        extra = sorted(got_ids - planned_set) if planned_set else []
         shard_desc = ", ".join(f"shard{i}={n}" for i, n in enumerate(per_shard))
-        log(f"[merge-summary] ❌ 汇总后 {len(merged)} 帖 != 可达上限 {target} 帖"
-            f"（groups 并集）")
-        log(f"[merge-summary]    各片上报: {shard_desc}（合计 {sum(per_shard)}）")
-        if missing:
-            log(f"[merge-summary]    缺失 ID（{len(missing)} 个）: {missing[:20]}"
-                f"{'…' if len(missing) > 20 else ''}")
+        # ---- 只多不少：plan 生成后源站新增了新帖（合法实时增量）----
+        # 严格校验：extra 里的帖必须
+        #   ① 帖子 ID 唯一（不重复）
+        #   ② 作者存在于 plan 里（是已知作者的帖子，不是凭空冒出来的）
+        #   ③ 该帖来自**恰好一个**分片（不是多片重复抓）
+        _extra_ok = False
+        if planned_set and not missing and extra:
+            _dup_ids = len(merged) - len(got_ids)
+            # 作者校验：plan 里有 userToShard 时检查
+            _u2s = plan.get("userToShard") or {}
+            _bad_authors = []
+            _extra_set = set(extra)
+            for _p in merged:
+                try:
+                    _aid = int(_p.get("articleId") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if _aid not in _extra_set:
+                    continue
+                _uid = str(_p.get("senderId") or _p.get("userid")
+                           or _p.get("userId") or "")
+                if _u2s and _uid and _uid not in _u2s:
+                    _bad_authors.append((_aid, _uid))
+            _extra_ok = (_dup_ids == 0) and (not _bad_authors)
+            if not _extra_ok:
+                log(
+                    f"[merge-summary] ❌ 多出的 {len(extra)} 帖未通过校验："
+                    f"重复 id {_dup_ids} 个，作者不在 plan 里 {len(_bad_authors)} 个"
+                    f"{_bad_authors[:3]}"
+                )
+        if planned_set and not missing and extra and _extra_ok:
+            log(
+                f"[merge-summary] ✅ 汇总 {len(merged)} 帖 = 上限 {target} 帖 + "
+                f"新帖 {len(extra)} 帖（plan 生成后源站新增，已实时收全）"
+            )
+            log(f"[merge-summary]    新帖 ID: {extra[:20]}{'…' if len(extra) > 20 else ''}")
+            log(f"[merge-summary]    各片上报: {shard_desc}（合计 {sum(per_shard)}）")
+            # 不算失败，继续走后续流程（fullText 还原 / 产物生成 / 五道防线）
+            missing = []
         else:
-            log("[merge-summary]    plan 里没有 id 列表 → 无法算缺失 ID，只能看各片上报数")
-        raise SystemExit(41)
+            log(f"[merge-summary] ❌ 汇总后 {len(merged)} 帖 != 可达上限 {target} 帖"
+                f"（groups 并集）")
+            log(f"[merge-summary]    各片上报: {shard_desc}（合计 {sum(per_shard)}）")
+            if missing:
+                log(f"[merge-summary]    缺失 ID（{len(missing)} 个）: {missing[:20]}"
+                    f"{'…' if len(missing) > 20 else ''}")
+            if extra:
+                log(f"[merge-summary]    多出 ID（{len(extra)} 个）: {extra[:20]}"
+                    f"{'…' if len(extra) > 20 else ''}")
+            if not missing and not extra:
+                log("[merge-summary]    plan 里没有 id 列表 → 只能看各片上报数")
+            raise SystemExit(41)
 
     # ---------- ④ 排序（list.json 原始顺序）----------
     merged = _ms.order_posts_by_list(merged, list_order)
