@@ -108,10 +108,36 @@ def build_merged_meta(
     period = int((plan or {}).get("period") or tpl.get("period") or 0)
 
     expected = int((((plan or {}).get("counts") or {}).get("expectedPosts")) or 0)
+    # ⚠ 2026-11-22 根因修复（run 44928228939 实测：tuku 956 帖 vs plan 预期 952 帖）：
+    #   plan 生成时源站 952 帖，分片扫描时源站已 956 帖（新增 4 帖）。
+    #   分片按 by-user 收下本片作者的新帖 → 汇总 956 帖。
+    #   这是**合法实时增量**（用户要求「老用户有新增内容也实时识别」）。
+    #   原逻辑「帖数不符即拒绝出产物」把「只多不少」误判成缺漏。
+    #   新判据（与 runner.do_merge_summary 的第一道校验口径一致）：
+    #     · 少于 expected                     -> 真缺帖，拒绝
+    #     · 等于 expected                     -> 正常
+    #     · 多于 expected 且帖子 ID 唯一      -> 合法增量，放行
     if expected and len(merged_posts) != expected:
-        raise SystemExit(
-            f"[merge-summary] ❌ 汇总后 {len(merged_posts)} 帖 != plan 预期 {expected} 帖"
-            f"（各片 posts 可能有缺漏，拒绝出产物）"
+        _ids: list[int] = []
+        for _p in merged_posts:
+            try:
+                _ids.append(int(_p.get("articleId") or 0))
+            except (TypeError, ValueError):
+                continue
+        _unique = len(set(_ids))
+        _has_dup = _unique != len(_ids)
+        _short = len(merged_posts) < expected
+        if _short or _has_dup:
+            raise SystemExit(
+                f"[merge-summary] ❌ 汇总后 {len(merged_posts)} 帖 != plan 预期 {expected} 帖"
+                f"（{'少于预期' if _short else ''}"
+                f"{'且帖子 ID 有重复' if _has_dup else ''}，拒绝出产物）"
+            )
+        print(
+            f"[merge-summary] ✅ 汇总 {len(merged_posts)} 帖 = plan 预期 {expected} 帖"
+            f" + 新帖 {len(merged_posts) - expected} 帖（plan 生成后源站新增，已实时收全；"
+            f"帖子 ID 唯一 {_unique} 个）",
+            flush=True,
         )
 
     now = time.time()
