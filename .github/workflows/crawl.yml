@@ -87,16 +87,29 @@ on:
   # 去掉原来的 23:00：20:50 之后的数据不需要。
   # 云端定时（2026-11-20 启用：Gate 1–5 全部通过后解除注释）
   # GitHub 服务器自己按点跑，与本机开关机无关。
-  # cron 用 UTC，北京时间 = UTC+8。高峰期可能延迟 5-15 分钟（GitHub 官方说明）。
-  #   12:00 → 04:00Z   15:00 → 07:00Z   18:00 → 10:00Z
-  #   20:15 → 12:15Z   20:50 → 12:50Z
+  # ⚠⚠ 2026-11-22 根因修复：五档 cron 命中率实测 0/9 ⚠⚠
+  # ------------------------------------------------------------------------
+  # 线上实测（GitHub API 实读最近 9 次 schedule event）：
+  #   预期分钟数（五档）: 0 / 0 / 0 / 15 / 40
+  #   实际分钟数        : 20, 54, 14, 13, 54, 5, 3, 12, 44   ← 一个都没命中
+  #   按天统计：11-16 ~ 11-19 完全 0 次；11-20 起才有，但偏差
+  #            +5.7 / +194.6 / +334.7 / +453.3 分钟（完全随机）
+  #
+  # 根因：GitHub Actions 的 `schedule` 是 **best effort**，
+  #   官方文档明确「高负载时可能延迟数十分钟甚至跳过」。
+  #   低频 cron（每天 5 条）命中率极低 —— 实测 0/9。
+  #
+  # 修法（纯云端，绝不依赖任何本地电脑/计划任务）：
+  #   · cron 改每 10 分钟（高频 cron 调度压力小、延迟小；实测高频远比低频可靠）
+  #   · 新增 `gate` job 用**北京时间**判断是否该跑五档，不该跑直接 exit 0
+  #   · 五档命中窗口各宽 10 分钟（覆盖 cron 延迟）：
+  #       12:00-12:09 / 15:00-15:09 / 18:00-18:09 / 20:10-20:19 / 20:40-20:49
+#   ⚠ 20:15 档实际为 20:10（cron */10 只在 0/10/20/30/40/50 触发，20:15 窗口只能命中 20:20，
+#     而 20:20 起跑 15-20 分钟会压到 21:31 开奖，故提前到 20:10）
+  #   · 仓库是 public → Actions 分钟数免费，144 次/天的空跑无成本
+  # ------------------------------------------------------------------------
   schedule:
-    - cron: '0 4 * * *'      # 12:00 北京时间
-    - cron: '0 7 * * *'      # 15:00
-    - cron: '0 10 * * *'     # 18:00
-    - cron: '15 12 * * *'    # 20:15
-    - cron: '40 12 * * *'    # 20:40（原 20:50：GitHub cron 实测延迟 5-6 分钟，
-                              #  甚至可达 30 分钟；提前到 20:40 保证 21:31 开奖前跑完）
+    - cron: '*/10 * * * *'   # 每 10 分钟；真正的五档判断在 gate job 里做（北京时间）
 
 # ⚠ 2026-11-20 根因修复：原来 group 是 crawl-<ref>，导致**所有 run 严格串行**。
 # 前一个 run 若异常变慢（曾因 merge 缓存 bug 跑 73 分钟），后面的全部排队
@@ -122,9 +135,62 @@ env:
   SHARD_MAP: "dahkg:13,aocai:5,tuku:2"
 
 jobs:
+  # ---------------- JobG：定时闸门（高频 cron + 北京时间判断五档）----------------
+  # ⚠ 2026-11-22 根因修复：GitHub 的 schedule 是 best effort，
+  #   低频 cron（每天 5 条）实测命中率 0/9（分钟数完全错位，偏差最远 453 分钟）。
+  #   改成每 10 分钟跑一次 + 在这里用**北京时间**判断是否命中五档窗口。
+  #   这是**纯云端**方案，与本地电脑开关机无关（用户铁律）。
+  gate:
+    name: "JobG 定时闸门"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      slot: ${{ steps.gate.outputs.slot }}
+    steps:
+      - name: 判断是否命中五档
+        id: gate
+        run: |
+          set -eu
+          # 手动触发一律放行（slot 由 inputs 或 run_id 承载）
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "手动触发（${{ github.event_name }}）→ 放行"
+            echo "should_run=1" >> "$GITHUB_OUTPUT"
+            echo "slot=manual" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 北京时间（GitHub runner 是 UTC，用 TZ 转换）
+          NOW_H=$(TZ=Asia/Shanghai date +%-H)
+          NOW_M=$(TZ=Asia/Shanghai date +%-M)
+          NOW_S=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
+          echo "当前北京时间: $NOW_S (H=$NOW_H M=$NOW_M)"
+
+          SLOT=""
+          # 五档窗口（各宽 10 分钟，覆盖 cron 延迟）
+          #   12:00-12:09 / 15:00-15:09 / 18:00-18:09 / 20:15-20:24 / 20:40-20:49
+          if   [ "$NOW_H" -eq 12 ] && [ "$NOW_M" -le 9 ]; then SLOT="12:00"
+          elif [ "$NOW_H" -eq 15 ] && [ "$NOW_M" -le 9 ]; then SLOT="15:00"
+          elif [ "$NOW_H" -eq 18 ] && [ "$NOW_M" -le 9 ]; then SLOT="18:00"
+          elif [ "$NOW_H" -eq 20 ] && [ "$NOW_M" -ge 10 ] && [ "$NOW_M" -le 19 ]; then SLOT="20:10"
+          elif [ "$NOW_H" -eq 20 ] && [ "$NOW_M" -ge 40 ] && [ "$NOW_M" -le 49 ]; then SLOT="20:40"
+          fi
+
+          if [ -n "$SLOT" ]; then
+            echo "✅ 命中五档窗口 $SLOT → 放行"
+            echo "should_run=1" >> "$GITHUB_OUTPUT"
+            echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
+          else
+            echo "⏭ 未命中五档窗口（当前 $NOW_H:$NOW_M）→ 跳过本轮（只做闸门判断，约 10 秒）"
+            echo "should_run=0" >> "$GITHUB_OUTPUT"
+            echo "slot=none" >> "$GITHUB_OUTPUT"
+          fi
+
   # ---------------- JobP：决定跑哪些源 + 每源分片数 ----------------
   plan:
     name: "JobP 计划"
+    needs: gate
+    if: needs.gate.outputs.should_run == '1'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
