@@ -750,9 +750,18 @@ def do_plan(args) -> int:
         if len(flat_users) != len(set(flat_users)):
             raise SystemExit(f"[plan] ❌ 断言②失败：有用户被分配到多个分片")
         groups = [[aid for uid in g for aid in aid_by_user.get(uid, [])] for g in user_groups]
-        # 帖子层面再平衡（修「单个超大用户不可拆」导致的 400 倍失衡，见 _rebalance_groups docstring）
+        # ⚠ 2026-11-21 按用户设计重构（run 44867937884 实测）：
+        #   原 _rebalance_groups 会把「重片里最重的帖」搬到轻片 →
+        #   搬走的帖在新片没有历史缓存 → hit_rate 骤降 → 分片截断 → 缺 39 帖。
+        #   用户的设计：「老用户还是在原来那片，新用户再平均分给各分片」
+        #   → 只在「单个超大用户」（权重 > 平均片负载 × 2）时才拆它的帖子。
         _before = [sum(max(1, weights.get(a, 1)) for a in g) for g in groups]
-        groups = _rebalance_groups(groups, weights)
+        groups = _rebalance_groups(
+            groups, weights,
+            poster_of=sender_of_aid,
+            user_weights=user_weights,
+            split_ratio=2.0,
+        )
         _after = [sum(max(1, weights.get(a, 1)) for a in g) for g in groups]
         if _before != _after:
             print(
@@ -1073,20 +1082,45 @@ def _sender_of(item: dict, source: str | None = None) -> str:
     return ""
 
 
-def _rebalance_groups(groups: list[list[int]], weights: dict[int, int],
-                      max_ratio: float = 1.35, max_moves: int = 400) -> list[list[int]]:
-    """在**帖子层面**再平衡分片负载（2026-11-19 修 400 倍失衡）。
+def _rebalance_groups(
+    groups: list[list[int]], weights: dict[int, int],
+    max_ratio: float = 1.35, max_moves: int = 400,
+    poster_of: dict[int, str] | None = None,
+    user_weights: dict[str, int] | None = None,
+    split_ratio: float = 2.0,
+) -> list[list[int]]:
+    """分片负载再平衡 —— **只拆超大用户，绝不搬动普通帖子**。
 
-    ## 为什么需要（run 44470578706 实测）
-      [shard] 本片   4 图 → 估算  0.1 分钟
-      [shard] 本片 1605 图 → 估算 52.7 分钟（上限 15）→ 转移 72% → merge 25.8 分钟 → 整轮 55 分
+    ## ⚠ 2026-11-21 根因重写（run 44867937884 实测）
+    原实现「把重片里最重的那帖搬到最轻片」，导致：
+    ```
+    [shard] 本片 53 帖 → 容量只够 46 帖 → 截断 7 帖
+    [merge-summary] ❌ 汇总后 647 帖 != 可达上限 686 帖（缺 39 帖）
+    ```
+    搬走的帖子在新分片没有历史缓存 → hit_rate 骤降 → 估算超限 → 截断 →
+    summary 模式的 merge 不采集 → 缺帖 → 整轮失败。
 
-    LPT 按「用户」分组，而**单个超大用户不可拆** → 必造出极端失衡。
-    这里在 aid 层面做局部搜索：反复把「最重片里最重的那帖」搬到「最轻片」，
-    直到极差 <= max_ratio 或搬够 max_moves 次。
+    ## 用户的设计（2026-11-21 确认）
+    「老用户还是在原来那片，新用户再平均分给各分片」
+    → **老用户的帖子绝不能换片**（否则缓存全废）
 
-    安全性：搬帖不破坏完整性（每个 aid 仍在恰好一个片里），
-    `_slice_items` 已改成「by-user ∪ planned-ids」，所以作者被拆到多片也能正确落位。
+    ## 新逻辑
+    1. 普通用户：整块不动（缓存集中，命中率高）
+    2. **超大用户**：权重 > 平均片负载 × `split_ratio` 时，
+       把该用户的帖子按权重从大到小，分发到最轻的片
+       （只有 1605 图那种极端情况会触发）
+    3. 其余情况不做任何搬动
+
+    ## 参数
+    poster_of    : {articleId: userId}，用于识别「哪些帖子属于超大用户」
+    user_weights : {userId: 权重}，用于判定超大用户
+    split_ratio  : 超过「平均片负载 × 该值」即视为超大用户
+
+    ## 为什么这样不影响完整性
+    `_slice_items` 是「by-user ∪ planned-ids」：
+      · 用户整块在某片 → 按 by-user 拿到全部帖子
+      · 用户被拆 → 各片按 planned-ids 拿到分给它的那部分
+    两条路都覆盖，且每个 aid 只在一个片里。
     """
     if not groups or len(groups) < 2:
         return groups
@@ -1095,38 +1129,68 @@ def _rebalance_groups(groups: list[list[int]], weights: dict[int, int],
         return sum(max(1, int(weights.get(a, 1))) for a in g)
 
     loads = [_load(g) for g in groups]
+    total = sum(loads)
+    if total <= 0:
+        return groups
+
+    # 没有 poster_of / user_weights → 无法识别超大用户 → 不动（保守）
+    if not poster_of or not user_weights:
+        return groups
+
+    avg_shard = total / len(groups)
+    threshold = avg_shard * max(1.0, float(split_ratio))
+
+    # 找超大用户
+    huge_users = {u for u, w in user_weights.items() if int(w) > threshold}
+    if not huge_users:
+        return groups
+
+    # 把超大用户的帖子按权重从大到小，分发到最轻的片
     moves = 0
-    while moves < max_moves:
-        hi = max(range(len(groups)), key=lambda i: (loads[i], -i))
-        lo = min(range(len(groups)), key=lambda i: (loads[i], i))
-        if hi == lo or loads[lo] <= 0:
-            break
-        if loads[hi] <= loads[lo] * max_ratio:
-            break
-        src = groups[hi]
-        if len(src) <= 1:
-            # 该片只有一帖（超大帖），搬不动
-            break
-        # 搬「最重且不超过 lo 目标」的一帖：优先搬最大的
-        aid = max(src, key=lambda a: max(1, int(weights.get(a, 1))))
-        w = max(1, int(weights.get(aid, 1)))
-        if w > loads[hi] - loads[lo]:
-            # 搬最大的会让天平反向，退而搬最小的
-            aid = min(src, key=lambda a: max(1, int(weights.get(a, 1))))
-            w = max(1, int(weights.get(aid, 1)))
-        src.remove(aid)
-        groups[lo].append(aid)
-        loads[hi] -= w
-        loads[lo] += w
-        moves += 1
+    for uid in sorted(huge_users, key=lambda u: -int(user_weights.get(u, 0))):
+        # 该用户当前在哪些片、有哪些帖
+        aids = [a for a in weights if poster_of.get(a) == uid]
+        aids.sort(key=lambda a: -int(weights.get(a, 1)))
+        for a in aids:
+            if moves >= max_moves:
+                break
+            # 从原片移除
+            src_i = next((k for k, g in enumerate(groups) if a in g), None)
+            if src_i is None:
+                continue
+            lo = min(range(len(groups)), key=lambda k: (loads[k], k))
+            if lo == src_i:
+                continue
+            # 只在「搬过去能显著改善」时才搬
+            w = max(1, int(weights.get(a, 1)))
+            if loads[src_i] <= loads[lo] * max_ratio:
+                break
+            groups[src_i].remove(a)
+            groups[lo].append(a)
+            loads[src_i] -= w
+            loads[lo] += w
+            moves += 1
+
     return groups
 
 
-def _group_by_user(user_weights: dict[str, int], n: int, prev: dict[str, int] | None = None):
-    """按**用户**做 LPT 分组，并尽量保持上一轮的归属（跨轮稳定）。
+def _group_by_user(
+    user_weights: dict[str, int], n: int, prev: dict[str, int] | None = None,
+    split_ratio: float = 2.0,
+):
+    """按**用户**做 LPT 分组，老用户永不搬动（跨轮稳定 → 缓存命中）。
 
-    - 老用户：沿用 `prev` 里的分片号（保证跨轮一致，缓存才命得中）
-    - 新用户：放进当前负载最轻的那片
+    ## 用户的设计（2026-11-21 确认）
+    「指挥官按用户名把用户平均分给各分片；
+      下次分配时老用户还是在原来那片；新用户再平均分给各分片。」
+
+    ## 三步
+    1. **老用户就位**：沿用 `prev` 台账的分片号（缓存集中，永不搬）
+    2. **新用户分配**：按权重从大到小，塞进最轻的片
+    3. **超大用户拆分**：若某用户权重 > `split_ratio × 平均片负载`，
+       它的帖子会拆到多片（避免整片超时）。
+       判定与拆分在调用方用 `_rebalance_groups` 的「只拆超大用户」模式完成。
+
     返回 (groups_by_user, user_to_shard)。
     """
     prev = prev or {}
@@ -1135,7 +1199,7 @@ def _group_by_user(user_weights: dict[str, int], n: int, prev: dict[str, int] | 
     loads = [0] * n
     mapping: dict[str, int] = {}
 
-    # 1) 老用户先就位（保持稳定）
+    # 1) 老用户先就位（**永不搬动** —— 这是缓存能不能命中的关键）
     for uid, w in user_weights.items():
         idx = prev.get(uid)
         if isinstance(idx, int) and 0 <= idx < n:
@@ -1143,7 +1207,7 @@ def _group_by_user(user_weights: dict[str, int], n: int, prev: dict[str, int] | 
             loads[idx] += max(1, int(w))
             mapping[uid] = idx
 
-    # 2) 新用户按权重从大到小，塞进最轻的片
+    # 2) 新用户按权重从大到小，塞进最轻的片（平均分配）
     rest = [(uid, max(1, int(w))) for uid, w in user_weights.items() if uid not in mapping]
     rest.sort(key=lambda x: -x[1])
     for uid, w in rest:
@@ -1669,24 +1733,46 @@ def _find_ocr_cache_dir(work: Path, out_root: Path) -> Path | None:
 
 
 def _pick_within_budget(
-    ids: list[int], cost: dict, per_image_seconds: float, budget_seconds: float
+    ids: list[int], cost: dict, per_image_seconds: float, budget_seconds: float,
+    hit_rate: float = 0.0,
 ) -> tuple[list[int], list[int]]:
     """按预算挑出本机要处理的帖子，其余留给 merge。
 
-    cost: {articleId: 预计图片数}（来自 plan 的 postCost）
-    估算：每帖耗时 ≈ 图片数 × 本机秒/张；另留 60s 固定开销（启动/扫描/收尾）。
+    ## ⚠ 2026-11-21 根因修复（run 44867937884 实测）
+    原实现用「每图未命中成本 × 全部图片数」估算，**忽略缓存命中率**：
+    ```
+    [shard] 本片 642 图，缓存命中 206（32%），有效 3.910 秒/次
+    [shard] 反推未命中成本 5.755 秒/次
+    → 估算 642 × 3.910 = 2510 秒 = 41.8 分钟（上限 15）
+    → 只处理 46 帖，7 帖写 unfinished 交 merge
+    ```
+    而实测：
+    ```
+    [diag] 本片总耗时 243.4s = OCR 0.0s（全部命中缓存） + 下载 2.5s + 其他 240.9s
+    ```
+    **估算高估 10 倍**，导致不必要的截断；而 summary 模式的 merge **不做采集**，
+    无法补抓 unfinished → 13 片合计缺 39 帖 → 完整性防线拦截 → 整轮失败。
 
-    ⚠ 2026-11-19：本函数曾被「按行号区间删除旧探针代码」误删（它正好在区间内），
-    导致 20/20 分片 NameError。`work/cloud_build/check_undefined_calls.py` 是防回归检查。
+    ## 修法
+    按「命中率」折算期望成本：
+      expected = n_img × (hit_rate × HIT_SEC + (1 - hit_rate) × per_image_seconds)
+    其中 HIT_SEC ≈ 0.05 秒（读一个 OCR JSON，不是重新推理）。
+
+    ## 保守兜底
+    hit_rate 未知（0）时退化为旧行为（全按未命中算），保证安全。
     """
     if per_image_seconds <= 0 or budget_seconds <= 0 or not ids:
         return list(ids), []
+    # 命中一张图的成本（读缓存 JSON + 匹配，实测约 0.05 秒）
+    HIT_SEC = 0.05
+    hr = max(0.0, min(1.0, float(hit_rate or 0.0)))
+    eff_sec = hr * HIT_SEC + (1.0 - hr) * per_image_seconds
     usable = max(0.0, budget_seconds - 60.0)
     taken: list[int] = []
     rest: list[int] = []
     acc = 0.0
     for aid in sorted(ids, key=lambda x: cost.get(x, 1)):
-        est = max(1, cost.get(aid, 1)) * per_image_seconds
+        est = max(1, cost.get(aid, 1)) * eff_sec
         if acc + est > usable:
             rest.append(aid)
             continue
@@ -2308,10 +2394,15 @@ def do_shard(args) -> int:
         )
 
         if budget_dec["transfer"] > 0:
-            # 与 decide_transfer 的 capacity 口径对齐：_pick_within_budget 内部有 usable = budget - 60
+            # ⚠ 2026-11-21 根因修复：把**真实未命中成本 miss_cost** 与**命中率**传进去，
+            #   而不是传 effective（effective 已是「按命中率折算后」的均值，
+            #   再乘全部图片数会重复折算 → 高估 10 倍 → 不必要截断 → summary 缺帖）。
+            _miss = float(budget_est.get("miss_cost") or budget_est["effective"])
+            _hr = float(budget_est.get("hit_rate") or 0.0)
             taken, rest_ids = _pick_within_budget(
-                sorted(planned_ids), cost, budget_est["effective"],
-                budget_seconds=budget_dec["shard_capacity"] * budget_est["effective"] + 60.0,
+                sorted(planned_ids), cost, _miss,
+                budget_seconds=budget_dec["shard_capacity"] * _miss + 60.0,
+                hit_rate=_hr,
             )
             log(
                 f"[shard] ⏱ 分片容量内只能处理 {len(taken)} 帖（{budget_dec['shard_capacity']} 图），"
@@ -2784,6 +2875,15 @@ def do_merge_summary(args) -> int:
     # ⚠ 2026-11-20：文字版**失败必须让 merge 失败**（不再 try/except 吞掉）。
     # 原因：吞掉后产物少 4 个（当期文字版.txt / 文字版.html/.txt / 论坛原帖.html），
     # 违反「产物完整无缺失」。宁可整轮失败重跑，也不交付残缺产物。
+    # ⚠ 2026-11-21 根因修复（run 44864155826 实测，merge dahkg 15.9 分被取消）：
+    #   `text_report.write_text_report` 在 fullText 缺失时会走 process_media，
+    #   而 merge 手里没有图片文件 → **开始下载图片 + OCR**！
+    #   实测日志：[媒体] 整体 627/7321 张（8%），预计还需约 89 分钟。
+    #   OCR 是分片的职责，merge 绝不能做（违反「各司其职」）。
+    #   这里强制禁用下载与 OCR：fullText 只能来自各片已合并的 ocr 结果。
+    os.environ["NO_IMAGES"] = "true"
+    os.environ["NO_OCR"] = "true"
+    log("[merge-summary] 已强制禁用图片下载与 OCR（merge 只汇总，不重采集）")
     try:
         text_report.write_text_report(
             out_dir, merged, period=period, year=int(meta.get("year") or 0) or 2026,
