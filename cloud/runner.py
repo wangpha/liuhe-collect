@@ -870,6 +870,24 @@ def _plan_item_id(item: dict) -> int:
     return 0
 
 
+
+#: 三源列表行里的**作者字段名**（2026-11-17 实测）
+#:   dahkg：`senderId`（驼峰）
+#:   aocai：`userid`  （全小写！实测字段表只有 userid，没有 senderId/userId）
+#:   tuku ：`userid`  （同 aocai 的通行写法；缺失会硬失败，不会静默归 None）
+#: 每源的「作者字段候选序列」——按顺序取第一个存在的。
+#:   dahkg：`senderId`（驼峰，实测确认）
+#:   aocai：`userid`（**全小写**，实测确认；没有 senderId/userId）
+#:   tuku ：列行字段尚未实测确认（源站 502），先给多候选，
+#:          取不到任何一个仍然**硬失败**（不会静默归到空用户）
+SOURCE_USER_KEYS: dict[str, tuple[str, ...]] = {
+    "dahkg": ("senderId",),
+    "aocai": ("userid",),
+    "tuku": ("userid", "userId", "senderId", "username", "nickname"),
+}
+#: 兼容旧名字（plan 的报错文案会引用）
+SOURCE_USER_KEY = {k: v[0] for k, v in SOURCE_USER_KEYS.items()}
+
 #: det 的 limit_side_len（core/scraper.py 里同值）：短边小于它会被放大到它
 _DET_SIDE = 736
 #: 回复图没有尺寸 → 用回复条数估；实测 2682 张回复图 / 4813 条回复 ≈ 0.56 张/条
