@@ -1485,16 +1485,22 @@ jobs:
           if git diff --cached --quiet; then echo "无变化"; exit 0; fi
           # ⚠ 2026-11-21：commit message 里带上期号，供本地软件反查
           #   （artifact 名只有 run_id，本地要显示「第X期」只能靠这里）
-          # ⚠ 2026-11-21：期号提取踩过两次坑（grep -oP 的 K 标记取到空；sed 的反向引用被转义吃掉）。
-          # 最终用纯 shell 参数展开，零转义风险：
-          #   data/dahkg/澳门_2026_325期.tar.gz
-          #     → basename 去掉目录 → 去后缀 .tar.gz → 去前缀「澳门_YYYY_」→ 去后缀「期」
+          # ⚠ 2026-11-21：期号提取第三次修正。
+          #   前两次失败原因：grep -oP 的 K 标记取到空；sed 反向引用被 Python 转义吃掉。
+          #   这次失败原因（run#129/#130 实测「期?」）：grep '中文' 在 runner 上匹配不到
+          #     —— 不依赖中文，只按路径里的 data/ 前缀 + .tar.gz 后缀识别。
+          #   路径形如 data/dahkg/澳门_2026_325期.tar.gz
+          #   → 去 .tar.gz → 取最后一个 _ 之后 → 去尾部的「期」等非数字字符
           PERIODS=""
-          for f in $(git diff --cached --name-only | grep '澳门_'); do
-            b=$(basename "$f")
-            b=${b%.tar.gz}
+          for f in $(git diff --cached --name-only); do
+            case "$f" in
+              data/*.tar.gz) ;;
+              *) continue ;;
+            esac
+            b=$(basename "$f" .tar.gz)
             p=${b##*_}
-            p=${p%期}
+            # 只保留开头连续数字（期号），丢掉后面的非数字（如「期」）
+            p=$(echo "$p" | sed 's/[^0-9].*//')
             case "$p" in
               ''|*[!0-9]*) continue ;;
             esac
