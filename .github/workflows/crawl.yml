@@ -1485,30 +1485,32 @@ jobs:
           if git diff --cached --quiet; then echo "无变化"; exit 0; fi
           # ⚠ 2026-11-21：commit message 里带上期号，供本地软件反查
           #   （artifact 名只有 run_id，本地要显示「第X期」只能靠这里）
-          # ⚠ 2026-11-21：期号提取第三次修正。
-          #   前两次失败原因：grep -oP 的 K 标记取到空；sed 反向引用被 Python 转义吃掉。
-          #   这次失败原因（run#129/#130 实测「期?」）：grep '中文' 在 runner 上匹配不到
-          #     —— 不依赖中文，只按路径里的 data/ 前缀 + .tar.gz 后缀识别。
-          #   路径形如 data/dahkg/澳门_2026_325期.tar.gz
-          #   → 去 .tar.gz → 取最后一个 _ 之后 → 去尾部的「期」等非数字字符
+          # ⚠ 2026-11-21：期号提取第四次修正，**根治**。
+          #   前三次都失败了：
+          #     v1 grep -oP 的 K 标记 → runner 上取到空
+          #     v2 sed 反向引用 → 被 Python 源码转义吃掉
+          #     v3 grep '中文' → runner locale 匹配不到
+          #     v4 data/*.tar.gz 前缀 → 但 run#131 实测 git diff 里**没有 .tar.gz**
+          #        （同期内容未变，git 认为无变化，只有 logs 变了）
+          #   真正可靠的数据源：`work/store/manifest.json` 里的 periods 字段
+          #   （publish_store.py 每次都会写，与本次实际产出的期号完全一致）
+          #   注：不用 heredoc（YAML 会破坏 run:| 缩进）；不依赖 python（路径不确定）；
+          #   也不用 tr 换行技巧，因为 Python 源码里的转义会变成真换行 —— 只用 grep -o + sort -u
           PERIODS=""
-          for f in $(git diff --cached --name-only); do
-            case "$f" in
-              data/*.tar.gz) ;;
-              *) continue ;;
-            esac
-            b=$(basename "$f" .tar.gz)
-            p=${b##*_}
-            # 只保留开头连续数字（期号），丢掉后面的非数字（如「期」）
-            p=$(echo "$p" | sed 's/[^0-9].*//')
-            case "$p" in
-              ''|*[!0-9]*) continue ;;
-            esac
-            case ",$PERIODS," in
-              *",$p,"*) ;;
-              *) PERIODS="${PERIODS:+$PERIODS,}$p" ;;
-            esac
-          done
+          MAN="work/store/manifest.json"
+          if [ -f "$MAN" ]; then
+            for tok in $(grep -o '澳门_[0-9]*_[0-9]*期' "$MAN" | sort -u); do
+              p=${tok##*_}
+              p=${p%期}
+              case "$p" in
+                ''|*[!0-9]*) continue ;;
+              esac
+              case ",$PERIODS," in
+                *",$p,"*) ;;
+                *) PERIODS="${PERIODS:+$PERIODS,}$p" ;;
+              esac
+            done
+          fi
           [ -z "$PERIODS" ] && PERIODS="?"
           git commit -m "data: 云端采集(分片) 期${PERIODS} $(date -u +%Y-%m-%dT%H:%M:%SZ) run#${{ github.run_number }}"
           git push
