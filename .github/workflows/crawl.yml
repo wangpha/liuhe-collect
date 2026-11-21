@@ -349,6 +349,18 @@ jobs:
         run: |
           PERIOD="${{ steps.period.outputs.period }}"
           mkdir -p "work/meta-cache/$PERIOD" work/ocr-cache/ocr
+          # ⚠ 2026-11-21 根因修复（run 44906863761 实测「铺回 0 个 .cache」）：
+          #   分片刚启动时 work/out 是空的（还没跑采集 → 没有期目录 → 没有 .cache）
+          #   → find 返回 0 个目录 → 缓存一个都没铺进去
+          #   → OCR 结果留在 work/ocr-cache/ocr/ 但没人读
+          #   → 采集时全部重新 OCR → 2030 图 × 1 秒 = 34 分钟 → SIGTERM
+          #   修法：先按「源+期号」预建期目录和 .cache/ocr，再铺回。
+          SRC="dahkg"
+          SUB="大港澳"
+          # 期号可能是 2026325 或 325，两种目录名都建（同一个位置，取短的）
+          P3=$(echo "$PERIOD" | sed 's/^2026//')
+          [ -z "$P3" ] && P3="$PERIOD"
+          mkdir -p "work/out/$SUB/澳门_2026_${P3}期/.cache/ocr"
           n=0
           for d in $(find work/out -type d -name .cache 2>/dev/null); do
             [ -d "$d" ] || continue
@@ -357,7 +369,8 @@ jobs:
             cp -n work/ocr-cache/ocr/*.json "$d/ocr/" 2>/dev/null || true
             n=$((n+1))
           done
-          echo "铺回 $n 个 .cache（meta 期号=$PERIOD / OCR 跨期）"
+          echo "铺回 $n 个 .cache（meta 期号=$PERIOD / OCR $(ls work/ocr-cache/ocr 2>/dev/null | wc -l) 个文件）"
+          echo "预建目录：work/out/$SUB/澳门_2026_${P3}期/.cache/ocr ($(ls work/out/$SUB/澳门_2026_${P3}期/.cache/ocr 2>/dev/null | wc -l) 个)"
       - name: 分片预热（只处理本片：详情+回复+图片+OCR）
         id: shard
         working-directory: repo
@@ -558,6 +571,18 @@ jobs:
         run: |
           PERIOD="${{ steps.period.outputs.period }}"
           mkdir -p "work/meta-cache/$PERIOD" work/ocr-cache/ocr
+          # ⚠ 2026-11-21 根因修复（run 44906863761 实测「铺回 0 个 .cache」）：
+          #   分片刚启动时 work/out 是空的（还没跑采集 → 没有期目录 → 没有 .cache）
+          #   → find 返回 0 个目录 → 缓存一个都没铺进去
+          #   → OCR 结果留在 work/ocr-cache/ocr/ 但没人读
+          #   → 采集时全部重新 OCR → 2030 图 × 1 秒 = 34 分钟 → SIGTERM
+          #   修法：先按「源+期号」预建期目录和 .cache/ocr，再铺回。
+          SRC="aocai"
+          SUB="澳彩交流"
+          # 期号可能是 2026325 或 325，两种目录名都建（同一个位置，取短的）
+          P3=$(echo "$PERIOD" | sed 's/^2026//')
+          [ -z "$P3" ] && P3="$PERIOD"
+          mkdir -p "work/out/$SUB/澳门_2026_${P3}期/.cache/ocr"
           n=0
           for d in $(find work/out -type d -name .cache 2>/dev/null); do
             [ -d "$d" ] || continue
@@ -566,7 +591,8 @@ jobs:
             cp -n work/ocr-cache/ocr/*.json "$d/ocr/" 2>/dev/null || true
             n=$((n+1))
           done
-          echo "铺回 $n 个 .cache（meta 期号=$PERIOD / OCR 跨期）"
+          echo "铺回 $n 个 .cache（meta 期号=$PERIOD / OCR $(ls work/ocr-cache/ocr 2>/dev/null | wc -l) 个文件）"
+          echo "预建目录：work/out/$SUB/澳门_2026_${P3}期/.cache/ocr ($(ls work/out/$SUB/澳门_2026_${P3}期/.cache/ocr 2>/dev/null | wc -l) 个)"
       - name: 分片预热（只处理本片：详情+回复+图片+OCR）
         id: shard
         working-directory: repo
@@ -767,6 +793,18 @@ jobs:
         run: |
           PERIOD="${{ steps.period.outputs.period }}"
           mkdir -p "work/meta-cache/$PERIOD" work/ocr-cache/ocr
+          # ⚠ 2026-11-21 根因修复（run 44906863761 实测「铺回 0 个 .cache」）：
+          #   分片刚启动时 work/out 是空的（还没跑采集 → 没有期目录 → 没有 .cache）
+          #   → find 返回 0 个目录 → 缓存一个都没铺进去
+          #   → OCR 结果留在 work/ocr-cache/ocr/ 但没人读
+          #   → 采集时全部重新 OCR → 2030 图 × 1 秒 = 34 分钟 → SIGTERM
+          #   修法：先按「源+期号」预建期目录和 .cache/ocr，再铺回。
+          SRC="tuku"
+          SUB="49图库"
+          # 期号可能是 2026325 或 325，两种目录名都建（同一个位置，取短的）
+          P3=$(echo "$PERIOD" | sed 's/^2026//')
+          [ -z "$P3" ] && P3="$PERIOD"
+          mkdir -p "work/out/$SUB/澳门_2026_${P3}期/.cache/ocr"
           n=0
           for d in $(find work/out -type d -name .cache 2>/dev/null); do
             [ -d "$d" ] || continue
@@ -775,7 +813,8 @@ jobs:
             cp -n work/ocr-cache/ocr/*.json "$d/ocr/" 2>/dev/null || true
             n=$((n+1))
           done
-          echo "铺回 $n 个 .cache（meta 期号=$PERIOD / OCR 跨期）"
+          echo "铺回 $n 个 .cache（meta 期号=$PERIOD / OCR $(ls work/ocr-cache/ocr 2>/dev/null | wc -l) 个文件）"
+          echo "预建目录：work/out/$SUB/澳门_2026_${P3}期/.cache/ocr ($(ls work/out/$SUB/澳门_2026_${P3}期/.cache/ocr 2>/dev/null | wc -l) 个)"
       - name: 分片预热（只处理本片：详情+回复+图片+OCR）
         id: shard
         working-directory: repo
