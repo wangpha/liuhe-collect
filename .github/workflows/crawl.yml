@@ -66,9 +66,15 @@ on:
         default: ""
         type: string
       merge_mode:
-        description: "merge 模式：legacy=重跑模块（默认）；summary=只汇总各片产物（C1，需配合 --merge 使用）"
+        # ⚠ 2026-11-21 根因修复：默认值原来是 "legacy"，
+        #   导致 `${{ github.event.inputs.merge_mode || 'summary' }}` 永远取到 "legacy"
+        #   （因为 legacy 非空，|| 不会回退到 summary）
+        #   → merge 实际在跑 legacy = 重跑模块 main() = 完整采集 + OCR！
+        #   实测 merge dahkg 卡在 [媒体] 7321 张图，预计 90 分钟 → 被 Watchdog 取消。
+        #   summary = 只汇总各片产物，绝不重采集（这是设计要求的职责分离）。
+        description: "merge 模式：summary=只汇总各片产物（默认，不重采集）；legacy=重跑模块（慢，仅调试用）"
         required: false
-        default: "legacy"
+        default: "summary"
         type: choice
         options:
           - legacy
