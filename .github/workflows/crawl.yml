@@ -1496,8 +1496,10 @@ jobs:
           #   （publish_store.py 每次都会写，与本次实际产出的期号完全一致）
           #   注：不用 heredoc（YAML 会破坏 run:| 缩进）；不依赖 python（路径不确定）；
           #   也不用 tr 换行技巧，因为 Python 源码里的转义会变成真换行 —— 只用 grep -o + sort -u
+          #   ⚠ working-directory 就是 repo/work/store，所以路径是 ./manifest.json
+          #     （run#132 实测：写成 work/store/manifest.json 会找不到文件 → 期?）
           PERIODS=""
-          MAN="work/store/manifest.json"
+          MAN="./manifest.json"
           if [ -f "$MAN" ]; then
             for tok in $(grep -o '澳门_[0-9]*_[0-9]*期' "$MAN" | sort -u); do
               p=${tok##*_}
