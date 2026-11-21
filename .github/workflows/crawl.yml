@@ -324,13 +324,20 @@ jobs:
           key: ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-dahkg-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
             ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-dahkg-${{ github.event.inputs.cache_buster || '0' }}-
-      - name: 恢复 OCR 缓存（层2·跨期共享）
-        uses: actions/cache@v4
+      # ⚠ 2026-11-21 根因修复（缓存不生效的关键）：
+      #   原来 13 个分片都往同一个 key `ocr-hash-{源}-0-{run_id}` 写，
+      #   而 GitHub actions/cache 的 save 是「key 已存在就跳过」
+      #   → 只有第一个分片写成功，其余 12 片的 OCR 结果**全部丢失**
+      #   （实测：13 片 cache artifact 合计 17 MB，但 ocr-hash-dahkg 只有 10 MB）
+      #   现在改为：分片**只读不写**（actions/cache/restore@v4），
+      #   写只发生在 merge（唯一的写者，见 merge job 的「保存全局 OCR 池」）。
+      - name: 恢复全局 OCR 池（只读，写入由 merge 负责）
+        uses: actions/cache/restore@v4
         with:
           path: repo/work/ocr-cache
-          key: ocr-hash-dahkg-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
+          key: ocr-pool-dahkg-v3-readonly-${{ github.run_id }}
           restore-keys: |
-            ocr-hash-dahkg-${{ github.event.inputs.cache_buster || '0' }}-
+            ocr-pool-dahkg-v3-
       - name: 把两层缓存铺回各 .cache 目录
         working-directory: repo
         run: |
@@ -526,13 +533,20 @@ jobs:
           key: ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-aocai-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
             ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-aocai-${{ github.event.inputs.cache_buster || '0' }}-
-      - name: 恢复 OCR 缓存（层2·跨期共享）
-        uses: actions/cache@v4
+      # ⚠ 2026-11-21 根因修复（缓存不生效的关键）：
+      #   原来 13 个分片都往同一个 key `ocr-hash-{源}-0-{run_id}` 写，
+      #   而 GitHub actions/cache 的 save 是「key 已存在就跳过」
+      #   → 只有第一个分片写成功，其余 12 片的 OCR 结果**全部丢失**
+      #   （实测：13 片 cache artifact 合计 17 MB，但 ocr-hash-dahkg 只有 10 MB）
+      #   现在改为：分片**只读不写**（actions/cache/restore@v4），
+      #   写只发生在 merge（唯一的写者，见 merge job 的「保存全局 OCR 池」）。
+      - name: 恢复全局 OCR 池（只读，写入由 merge 负责）
+        uses: actions/cache/restore@v4
         with:
           path: repo/work/ocr-cache
-          key: ocr-hash-aocai-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
+          key: ocr-pool-aocai-v3-readonly-${{ github.run_id }}
           restore-keys: |
-            ocr-hash-aocai-${{ github.event.inputs.cache_buster || '0' }}-
+            ocr-pool-aocai-v3-
       - name: 把两层缓存铺回各 .cache 目录
         working-directory: repo
         run: |
@@ -728,13 +742,20 @@ jobs:
           key: ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-tuku-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
           restore-keys: |
             ocr-meta-p${{ steps.period.outputs.period }}-${{ matrix.shard }}-tuku-${{ github.event.inputs.cache_buster || '0' }}-
-      - name: 恢复 OCR 缓存（层2·跨期共享）
-        uses: actions/cache@v4
+      # ⚠ 2026-11-21 根因修复（缓存不生效的关键）：
+      #   原来 13 个分片都往同一个 key `ocr-hash-{源}-0-{run_id}` 写，
+      #   而 GitHub actions/cache 的 save 是「key 已存在就跳过」
+      #   → 只有第一个分片写成功，其余 12 片的 OCR 结果**全部丢失**
+      #   （实测：13 片 cache artifact 合计 17 MB，但 ocr-hash-dahkg 只有 10 MB）
+      #   现在改为：分片**只读不写**（actions/cache/restore@v4），
+      #   写只发生在 merge（唯一的写者，见 merge job 的「保存全局 OCR 池」）。
+      - name: 恢复全局 OCR 池（只读，写入由 merge 负责）
+        uses: actions/cache/restore@v4
         with:
           path: repo/work/ocr-cache
-          key: ocr-hash-tuku-${{ github.event.inputs.cache_buster || '0' }}-${{ github.run_id }}
+          key: ocr-pool-tuku-v3-readonly-${{ github.run_id }}
           restore-keys: |
-            ocr-hash-tuku-${{ github.event.inputs.cache_buster || '0' }}-
+            ocr-pool-tuku-v3-
       - name: 把两层缓存铺回各 .cache 目录
         working-directory: repo
         run: |
@@ -988,6 +1009,20 @@ jobs:
             repo/work/plan
             repo/work/images_cleanup.log
           if-no-files-found: warn
+      # ⚠ 2026-11-21 新增（用户的核心要求）：
+      #   merge 把各片缓存合并成**完整的一份**后，必须存回 actions/cache，
+      #   供下一轮所有分片 restore。否则合并结果随 runner 销毁而丢失
+      #   （实测：两轮同源同期耗时都是 25-30 分，因为第二轮 restore 到的
+      #    仍是「某个分片的旧快照」，不是「上一轮全部内容」）。
+      #   这是全仓唯一写 ocr-pool 的地方 → 无 key 冲突。
+      - name: 保存全局 OCR 池（供下轮所有分片复用）
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            repo/work/out/**/.cache
+          key: ocr-pool-dahkg-v3-${{ github.run_id }}
+
       - name: 上传产物（数据类，不含图片）
         if: always()
         uses: actions/upload-artifact@v4
@@ -1135,6 +1170,20 @@ jobs:
             repo/work/plan
             repo/work/images_cleanup.log
           if-no-files-found: warn
+      # ⚠ 2026-11-21 新增（用户的核心要求）：
+      #   merge 把各片缓存合并成**完整的一份**后，必须存回 actions/cache，
+      #   供下一轮所有分片 restore。否则合并结果随 runner 销毁而丢失
+      #   （实测：两轮同源同期耗时都是 25-30 分，因为第二轮 restore 到的
+      #    仍是「某个分片的旧快照」，不是「上一轮全部内容」）。
+      #   这是全仓唯一写 ocr-pool 的地方 → 无 key 冲突。
+      - name: 保存全局 OCR 池（供下轮所有分片复用）
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            repo/work/out/**/.cache
+          key: ocr-pool-aocai-v3-${{ github.run_id }}
+
       - name: 上传产物（数据类，不含图片）
         if: always()
         uses: actions/upload-artifact@v4
@@ -1282,6 +1331,20 @@ jobs:
             repo/work/plan
             repo/work/images_cleanup.log
           if-no-files-found: warn
+      # ⚠ 2026-11-21 新增（用户的核心要求）：
+      #   merge 把各片缓存合并成**完整的一份**后，必须存回 actions/cache，
+      #   供下一轮所有分片 restore。否则合并结果随 runner 销毁而丢失
+      #   （实测：两轮同源同期耗时都是 25-30 分，因为第二轮 restore 到的
+      #    仍是「某个分片的旧快照」，不是「上一轮全部内容」）。
+      #   这是全仓唯一写 ocr-pool 的地方 → 无 key 冲突。
+      - name: 保存全局 OCR 池（供下轮所有分片复用）
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            repo/work/out/**/.cache
+          key: ocr-pool-tuku-v3-${{ github.run_id }}
+
       - name: 上传产物（数据类，不含图片）
         if: always()
         uses: actions/upload-artifact@v4

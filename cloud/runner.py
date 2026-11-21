@@ -399,11 +399,25 @@ def _prefetch_post_costs(
                             for u in str((sub or {}).get("img") or "").split(",")
                             if u.strip()
                         ]
+                _body_urls = [u.strip() for u in str(detail.get("img") or "").split(",") if u.strip()]
+                _reply_urls: list[str] = []
+                for _r in reps:
+                    _reply_urls += [u.strip() for u in str(_r.get("img") or "").split(",") if u.strip()]
+                    for _sub in (_r.get("subList") or []):
+                        _reply_urls += [
+                            u.strip()
+                            for u in str((_sub or {}).get("img") or "").split(",")
+                            if u.strip()
+                        ]
                 return aid, {
                     "count": len(urls),
                     "detArea": sum(_det_input_area(u) for u in urls),
                     "bodyCount": body_count,
-                    "replyCount": len(urls) - body_count,
+                    "replyCount": len(reps),
+                    # 2026-11-21：真实图 URL（供 _item_image_weight 精确算成本）
+                    "bodyUrls": _body_urls,
+                    "replyUrls": _reply_urls,
+                    "imgCount": len(_body_urls) + len(_reply_urls),
                     # 【内容指纹】零额外请求：详情和回复都已经抓在手里了（用户第四节）
                     **_post_content_hashes(detail, reps),
                 }
@@ -424,11 +438,24 @@ def _prefetch_post_costs(
                             for u in str((sub or {}).get("img") or "").split(",")
                             if u.strip()
                         ]
+                _body_urls = [u.strip() for u in str(tiezi.get("img") or "").split(",") if u.strip()]
+                _reply_urls: list[str] = []
+                for _r in reps:
+                    _reply_urls += [u.strip() for u in str(_r.get("img") or "").split(",") if u.strip()]
+                    for _sub in (_r.get("subList") or []):
+                        _reply_urls += [
+                            u.strip()
+                            for u in str((_sub or {}).get("img") or "").split(",")
+                            if u.strip()
+                        ]
                 return aid, {
                     "count": len(urls),
                     "detArea": sum(_det_input_area(u) for u in urls),
                     "bodyCount": body_count,
-                    "replyCount": len(urls) - body_count,
+                    "replyCount": len(reps),
+                    "bodyUrls": _body_urls,
+                    "replyUrls": _reply_urls,
+                    "imgCount": len(_body_urls) + len(_reply_urls),
                     **_post_content_hashes(tiezi, reps),
                 }
             if source == "tuku":
@@ -439,11 +466,15 @@ def _prefetch_post_costs(
                 # 直接取 pic["url"] 会全部为 None → 权重恒为 1（假均衡）。改用 core 的同一函数。
                 imgs = scraper.images_from_picture_list((raw or {}).get("pictureList") or [])
                 urls += [str(im.get("url") or "") for im in imgs if im.get("url")]
+                _body_urls = [str(im.get("url") or "") for im in imgs if im.get("url")]
                 return aid, {
                     "count": len(urls),
                     "detArea": sum(_det_input_area(u) for u in urls),
                     "bodyCount": len(urls),
                     "replyCount": 0,
+                    "bodyUrls": _body_urls,
+                    "replyUrls": [],
+                    "imgCount": len(_body_urls),
                     **_post_content_hashes(raw or {}, []),
                 }
         except Exception:  # noqa: BLE001 - 预抓失败不算致命，后面有兜底
@@ -650,13 +681,21 @@ def do_plan(args) -> int:
 
     if shard_n > 1 and union_ids:
         if prefetched:
+            # ⚠ 2026-11-21 根因修复（消除 2.25-2.55 倍失衡）：
+            #   原来用 `detArea`（图片面积和）当权重，漏了「详情/回复的网络成本」
+            #   和「图片下载成本」→ 图少但回复多的帖子被严重低估 → 分到太多。
+            #   现在把 prefetch 的真实数据（bodyUrls/replyUrls/replyCount/imgCount）
+            #   喂进 _item_image_weight，权重 = OCR + 网络 + 下载 全成本。
             weights = {}
             for aid in union_ids:
-                info = prefetched.get(aid) or {}
-                w = int(info.get("detArea") or 0) or int(info.get("count") or 0)
-                weights[aid] = max(1, w)
-            mode = "prefetch-det-area"
-            weight_src = f"prepare 预抓实测 {len(prefetched)}/{len(union_ids)} 帖（det 面积，无尺寸的源退化为图数）"
+                meta_row = dict(union_meta.get(str(aid)) or {})
+                pf = prefetched.get(aid) or {}
+                if pf:
+                    meta_row["_prefetch"] = pf
+                weights[aid] = _item_image_weight(meta_row)
+            mode = "prefetch-fullcost"
+            weight_src = (f"prepare 预抓实测 {len(prefetched)}/{len(union_ids)} 帖"
+                          f"（全成本权重：OCR+网络+下载）")
         elif use_hist:
             weights = {}
             for aid in union_ids:
@@ -835,6 +874,14 @@ def _plan_item_id(item: dict) -> int:
 _DET_SIDE = 736
 #: 回复图没有尺寸 → 用回复条数估；实测 2682 张回复图 / 4813 条回复 ≈ 0.56 张/条
 _REPLY_IMG_PER_REPLY = 0.56
+
+# 2026-11-21 分片均衡全成本权重常量
+# 实测 run 44851897421 极差 dahkg 2.25 / aocai 2.55 倍，原权重只算 OCR 秒数，
+# 漏了 ① 每帖固定开销 ② 回复分页请求 ③ 图片下载 → 图少但回复多的帖子被低估。
+_BASE_SEC_PER_POST = 1.0
+_REPLY_PAGE_SEC = 0.8
+_REPLY_PAGE_SIZE = 30
+_DOWNLOAD_SEC_PER_IMG = 0.15
 #: 回复图中位面积（用户给的实测中位值，单位：det 输入像素）
 _MEDIAN_IMG_AREA = 1_920_000
 #: 大港澳图片 URL 里的尺寸：`..._<w>_<h>_.png`
@@ -916,61 +963,73 @@ def _ocr_seconds_of_url(url: str) -> float:
     return round(sec, 2)
 
 def _item_image_weight(item: dict) -> int:
-    """一条列表行的工作量权重 = **预估 OCR 秒数 × 10**（用于分片均衡）。
+    """一条列表行的工作量权重（单位：秒 × 10，用于分片均衡）。
 
-    ## 2026-11-19 变更：从「det 输入像素」改成「OCR 秒数」
-    实测 run 44478252994：det 面积权重极差 **1.28 倍**（plan 以为很均衡），
-    实际分片耗时极差 **11.26 倍**（1.9 分 vs 21.4 分）。
-    → det 面积不是 OCR 成本的好代理（台账 #13 记的相关系数 0.626，不够用）。
+    ## 2026-11-21 重定（消除 2.5 倍失衡）
+    实测 run 44851897421 分片极差 dahkg 2.25 / aocai 2.55 / tuku 1.89 倍，
+    原权重只算 OCR 秒数，漏了三块真实成本：
+      ① 每帖固定开销（详情请求 + 解析）            → _BASE_SEC_PER_POST
+      ② 回复分页请求（每 30 条 1 次）              → _REPLY_PAGE_SEC
+      ③ 图片下载（每张 0.15 秒，网络+落盘+哈希）   → _DOWNLOAD_SEC_PER_IMG
 
-    新口径：`Σ _ocr_seconds_of_url(图)` + 回复图秒数估计（×10 保留精度）。
-    这样 plan 的「极差」就等于「耗时极差」，均衡才有意义。
+    ## 优先用 prefetch 的真实数据
+    如果 item 里有 `_prefetch`（plan 预抓得到的真实图数/回复数），直接用它；
+    否则退回列表行的估算字段。
 
-    - **大港澳**：URL 带 `_<w>_<h>_` 尺寸 → 按面积分档估秒数
-    - **澳彩 / 49图库**：URL 不带尺寸（`v27-xxx.jpg`）→ 按「图数 × 1.0 秒」
-      （这两源图尺寸分布相近，实测本来就不失衡）
+    ## 返回
+    int，单位秒×10（保留一位小数精度）。
     """
-    urls = [u.strip() for u in str(item.get("img") or "").split(",") if u.strip()]
-    try:
-        replies = max(0, int(item.get("replyPoint") or 0))
-    except (TypeError, ValueError):
-        replies = 0
+    import math as _m
 
-    # 正文图的 OCR 秒数（按图面积分档，见 _ocr_seconds_of_url）
-    secs = sum(_ocr_seconds_of_url(u) for u in urls)
+    pf = item.get("_prefetch") or {}
 
-    if secs > 0:
-        # 有尺寸信息（dahkg）：按秒数 + 回复图秒数（用中位 1.5 秒估）
-        weight = secs + replies * _REPLY_IMG_PER_REPLY * 1.5
-        return max(1, int(round(weight * 10)))      # ×10 保留一位小数精度
+    # ---- 正文图 URL ----
+    if pf.get("bodyUrls") is not None:
+        body_urls = [str(u) for u in (pf.get("bodyUrls") or []) if u]
+    else:
+        body_urls = [
+            u.strip() for u in str(item.get("img") or "").split(",") if u.strip()
+        ]
 
-    # 无尺寸信息（aocai/tuku）：图尺寸分布相近，按「图数 × 1.0 秒」计
-    body = 0
-    try:
-        body = int(item.get("imgTotal") or 0)
-    except (TypeError, ValueError):
-        body = 0
-    body = body or max(1, len(urls))
-    weight = body * 1.0 + replies * _REPLY_IMG_PER_REPLY * 1.0
-    return max(1, int(round(weight * 10)))
+    # ---- 回复图 URL（prefetch 才有精确值）----
+    reply_urls = [str(u) for u in (pf.get("replyUrls") or []) if u]
 
+    # ---- 回复条数 ----
+    if pf.get("replyCount") is not None:
+        n_replies = max(0, int(pf.get("replyCount") or 0))
+    else:
+        try:
+            n_replies = max(0, int(item.get("replyPoint") or 0))
+        except (TypeError, ValueError):
+            n_replies = 0
 
-#: 三源列表行里的**作者字段名**（2026-11-17 实测）
-#:   dahkg：`senderId`（驼峰）
-#:   aocai：`userid`  （全小写！实测字段表只有 userid，没有 senderId/userId）
-#:   tuku ：`userid`  （同 aocai 的通行写法；缺失会硬失败，不会静默归 None）
-#: 每源的「作者字段候选序列」——按顺序取第一个存在的。
-#:   dahkg：`senderId`（驼峰，实测确认）
-#:   aocai：`userid`（**全小写**，实测确认；没有 senderId/userId）
-#:   tuku ：列行字段尚未实测确认（源站 502），先给多候选，
-#:          取不到任何一个仍然**硬失败**（不会静默归到空用户）
-SOURCE_USER_KEYS: dict[str, tuple[str, ...]] = {
-    "dahkg": ("senderId",),
-    "aocai": ("userid",),
-    "tuku": ("userid", "userId", "senderId", "username", "nickname"),
-}
-#: 兼容旧名字（plan 的报错文案会引用）
-SOURCE_USER_KEY = {k: v[0] for k, v in SOURCE_USER_KEYS.items()}
+    # ---- 图片总数 ----
+    if pf.get("imgCount") is not None:
+        n_imgs = max(0, int(pf.get("imgCount") or 0))
+    else:
+        try:
+            n_imgs = max(0, int(item.get("imgTotal") or 0))
+        except (TypeError, ValueError):
+            n_imgs = 0
+        n_imgs = n_imgs or (len(body_urls) + len(reply_urls))
+
+    # ---- 成本累加 ----
+    secs = _BASE_SEC_PER_POST
+    # 回复分页：每 30 条回复一页
+    secs += _REPLY_PAGE_SEC * max(0, _m.ceil(n_replies / max(1, _REPLY_PAGE_SIZE)))
+    # OCR：正文图 + 回复图（按面积分档；无尺寸信息则按 1.0 秒/张）
+    for u in body_urls:
+        secs += _ocr_seconds_of_url(u) or 1.0
+    for u in reply_urls:
+        secs += _ocr_seconds_of_url(u) or 1.0
+    # 如果 reply_urls 为空但有回复数（prefetch 不可用），按回复数 × 中位图数估
+    if not reply_urls and n_replies:
+        secs += n_replies * _REPLY_IMG_PER_REPLY * 1.0
+    # 图片下载成本
+    secs += _DOWNLOAD_SEC_PER_IMG * max(0, n_imgs)
+
+    return max(1, int(round(secs * 10)))
+
 
 
 def _sender_of(item: dict, source: str | None = None) -> str:
