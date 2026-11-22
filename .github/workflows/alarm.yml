@@ -51,9 +51,13 @@ on:
   schedule:
     - cron: '7 0,6,12,18 * * *'
 
-# 同一时间只跑一个闹钟，避免多个闹钟同时触发
+# 同一时间只跑一个「生产闹钟」。
+# ⚠ 2026-11-23 修正（自测 run 45078940835 卡在 pending 发现）：
+#   原来 group 固定 'alarm'，导致自测实例永远排队进不来。
+#   现在：自测实例（test_slot 非空）用独立 group，互不阻塞。
+#   生产实例仍共用 'alarm'，保证同时只有一个（防重复触发）。
 concurrency:
-  group: alarm
+  group: alarm-${{ github.event.inputs.test_slot || 'prod' }}
   cancel-in-progress: false
 
 permissions:
