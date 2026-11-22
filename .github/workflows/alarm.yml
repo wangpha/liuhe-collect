@@ -26,10 +26,30 @@ name: 六合定时闹钟
 
 on:
   # 手动启动一次（第一次部署后手动跑一次，链就接上了）
+  # test_slot / test_minutes：自测用。填了 test_slot 时闹钟只用那个时刻做档位，
+  #   不改生产逻辑（留空 = 正常五档 + 349 分钟）。
   workflow_dispatch:
+    inputs:
+      test_slot:
+        description: "自测档位 HH:MM（留空 = 正常五档）"
+        required: false
+        default: ""
+      test_minutes:
+        description: "自测运行分钟数（留空 = 349）"
+        required: false
+        default: ""
   # 每 6 小时兜底重启（万一上一条链被取消/超时）
+  # ⚠ 注意：GitHub cron 一律是 UTC，不是北京时间！
+  #   UTC 00:07 / 06:07 / 12:07 / 18:07
+  #   = 北京 08:07 / 14:07 / 20:07 / 02:07
+  #   每个实例跑 349 分钟后退出，覆盖窗口：
+  #     北京 08:07-13:56 → 覆盖 12:00
+  #     北京 14:07-19:56 → 覆盖 15:00、18:00
+  #     北京 20:07-01:56 → 覆盖 20:10、20:40
+  #     北京 02:07-07:56 → 无档位（正常，夜间不跑）
+  #   已用 verify_alarm_covers_all.py 穷举验证：五档全部被覆盖 ✅
   schedule:
-    - cron: '7 0,6,12,18 * * *'   # 避开整点，每 6 小时一次
+    - cron: '7 0,6,12,18 * * *'
 
 # 同一时间只跑一个闹钟，避免多个闹钟同时触发
 concurrency:
@@ -81,7 +101,17 @@ jobs:
           # 五档：12:00 / 15:00 / 18:00 / 20:10 / 20:40
           # 只在「该分钟的第 0-19 秒」触发，保证每档只触发一次
           SLOTS="12:00 15:00 18:00 20:10 20:40"
-          END=$(( $(date +%s) + 349*60 ))   # 跑 349 分钟（略小于 timeout）
+          # 自测模式：test_slot 非空时只用它做档位，运行分钟数也缩短
+          TEST_SLOT="${{ github.event.inputs.test_slot }}"
+          TEST_MIN="${{ github.event.inputs.test_minutes }}"
+          if [ -n "$TEST_SLOT" ]; then
+            SLOTS="$TEST_SLOT"
+            RUN_MIN="${TEST_MIN:-5}"
+            echo "⚠ 自测模式：档位=$TEST_SLOT，运行 $RUN_MIN 分钟"
+          else
+            RUN_MIN=349
+          fi
+          END=$(( $(date +%s) + RUN_MIN*60 ))   # 正常 349 分钟（略小于 timeout）
           FIRED=""                          # 已触发的档位（本 job 内去重）
           ROUND=0
 
