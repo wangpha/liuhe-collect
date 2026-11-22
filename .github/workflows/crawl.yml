@@ -1074,7 +1074,7 @@ jobs:
   # ---------------- 合并 dahkg：解开各片缓存后完整跑一次 ----------------
   merge_dahkg:
     name: "合并 dahkg"
-    needs: [plan, prepare, shard_dahkg]
+    needs: [gate, plan, prepare, shard_dahkg]
     # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
     if: needs.gate.outputs.should_run == '1' && always() && !cancelled() && contains(needs.plan.outputs.sources, 'dahkg')
     runs-on: ubuntu-24.04
@@ -1232,7 +1232,7 @@ jobs:
   # ---------------- 合并 aocai：解开各片缓存后完整跑一次 ----------------
   merge_aocai:
     name: "合并 aocai"
-    needs: [plan, prepare, shard_aocai]
+    needs: [gate, plan, prepare, shard_aocai]
     # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
     if: needs.gate.outputs.should_run == '1' && always() && !cancelled() && contains(needs.plan.outputs.sources, 'aocai')
     runs-on: ubuntu-24.04
@@ -1390,7 +1390,7 @@ jobs:
   # ---------------- 合并 tuku：解开各片缓存后完整跑一次 ----------------
   merge_tuku:
     name: "合并 tuku"
-    needs: [plan, prepare, shard_tuku]
+    needs: [gate, plan, prepare, shard_tuku]
     # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
     if: needs.gate.outputs.should_run == '1' && always() && !cancelled() && contains(needs.plan.outputs.sources, 'tuku')
     runs-on: ubuntu-24.04
