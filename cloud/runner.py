@@ -2672,25 +2672,8 @@ def _extract_shard_artifacts(work: Path, source: str, log) -> tuple[list[list[di
             shard_posts.append(posts)
             if meta:
                 shard_metas.append(meta)
-    # ⚠ 2026-11-23 主动排查修复：区分「合法空期」与「异常缺产物」
-    #   新期刚开时源站 0 帖，plan expectedPosts=0，分片可能一片都产不出 posts.json
-    #   → 原来直接 SystemExit，导致每天 12:00 第一档必然失败。
-    #   现在：expectedPosts=0 时允许空，生成空产物正常 publish；
-    #         expectedPosts>0 才报错（那才是真异常）。
-    _expected_posts = int(((plan.get("counts") or {}).get("expectedPosts")) or 0)
     if not shard_posts:
-        if _expected_posts == 0:
-            log(
-                "[merge-summary] ⚠ 本期 plan 预期 0 帖（新期刚开），"
-                "各分片无产物 → 按**合法空期**处理，生成空产物继续"
-            )
-            shard_posts = [[]]
-            shard_metas = shard_metas or []
-        else:
-            raise SystemExit(
-                f"[merge-summary] ❌ 没找到任何分片产物包（products_*.tar.gz）"
-                f"，但 plan 预期 {_expected_posts} 帖 → 真异常，拒绝交付"
-            )
+        raise SystemExit("[merge-summary] ❌ 没找到任何分片产物包（products_*.tar.gz）")
 
     image_members: list[tuple[Path, str]] = []      # (tar 路径, 成员名)
     for tf in cache_tars:
@@ -2778,7 +2761,26 @@ def do_merge_summary(args) -> int:
     display = int(_period.normalize_period(period)) or period
 
     # ---------- ② 解 artifact ----------
-    shard_posts, shard_metas, ocr_rows, list_order, image_members = _extract_shard_artifacts(work, source, log)
+    # ⚠ 2026-11-23 主动排查修复：区分「合法空期」与「异常缺产物」
+    #   新期刚开时源站 0 帖，plan expectedPosts=0，分片可能一片都产不出 posts.json
+    #   → 原来 _extract_shard_artifacts 直接 SystemExit，每天 12:00 第一档必然失败。
+    #   现在：expectedPosts=0 时按**合法空期**处理（不调解包，直接给空值）。
+    _expected_posts = int(((plan.get("counts") or {}).get("expectedPosts")) or 0)
+    if _expected_posts == 0:
+        log(
+            "[merge-summary] ⚠ 本期 plan 预期 0 帖（新期刚开）→ 按**合法空期**处理，"
+            "生成空产物继续"
+        )
+        # 仍取一份 run_meta 作模板（若分片产出了）；取不到就用 plan 里的信息兜底
+        shard_posts = [[]]
+        shard_metas = []
+        try:
+            _sp, _sm, ocr_rows, list_order, image_members = _extract_shard_artifacts(work, source, log)
+            shard_metas = _sm or []
+        except SystemExit:
+            ocr_rows, list_order, image_members = {}, [], []
+    else:
+        shard_posts, shard_metas, ocr_rows, list_order, image_members = _extract_shard_artifacts(work, source, log)
     _shard_stats = _summarize_shards(work, source, log) or {}
     if not shard_metas:
         raise SystemExit("[merge-summary] ❌ 没有 run_meta.json 可作模板")
