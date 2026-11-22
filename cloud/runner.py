@@ -3087,10 +3087,19 @@ def do_merge_summary(args) -> int:
     _image_check: dict = {"passed": None}
     _scan_complete = True
     try:
-        _collect_started = float((meta.get("generatedAtUnix") or 0))
+        # ⚠ 2026-11-23 修复（run 45058970030 实测：防线2「声明 0 张」/ 防线1「expected=0」）：
+        #   原写 `_collect_started = meta["generatedAtUnix"]`，
+        #   那是**产物生成时间**（merge 时刻，比采集晚 ~20 分钟），
+        #   而 independent_scan 用它过滤「此时间之后的帖子算 lateIds」
+        #   → 整期帖子全判成 lateIds → unionMeta 几乎为空 → declared 全 0。
+        #
+        #   merge 阶段本就不需要时间对齐：
+        #     分片全部跑完后才 merge，产物已固定；
+        #     独立扫描拿到的就是这一期完整清单，直接对账即可。
+        #   所以 created_before 传 0（=不做时间对齐）。
         _scan = _reconcile.independent_scan(
             source, period, max_pages=200,
-            created_before=_collect_started, log=log,
+            created_before=0.0, log=log,
         )
         _scan_complete = bool(_scan.get("complete", True))
         if not _scan_complete:
@@ -3109,12 +3118,14 @@ def do_merge_summary(args) -> int:
                                      target_period=period)
             if _probe_ids else None
         )
+        # 同理：collect_started 传 None（不做「采集期间新发帖」的索引延迟豁免），
+        # merge 时所有帖子都已固定，不存在这个场景。
         _post_check = _reconcile.reconcile_posts(
             merged, _scan,
             previous_ids=None,
             probe=_probe,
             target_period=period,
-            collect_started=_collect_started,
+            collect_started=None,
         )
         log(
             f"[防线1] 帖子对账：采集前已存在 {_post_check['expected']} 帖 / 产物 "
