@@ -80,14 +80,53 @@ def cleanup_images(
     }
 
 
-def _period_sort_key(path: Path) -> tuple[int, str]:
-    """期目录名形如 `澳门_2026_317期`，按其中的期号排序。"""
-    name = path.name
+def _period_sort_key(path: Path | str) -> tuple[int, str]:
+    """期目录名形如 `澳门_2026_317期`，按其中的期号排序。
+
+    2026-11-23：接受 Path 或 str（轮转时两种形态都可能传进来，
+    目录用 Path、`.tar.gz` 去掉后缀后用 str）。
+    """
+    name = path.name if isinstance(path, Path) else str(path)
     digits = "".join(ch for ch in name.split("_")[-1] if ch.isdigit())
     try:
         return (int(digits or 0), name)
     except ValueError:
         return (0, name)
+
+
+#: 期归档的后缀（与 cloud/publish_store.py 的 ARCHIVE_SUFFIX 一致）
+_ARCHIVE_SUFFIX = ".tar.gz"
+
+
+def _collect_period_entries(source_dir: Path) -> dict[str, list[Path]]:
+    """扫一个源目录，返回 {期名: [该期的所有路径]}。
+
+    ## 为什么需要（2026-11-23 修复 R7「30 天轮转从未生效」）
+    原来只认**子目录**（`p.is_dir()`），但 publish_store 写的是
+    `data/<源>/澳门_2026_XXX期.tar.gz`（**文件**）→ 期列表恒为空 → 永不轮转。
+    实测数据仓三源各有 8 期，日志却写「共 0 期」。
+
+    现在两种形态都识别：
+      · 目录：`澳门_2026_XXX期/`            → 期名 = 目录名
+      · 文件：`澳门_2026_XXX期.tar.gz`      → 期名 = 去掉 .tar.gz
+    非期文件（如 .gitkeep）忽略。
+    """
+    entries: dict[str, list[Path]] = {}
+    try:
+        children = list(source_dir.iterdir())
+    except OSError:
+        return entries
+    for child in children:
+        name = child.name
+        try:
+            if child.is_dir():
+                entries.setdefault(name, []).append(child)
+            elif child.is_file() and name.endswith(_ARCHIVE_SUFFIX):
+                period = name[: -len(_ARCHIVE_SUFFIX)]
+                entries.setdefault(period, []).append(child)
+        except OSError:
+            continue
+    return entries
 
 
 def rotate_periods(
@@ -96,7 +135,10 @@ def rotate_periods(
     dry_run: bool = False,
     log: Callable[[str], None] | None = None,
 ) -> dict:
-    """数据仓里每个源只保留最近 `keep` 期，更早的整目录删除（R7）。"""
+    """数据仓里每个源只保留最近 `keep` 期，更早的整期删除（R7）。
+
+    支持两种形态：期目录（历史）与 `.tar.gz` 归档（当前）。
+    """
     say = log or (lambda message: None)
     store_root = Path(store_root)
     removed: list[str] = []
@@ -107,17 +149,35 @@ def rotate_periods(
         return {"sources": {}, "removed": [], "keep": keep}
 
     for source_dir in sorted(p for p in store_root.iterdir() if p.is_dir()):
-        periods = sorted((p for p in source_dir.iterdir() if p.is_dir()), key=_period_sort_key)
-        keep_list = periods[-keep:] if len(periods) > keep else periods
-        drop_list = periods[: max(0, len(periods) - keep)]
-        kept_per_source[source_dir.name] = [p.name for p in keep_list]
-        for old in drop_list:
-            removed.append(f"{source_dir.name}/{old.name}")
-            if not dry_run:
-                shutil.rmtree(old, ignore_errors=True)
+        entries = _collect_period_entries(source_dir)
+        period_names = sorted(entries, key=_period_sort_key)
+        keep_list = period_names[-keep:] if len(period_names) > keep else period_names
+        drop_list = period_names[: max(0, len(period_names) - keep)]
+        kept_per_source[source_dir.name] = keep_list
+        for old_name in drop_list:
+            paths = entries.get(old_name) or []
+            shapes = []
+            for old in paths:
+                removed.append(f"{source_dir.name}/{old.name}")
+                try:
+                    is_dir = old.is_dir()
+                except OSError:
+                    continue
+                shapes.append("目录" if is_dir else "文件")
+                if dry_run:
+                    continue
+                if is_dir:
+                    shutil.rmtree(old, ignore_errors=True)
+                else:
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
+            shapes_txt = "/".join(sorted(set(shapes))) if shapes else "?"
+            say(f"[轮转]   删除 {source_dir.name}/{old_name}（{shapes_txt}）")
         say(
-            f"[轮转] {source_dir.name}: 共 {len(periods)} 期，保留 {len(keep_list)} 期"
-            + (f"，删除 {len(drop_list)} 期：{[p.name for p in drop_list]}" if drop_list else "")
+            f"[轮转] {source_dir.name}: 共 {len(period_names)} 期，保留 {len(keep_list)} 期"
+            + (f"，删除 {len(drop_list)} 期：{drop_list}" if drop_list else "")
             + ("（dry-run 未实际删除）" if dry_run and drop_list else "")
         )
     if not removed:

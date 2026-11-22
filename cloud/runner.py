@@ -2430,11 +2430,19 @@ def do_shard(args) -> int:
             shard_timeout_s=shard_to, merge_timeout_s=merge_to,
         )
         ratio = _budget.USABLE_RATIO
+        # ⚠ 2026-11-23 口径修正（审计实测：日志写「本片 58 图，缓存命中 2641」超图数 45 倍）：
+        #   `cached` 是**全局层2 缓存池的唯一条目数**（跨片/跨源/跨期共享），
+        #   不是「本片复用了多少张」。原来写成「缓存命中 N」会让人误以为是本片命中数。
+        #   现在明确区分：
+        #     · 缓存池 N 条（全局可复用的 OCR 结果总量）
+        #     · 按假设命中率 X% 估算（仅用于耗时预算，保守方向）
+        #   真实本片复用数由 [OCR] 行的「缓存命中 Y」上报（见 diag 探针）。
         log(
-            f"[shard] 本片 {total_imgs} 图，缓存命中 {cached}"
-            f"（{budget_est['hit_rate'] * 100:.0f}%），"
-            f"有效 {budget_est['effective']:.3f} 秒/次，"
-            f"估算 {total_imgs * budget_est['effective'] / 60:.1f} 分钟"
+            f"[shard] 本片 {total_imgs} 图；缓存池 {cached} 条可复用 OCR 结果"
+            f"（全局共享，非本片命中数）；按假设命中率 "
+            f"{budget_est['hit_rate'] * 100:.0f}% 估算，有效 "
+            f"{budget_est['effective']:.3f} 秒/次，"
+            f"预计 {total_imgs * budget_est['effective'] / 60:.1f} 分钟"
             f"（分片上限 {shard_to * ratio / 60:.1f} / merge 上限 {merge_to * ratio / 60:.1f} 分）"
         )
         log(
@@ -3059,6 +3067,138 @@ def do_merge_summary(args) -> int:
             f"[merge-summary] ❌ 产物缺失 {len(_missing_products)} 个：{_missing_products}"
             f"（拒绝交付残缺产物）"
         )
+    # ==========================================================================
+    # ⑨c 防线 1/2/3 完整实现（2026-11-23 根因修复）
+    # --------------------------------------------------------------------------
+    # ## 为什么加
+    # 审计发现：防线 1/2/3 的完整实现只在 do_run（L3318-3483），
+    # 而三源 merge 走 do_merge_summary —— **从没接上**。
+    # 日志里 `[防线1]` / `[防线3]` grep 命中 0，只有弱化版防线2（字段格式）。
+    # 后果：R11「绝不漏帖子」/ R12「绝不漏图片」/ R13「绝不漏新增内容」
+    #       三条零容忍红线全部失效。
+    #
+    # ## 为什么不违反「merge 只汇总」
+    # 下面三步全是**只读核对**：扫源站列表、求证详情、比对快照。
+    # 不写产物、不重采集、不改 posts —— 只是拿源站真实清单和产物对账。
+    # ==========================================================================
+    log("[防线1] ===== 帖子独立对账（R11 绝不漏帖）=====")
+    _scan: dict = {}
+    _post_check: dict = {"passed": None}
+    _image_check: dict = {"passed": None}
+    _scan_complete = True
+    try:
+        _collect_started = float((meta.get("generatedAtUnix") or 0))
+        _scan = _reconcile.independent_scan(
+            source, period, max_pages=200,
+            created_before=_collect_started, log=log,
+        )
+        _scan_complete = bool(_scan.get("complete", True))
+        if not _scan_complete:
+            log(
+                f"[防线1] ⚠ 独立扫描有 {_scan.get('pageErrorCount', 0)} 页重试 "
+                f"{_reconcile.PAGE_RETRIES} 次仍失败 → 对账基准不可信，判**不通过**"
+            )
+        _got_ids = {int(p_.get("articleId") or 0) for p_ in merged if p_.get("articleId")}
+        _late_ids = {int(x) for x in (_scan.get("lateIds") or [])}
+        _want_ids = set(_scan.get("unionIds") or [])
+        _candidates = sorted(_got_ids - _want_ids - _late_ids)
+        _miss_candidates = sorted(_want_ids - _got_ids)
+        _probe_ids = sorted(set(_candidates) | set(_miss_candidates))
+        _probe = (
+            _reconcile.probe_details(source, _probe_ids, log=log,
+                                     target_period=period)
+            if _probe_ids else None
+        )
+        _post_check = _reconcile.reconcile_posts(
+            merged, _scan,
+            previous_ids=None,
+            probe=_probe,
+            target_period=period,
+            collect_started=_collect_started,
+        )
+        log(
+            f"[防线1] 帖子对账：采集前已存在 {_post_check['expected']} 帖 / 产物 "
+            f"{_post_check['actual']} 帖 / 缺 {_post_check['missingCount']}"
+            f" / 索引延迟 {_post_check.get('indexLagCount', 0)}"
+            f" / 扫描盲区 {_post_check['scanGapCount']}"
+            f" / 源站已删 {_post_check['disappearedCount']}"
+            f" / 幽灵 {_post_check['phantomCount']}"
+            f" / 待复核 {_post_check.get('unverifiedCount', 0)}"
+            f"  ← {'通过' if _post_check['passed'] else '不通过'}"
+        )
+        if _post_check.get("missing"):
+            log(f"[防线1] 漏帖样本（前 20）：{_post_check['missing'][:20]}")
+        if _post_check.get("scanGap"):
+            log(f"[防线1] 扫描盲区样本（前 20）：{_post_check['scanGap'][:20]}")
+        if not _scan_complete or _post_check.get("passed") is False:
+            passed = False
+    except Exception as _exc:  # noqa: BLE001 - 对账炸了不能静默通过
+        log(f"[防线1] ❌ 独立对账异常：{type(_exc).__name__}: {_exc}")
+        passed = False
+        _post_check = {"passed": False, "error": f"{type(_exc).__name__}: {_exc}"}
+
+    log("[防线2] ===== 图片独立对账（R12 绝不漏图）=====")
+    try:
+        _image_check = _reconcile.reconcile_images(
+            merged, _scan or {},
+            require_files=None,      # merge 手上没有图片文件，只做声明口径核对
+            probe_bad_images=True,   # 坏图 URL 求证（只读 HEAD 请求）
+            log=log,
+        )
+        log(
+            f"[防线2] 图片对账：声明 {_image_check.get('declaredTotal', 0)} 张 / 实际 "
+            f"{_image_check.get('actualTotal', 0)} 张 / 不符帖子 "
+            f"{_image_check.get('mismatchPosts', 0)} / 能下到却没下 "
+            f"{_image_check.get('retryableImages', 0)} / 源站404或空 "
+            f"{_image_check.get('unrecoverableImages', 0)}  ← "
+            f"{'通过' if _image_check.get('passed') else '不通过'}"
+        )
+        if _image_check.get("passed") is False:
+            passed = False
+    except Exception as _exc:  # noqa: BLE001
+        log(f"[防线2] ❌ 图片对账异常：{type(_exc).__name__}: {_exc}")
+        passed = False
+        _image_check = {"passed": False, "error": f"{type(_exc).__name__}: {_exc}"}
+
+    log("[防线3] ===== 新增内容不漏（R13）=====")
+    try:
+        # 单调性：与上一轮快照比，产物帖数不能少（少了就是丢了新增或旧帖）
+        _snap_path = work / "state" / f"snapshot_{source}_{period}.json"
+        _prev_ids: set[int] = set()
+        if _snap_path.exists():
+            try:
+                import json as _j
+
+                _prev = _j.loads(_snap_path.read_text(encoding="utf-8"))
+                _prev_ids = {int(x) for x in (_prev.get("ids") or [])}
+            except (OSError, ValueError):
+                _prev_ids = set()
+        _curr_ids = {int(p_.get("articleId") or 0) for p_ in merged if p_.get("articleId")}
+        if _prev_ids:
+            _lost = sorted(_prev_ids - _curr_ids)
+            log(
+                f"[防线3] 单调性：上轮 {len(_prev_ids)} 帖 → 本轮 {len(_curr_ids)} 帖"
+                f"，丢失 {len(_lost)} 帖"
+                + (f"（样本 {_lost[:10]}）← 不通过" if _lost else "  ← 通过")
+            )
+            if _lost:
+                passed = False
+        else:
+            log(f"[防线3] 单调性：无上轮快照（首次），建立基线 {len(_curr_ids)} 帖")
+        # 写本轮快照供下轮比对
+        try:
+            _guard.save_json(
+                _snap_path,
+                {"source": source, "period": period,
+                 "ids": sorted(_curr_ids),
+                 "ts": time.strftime("%Y-%m-%d %H:%M:%S")},
+            )
+        except OSError as _exc:
+            log(f"[防线3] ⚠ 快照写入失败（不影响本轮）：{_exc}")
+    except Exception as _exc:  # noqa: BLE001
+        log(f"[防线3] ❌ 单调性检查异常：{type(_exc).__name__}: {_exc}")
+        passed = False
+
     passed = bool(passed)
 
     # ---------- ⑩ 已知差异标注（条件 2）----------

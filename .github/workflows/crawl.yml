@@ -1735,7 +1735,12 @@ jobs:
             cp "$j" "work/store/logs/" 2>/dev/null || true
           done
           echo "拷入日志 $FOUND 份"
+          # ⚠ 2026-11-23 修复（审计 C-1，实测数据仓 logs/ 积了 127 个 audit_*.json）：
+          #   原来 glob 只有 *.log，audit_*.json 永不轮转（README 承诺 30 份）。
+          #   run_*.log 稳定 30 份证明机制有效，只是漏了 json 这一类。
           ls -1t work/store/logs/*.log 2>/dev/null | tail -n +31 | xargs -r rm -f
+          ls -1t work/store/logs/audit_*.json 2>/dev/null | tail -n +31 | xargs -r rm -f
+          echo "logs 轮转后：$(ls -1 work/store/logs/*.log 2>/dev/null | wc -l) 个 .log / $(ls -1 work/store/logs/audit_*.json 2>/dev/null | wc -l) 个 audit_*.json"
       - name: 提交并推送
         working-directory: repo/work/store
         run: |
