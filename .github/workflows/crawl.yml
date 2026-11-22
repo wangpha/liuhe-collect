@@ -257,7 +257,7 @@ jobs:
           if git diff --cached --quiet; then echo "无变化"; else
             git commit -m "cleanup: 图片2天/产物30期轮转 $(date -u +%Y-%m-%dT%H:%M:%SZ)"; git push; fi
       - name: 保存清理日志
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         uses: actions/upload-artifact@v4
         with:
           name: cleanup-log-${{ github.run_id }}
@@ -470,7 +470,7 @@ jobs:
             fi
             exit $code
       - name: 收集两层缓存（meta 按期 / OCR 跨期）
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           PERIOD="${{ steps.period.outputs.period }}"
@@ -482,7 +482,7 @@ jobs:
           done
           echo "meta($PERIOD): $(ls work/meta-cache/$PERIOD 2>/dev/null | wc -l) 个；ocr: $(ls work/ocr-cache/ocr 2>/dev/null | wc -l) 个"
       - name: 缓存体积检查（超 500MB 才瘦身）
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           # 方案 3 改动 4：分片 artifact **保留图片**（约 200MB/片），
@@ -507,7 +507,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -E '\[详情\]|\[OCR\]|\[图片\]|\[shard\]' work/shard_dahkg_${{ matrix.shard }}.log 2>/dev/null | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
       - name: 打包本片缓存
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           mkdir -p work/cacheout
@@ -528,7 +528,7 @@ jobs:
             [ -f "$f" ] && echo "产物包 $(basename "$f"): $(du -m "$f" | cut -f1) MB / $(tar -tzf "$f" | wc -l) 个文件"
           done
       - name: 上传本片缓存
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         uses: actions/upload-artifact@v4
         with:
           name: cache-dahkg-${{ matrix.shard }}-${{ github.run_id }}
@@ -692,7 +692,7 @@ jobs:
             fi
             exit $code
       - name: 收集两层缓存（meta 按期 / OCR 跨期）
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           PERIOD="${{ steps.period.outputs.period }}"
@@ -704,7 +704,7 @@ jobs:
           done
           echo "meta($PERIOD): $(ls work/meta-cache/$PERIOD 2>/dev/null | wc -l) 个；ocr: $(ls work/ocr-cache/ocr 2>/dev/null | wc -l) 个"
       - name: 缓存体积检查（超 500MB 才瘦身）
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           # 方案 3 改动 4：分片 artifact **保留图片**（约 200MB/片），
@@ -729,7 +729,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -E '\[详情\]|\[OCR\]|\[图片\]|\[shard\]' work/shard_aocai_${{ matrix.shard }}.log 2>/dev/null | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
       - name: 打包本片缓存
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           mkdir -p work/cacheout
@@ -750,7 +750,7 @@ jobs:
             [ -f "$f" ] && echo "产物包 $(basename "$f"): $(du -m "$f" | cut -f1) MB / $(tar -tzf "$f" | wc -l) 个文件"
           done
       - name: 上传本片缓存
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         uses: actions/upload-artifact@v4
         with:
           name: cache-aocai-${{ matrix.shard }}-${{ github.run_id }}
@@ -914,7 +914,7 @@ jobs:
             fi
             exit $code
       - name: 收集两层缓存（meta 按期 / OCR 跨期）
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           PERIOD="${{ steps.period.outputs.period }}"
@@ -926,7 +926,7 @@ jobs:
           done
           echo "meta($PERIOD): $(ls work/meta-cache/$PERIOD 2>/dev/null | wc -l) 个；ocr: $(ls work/ocr-cache/ocr 2>/dev/null | wc -l) 个"
       - name: 缓存体积检查（超 500MB 才瘦身）
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           # 方案 3 改动 4：分片 artifact **保留图片**（约 200MB/片），
@@ -951,7 +951,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -E '\[详情\]|\[OCR\]|\[图片\]|\[shard\]' work/shard_tuku_${{ matrix.shard }}.log 2>/dev/null | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
       - name: 打包本片缓存
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           mkdir -p work/cacheout
@@ -972,7 +972,7 @@ jobs:
             [ -f "$f" ] && echo "产物包 $(basename "$f"): $(du -m "$f" | cut -f1) MB / $(tar -tzf "$f" | wc -l) 个文件"
           done
       - name: 上传本片缓存
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         uses: actions/upload-artifact@v4
         with:
           name: cache-tuku-${{ matrix.shard }}-${{ github.run_id }}
@@ -988,7 +988,7 @@ jobs:
     name: "合并 dahkg"
     needs: [plan, prepare, shard_dahkg]
     # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
-    if: always() && !cancelled() && contains(needs.plan.outputs.sources, 'dahkg')
+    if: needs.gate.outputs.should_run == '1' && always() && !cancelled() && contains(needs.plan.outputs.sources, 'dahkg')
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -1094,7 +1094,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -E '\[详情\]|\[OCR\]|\[图片\]|\[plan\]|\[merge\]' work/run_dahkg.log 2>/dev/null | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
       - name: 日志零错误审计（文档 6B.3 方式 1）
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           LOG="work/run_dahkg.log"
@@ -1102,14 +1102,14 @@ jobs:
             python cloud/audit_logs.py "$LOG" --json "work/audit/logaudit_dahkg.json" || true
           fi
       - name: 汇总产物清单
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           find work/out -maxdepth 3 -type d -name '*期' > work/_periods.txt 2>/dev/null || true
           while read -r d; do [ -n "$d" ] || continue; echo "$d : $(find "$d" -maxdepth 1 -type f | wc -l) 个文件"; done < work/_periods.txt
           du -sh work/out 2>/dev/null || true
       - name: 上传日志与审计证据
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         uses: actions/upload-artifact@v4
         with:
           name: run-dahkg-${{ github.run_id }}
@@ -1132,7 +1132,7 @@ jobs:
       #   实测耗时 16.8 分被 Watchdog 取消（与已删除的 ocr-merge-v3 同一坑）。
       #   缓存改由各分片自己 save（key 带片号，无冲突）。
       - name: 上传产物（数据类，不含图片）
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         uses: actions/upload-artifact@v4
         with:
           name: products-dahkg-${{ github.run_id }}
@@ -1146,7 +1146,7 @@ jobs:
     name: "合并 aocai"
     needs: [plan, prepare, shard_aocai]
     # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
-    if: always() && !cancelled() && contains(needs.plan.outputs.sources, 'aocai')
+    if: needs.gate.outputs.should_run == '1' && always() && !cancelled() && contains(needs.plan.outputs.sources, 'aocai')
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -1252,7 +1252,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -E '\[详情\]|\[OCR\]|\[图片\]|\[plan\]|\[merge\]' work/run_aocai.log 2>/dev/null | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
       - name: 日志零错误审计（文档 6B.3 方式 1）
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           LOG="work/run_aocai.log"
@@ -1260,14 +1260,14 @@ jobs:
             python cloud/audit_logs.py "$LOG" --json "work/audit/logaudit_aocai.json" || true
           fi
       - name: 汇总产物清单
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           find work/out -maxdepth 3 -type d -name '*期' > work/_periods.txt 2>/dev/null || true
           while read -r d; do [ -n "$d" ] || continue; echo "$d : $(find "$d" -maxdepth 1 -type f | wc -l) 个文件"; done < work/_periods.txt
           du -sh work/out 2>/dev/null || true
       - name: 上传日志与审计证据
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         uses: actions/upload-artifact@v4
         with:
           name: run-aocai-${{ github.run_id }}
@@ -1290,7 +1290,7 @@ jobs:
       #   实测耗时 16.8 分被 Watchdog 取消（与已删除的 ocr-merge-v3 同一坑）。
       #   缓存改由各分片自己 save（key 带片号，无冲突）。
       - name: 上传产物（数据类，不含图片）
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         uses: actions/upload-artifact@v4
         with:
           name: products-aocai-${{ github.run_id }}
@@ -1304,7 +1304,7 @@ jobs:
     name: "合并 tuku"
     needs: [plan, prepare, shard_tuku]
     # 必须带源过滤：只跑本次选中的源，否则 tuku-only 运行会把 dahkg/aocai 的 merge 也拉起来（白跑几小时）
-    if: always() && !cancelled() && contains(needs.plan.outputs.sources, 'tuku')
+    if: needs.gate.outputs.should_run == '1' && always() && !cancelled() && contains(needs.plan.outputs.sources, 'tuku')
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -1410,7 +1410,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -E '\[详情\]|\[OCR\]|\[图片\]|\[plan\]|\[merge\]' work/run_tuku.log 2>/dev/null | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
       - name: 日志零错误审计（文档 6B.3 方式 1）
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           LOG="work/run_tuku.log"
@@ -1418,14 +1418,14 @@ jobs:
             python cloud/audit_logs.py "$LOG" --json "work/audit/logaudit_tuku.json" || true
           fi
       - name: 汇总产物清单
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         working-directory: repo
         run: |
           find work/out -maxdepth 3 -type d -name '*期' > work/_periods.txt 2>/dev/null || true
           while read -r d; do [ -n "$d" ] || continue; echo "$d : $(find "$d" -maxdepth 1 -type f | wc -l) 个文件"; done < work/_periods.txt
           du -sh work/out 2>/dev/null || true
       - name: 上传日志与审计证据
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         uses: actions/upload-artifact@v4
         with:
           name: run-tuku-${{ github.run_id }}
@@ -1448,7 +1448,7 @@ jobs:
       #   实测耗时 16.8 分被 Watchdog 取消（与已删除的 ocr-merge-v3 同一坑）。
       #   缓存改由各分片自己 save（key 带片号，无冲突）。
       - name: 上传产物（数据类，不含图片）
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         uses: actions/upload-artifact@v4
         with:
           name: products-tuku-${{ github.run_id }}
@@ -1460,8 +1460,8 @@ jobs:
   # ---------------- 整轮 watchdog：步骤级软超时（主）+ 40 分钟兜底（副） ----------------
   watchdog:
     name: "Watchdog 整轮 50 分钟上限"
-    needs: [plan]
-    if: always()
+    needs: [gate, plan]
+    if: needs.gate.outputs.should_run == '1' && always()
     # 取消整轮需要 actions: write；默认 GITHUB_TOKEN 没有该权限（实测 403）
     permissions:
       actions: write
@@ -1596,9 +1596,16 @@ jobs:
   # ---------------- Job 13：推送到私有数据仓 ----------------
   publish:
     name: "Job13 publish 推数据仓"
-    needs: [merge_dahkg, merge_aocai, merge_tuku]
-    if: always() && !cancelled() && github.event.inputs.dry_publish != 'true' && !contains(needs.*.result, 'failure')
-    runs-on: ubuntu-24.04
+    # ⚠ 2026-11-22 根因修复（run 44974512476 / 45009070383 实测）：
+    #   原来 needs 里**没有 gate**，却引用 needs.gate.outputs.should_run ——
+    #   GitHub 无法解析未在 needs 中声明的 job 输出，条件失效 →
+    #   gate 判定「跳过」时 publish 仍然执行 →
+    #   FATAL: 没有把任何一期的产物写进数据仓 → 整轮 failure。
+    #   修法：needs 加入 gate；条件不用 always() 包裹 should_run；
+    #        并显式拒绝上游 skipped（gate 跳过时 merge 全 skipped）。
+    needs: [gate, merge_dahkg, merge_aocai, merge_tuku]
+    if: needs.gate.outputs.should_run == '1' && always() && !cancelled() && github.event.inputs.dry_publish != 'true' && !contains(needs.*.result, 'failure')
+    if: needs.gate.outputs.should_run == '1' && !cancelled() && github.event.inputs.dry_publish != 'true' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'skipped')
     timeout-minutes: 10
     steps:
       - name: 检出代码
@@ -1682,7 +1689,7 @@ jobs:
           git commit -m "data: 云端采集(分片) 期${PERIODS} $(date -u +%Y-%m-%dT%H:%M:%SZ) run#${{ github.run_number }}"
           git push
       - name: 上传合并结果
-        if: always()
+        if: needs.gate.outputs.should_run == '1' && always()
         uses: actions/upload-artifact@v4
         with:
           name: publish-${{ github.run_id }}
