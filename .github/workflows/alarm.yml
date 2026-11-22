@@ -78,6 +78,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
+          # ⚠ 2026-11-23 修正（自测 run 45079348715 实测）：自测模式跳过防重复检查。
+          #   原来自测实例查到生产闹钟在跑 → 主动退出，自测永远跑不起来。
+          TEST_SLOT="${{ github.event.inputs.test_slot }}"
+          if [ -n "$TEST_SLOT" ]; then
+            echo "⚠ 自测模式（档位=$TEST_SLOT）→ 跳过防重复检查"
+            echo "should_start=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # 查有没有别的「六合定时闹钟」workflow 正在跑（排除自己）
           RUNNING=$(curl -sS --max-time 30 \
             -H "Authorization: Bearer $GH_TOKEN" \
