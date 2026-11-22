@@ -3120,12 +3120,26 @@ def do_merge_summary(args) -> int:
         )
         # 同理：collect_started 传 None（不做「采集期间新发帖」的索引延迟豁免），
         # merge 时所有帖子都已固定，不存在这个场景。
+        # ⚠ 2026-11-23 修复（run 45060719884 实测：3232213 被判「缺 1 帖」）
+        #   原因：plan 生成时源站 299 帖，30 分钟后 merge 独立扫描已 300 帖。
+        #   多出的那帖是 **plan 之后新发布的**，不是漏抓。
+        #   修法：把 plan 的帖 id 并集作为基线传进去，
+        #        只有「plan 内有、产物没有」才算真漏帖；
+        #        「plan 外、扫描有」记为新帖（如实列出，不判失败）。
+        _plan_ids: set[int] = set()
+        for _g in ((plan.get("shardPlan") or {}).get("groups") or {}).values():
+            for _x in (_g or []):
+                try:
+                    _plan_ids.add(int(_x))
+                except (TypeError, ValueError):
+                    continue
         _post_check = _reconcile.reconcile_posts(
             merged, _scan,
             previous_ids=None,
             probe=_probe,
             target_period=period,
             collect_started=None,
+            plan_ids=_plan_ids or None,
         )
         log(
             f"[防线1] 帖子对账：采集前已存在 {_post_check['expected']} 帖 / 产物 "
@@ -3135,6 +3149,7 @@ def do_merge_summary(args) -> int:
             f" / 源站已删 {_post_check['disappearedCount']}"
             f" / 幽灵 {_post_check['phantomCount']}"
             f" / 待复核 {_post_check.get('unverifiedCount', 0)}"
+            f" / plan后新发 {_post_check.get('newAfterPlanCount', 0)}"
             f"  ← {'通过' if _post_check['passed'] else '不通过'}"
         )
         if _post_check.get("missing"):

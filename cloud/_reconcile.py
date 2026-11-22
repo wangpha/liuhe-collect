@@ -757,6 +757,7 @@ def reconcile_posts(
     target_period: int = 0,
     collect_started: float | None = None,
     index_grace: float = 300.0,
+    plan_ids: set[int] | None = None,
 ) -> dict:
     """帖子数对账。
 
@@ -772,6 +773,14 @@ def reconcile_posts(
                        → 源站删帖（文档防线3 第3道），如实记录，不判失败
       * `phantom`      产物有、列表没扫到、详情拿不到且上轮快照也没有 → **疑似垃圾数据，硬失败**
       * `late`         采集开始之后才出现/变更的帖子 → 两边都不计入（时间对齐）
+      * `newAfterPlan` 独立扫描有、plan 基线没有 → **plan 生成后才发布的帖子**，
+                       不是漏抓（2026-11-23 加，见 run 45060719884 实测）
+
+    ## `plan_ids`（2026-11-23 新增）
+    plan 阶段分配到的帖子 id 并集。传入后：
+      · 「扫描有、产物没有、且 plan 里有」→ 真漏帖（`missing`）
+      · 「扫描有、产物没有、且 plan 里没有」→ plan 后新发（`newAfterPlan`，不判失败）
+    不传时退化为原行为（全部算 missing，靠 collect_started 区分索引延迟）。
     """
     got = {int(p.get("articleId") or 0) for p in posts if p.get("articleId")}
     late = {int(x) for x in (scan.get("lateIds") or [])}
@@ -783,7 +792,13 @@ def reconcile_posts(
     missing_all = sorted(want - got)
     missing: list[int] = []
     index_lag: list[int] = []
+    new_after_plan: list[int] = []
+    _plan = {int(x) for x in (plan_ids or set())}
     for aid in missing_all:
+        # 2026-11-23：先在 plan 基线里找。plan 里没有 = plan 之后新发布，不是漏抓
+        if _plan and aid not in _plan:
+            new_after_plan.append(aid)
+            continue
         created = probe_created.get(aid) or 0
         if collect_started and created and created > 0:
             if abs(float(collect_started) - float(created)) <= index_grace and created <= collect_started + index_grace:
@@ -834,6 +849,8 @@ def reconcile_posts(
         "lateExcluded": len(late),
         "lateButCollected": len(late_in_products),
         "missingCount": len(missing),
+        "newAfterPlanCount": len(new_after_plan),
+        "newAfterPlan": new_after_plan[:50],
         "indexLagCount": len(index_lag),
         "indexLag": index_lag,
         "scanGapCount": len(scan_gap),
