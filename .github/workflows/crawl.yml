@@ -108,8 +108,29 @@ on:
 #     而 20:20 起跑 15-20 分钟会压到 21:31 开奖，故提前到 20:10）
   #   · 仓库是 public → Actions 分钟数免费，144 次/天的空跑无成本
   # ------------------------------------------------------------------------
+  # ⚠⚠ 2026-11-22 二次修复：`*/10` 实测仍然不可靠 ⚠⚠
+  # ------------------------------------------------------------------------
+  # 实测证据（GitHub API 实读 11 次 schedule event）：
+  #   分钟数分布: :03 :05 :06 :12 :13 :14 :20 :44 :45 :54 :54
+  #   我们的目标: :00 :10 :20 :30 :40 :50
+  #   命中: 1 次（9%）；间隔 32 分 ~ 941 分（15.7 小时）完全随机
+  #   workflow updated_at 冻结在 2026-11-19（之后 30+ 次 push 未更新）
+  #
+  # GitHub 官方文档原文：
+  #   "The schedule event can be delayed during periods of high loads.
+  #    High load times include the start of every hour.
+  #    If the load is sufficiently high enough, some queued jobs may be dropped.
+  #    To decrease the chance of delay, schedule your workflow to run at a
+  #    different part of the hour."
+  #
+  # 修法（三层保障）：
+  #   层1 多档兜底：每小时 6 次，**全部避开 :00 与 :30**（高负载时段）
+  #   层2 自愈补跑：gate 查数据仓 manifest 判断「今天该档跑过没」，没跑就补
+  #   层3 外部 cron（可选）：cron-job.org 准点调 workflow_dispatch API
+  # ------------------------------------------------------------------------
   schedule:
-    - cron: '*/10 * * * *'   # 每 10 分钟；真正的五档判断在 gate job 里做（北京时间）
+    # 每小时 6 次，分钟数都避开了整点和半点（GitHub 高负载时段）
+    - cron: '5,15,25,35,45,55 * * * *'
 
 # ⚠ 2026-11-20 根因修复：原来 group 是 crawl-<ref>，导致**所有 run 严格串行**。
 # 前一个 run 若异常变慢（曾因 merge 缓存 bug 跑 73 分钟），后面的全部排队
@@ -148,8 +169,10 @@ jobs:
       should_run: ${{ steps.gate.outputs.should_run }}
       slot: ${{ steps.gate.outputs.slot }}
     steps:
-      - name: 判断是否命中五档
+      - name: 判断是否命中五档（窗口 + 自愈补跑）
         id: gate
+        env:
+          DATA_TOKEN: ${{ secrets.LIUHE_DATA_TOKEN }}
         run: |
           set -eu
           # 手动触发一律放行（slot 由 inputs 或 run_id 承载）
@@ -163,25 +186,90 @@ jobs:
           # 北京时间（GitHub runner 是 UTC，用 TZ 转换）
           NOW_H=$(TZ=Asia/Shanghai date +%-H)
           NOW_M=$(TZ=Asia/Shanghai date +%-M)
+          NOW_YMD=$(TZ=Asia/Shanghai date '+%Y-%m-%d')
           NOW_S=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
-          echo "当前北京时间: $NOW_S (H=$NOW_H M=$NOW_M)"
+          NOW_EPOCH=$(TZ=Asia/Shanghai date +%s)
+          echo "当前北京时间: $NOW_S"
 
-          SLOT=""
-          # 五档窗口（各宽 10 分钟，覆盖 cron 延迟）
-          #   12:00-12:09 / 15:00-15:09 / 18:00-18:09 / 20:15-20:24 / 20:40-20:49
-          if   [ "$NOW_H" -eq 12 ] && [ "$NOW_M" -le 9 ]; then SLOT="12:00"
-          elif [ "$NOW_H" -eq 15 ] && [ "$NOW_M" -le 9 ]; then SLOT="15:00"
-          elif [ "$NOW_H" -eq 18 ] && [ "$NOW_M" -le 9 ]; then SLOT="18:00"
-          elif [ "$NOW_H" -eq 20 ] && [ "$NOW_M" -ge 10 ] && [ "$NOW_M" -le 19 ]; then SLOT="20:10"
-          elif [ "$NOW_H" -eq 20 ] && [ "$NOW_M" -ge 40 ] && [ "$NOW_M" -le 49 ]; then SLOT="20:40"
+          # ------------------------------------------------------------------
+          # 五档定义（分钟数从 0 点起的偏移）
+          #   12:00 → 720    15:00 → 900    18:00 → 1080
+          #   20:10 → 1210   20:40 → 1240
+          # ------------------------------------------------------------------
+          SLOTS_MIN="720 900 1080 1210 1240"
+          SLOTS_NAME="12:00 15:00 18:00 20:10 20:40"
+          NOW_MIN=$(( NOW_H * 60 + NOW_M ))
+
+          # ① 窗口内（±10 分钟）→ 直接放行
+          WIN=10
+          HIT_NAME=""
+          i=0
+          for sm in $SLOTS_MIN; do
+            i=$((i+1))
+            nm=$(echo "$SLOTS_NAME" | cut -d' ' -f$i)
+            if [ "$NOW_MIN" -ge "$sm" ] && [ "$NOW_MIN" -le $((sm + WIN)) ]; then
+              HIT_NAME="$nm"
+              break
+            fi
+          done
+          if [ -n "$HIT_NAME" ]; then
+            echo "✅ 命中五档窗口 $HIT_NAME → 放行"
+            echo "should_run=1" >> "$GITHUB_OUTPUT"
+            echo "slot=$HIT_NAME" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "未在五档窗口内（当前 $NOW_MIN 分，窗口 5 个），检查是否需要补跑…"
+
+          # ② 自愈补跑：查数据仓 manifest 的 generatedAt，判断今天跑过哪一档
+          LAST_TS=""
+          if [ -n "${DATA_TOKEN:-}" ]; then
+            BODY=$(curl -sS --max-time 30 -H "Authorization: Bearer $DATA_TOKEN" -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/wangpha/liuhe-data/contents/manifest.json" 2>/dev/null || true)
+            LAST_TS=$(echo "$BODY" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('generatedAt') or '')" 2>/dev/null || true)
+          fi
+          echo "数据仓 manifest.generatedAt = ${LAST_TS:-（取不到）}"
+
+          # generatedAt 形如 2026-11-21T22:30:59+0000（UTC）→ 转北京时间
+          LAST_MIN_OF_DAY=""
+          LAST_YMD=""
+          if [ -n "$LAST_TS" ]; then
+            # 用 date 解析（-d 支持的格式：2026-11-21T22:30:59+0000）
+            if LAST_BJ=$(TZ=Asia/Shanghai date -d "$LAST_TS" '+%Y-%m-%d %H:%M' 2>/dev/null); then
+              LAST_YMD=$(echo "$LAST_BJ" | cut -d' ' -f1)
+              LH=$(echo "$LAST_BJ" | cut -d' ' -f2 | cut -d: -f1)
+              LM=$(echo "$LAST_BJ" | cut -d' ' -f2 | cut -d: -f2)
+              LAST_MIN_OF_DAY=$(( 10#$LH * 60 + 10#$LM ))
+              echo "  解析为北京 $LAST_BJ（当日第 $LAST_MIN_OF_DAY 分）"
+            fi
           fi
 
-          if [ -n "$SLOT" ]; then
-            echo "✅ 命中五档窗口 $SLOT → 放行"
+          # 找「已过窗口 + 今天没跑」的最早一档来补跑
+          NEED_NAME=""
+          i=0
+          for sm in $SLOTS_MIN; do
+            i=$((i+1))
+            nm=$(echo "$SLOTS_NAME" | cut -d' ' -f$i)
+            # 该档窗口已过（now > slot + WIN）
+            if [ "$NOW_MIN" -le $((sm + WIN)) ]; then
+              continue
+            fi
+            # 该档是否已跑：manifest 是今天的 且 时间 >= 该档
+            _same_day=0
+            if [ -n "$LAST_YMD" ] && [ "$LAST_YMD" = "$NOW_YMD" ]; then _same_day=1; fi
+            _ran_this=0
+            if [ "$_same_day" = "1" ] && [ -n "$LAST_MIN_OF_DAY" ] && [ "$LAST_MIN_OF_DAY" -ge "$sm" ]; then _ran_this=1; fi
+            if [ "$_ran_this" = "1" ]; then
+              continue
+            fi
+            NEED_NAME="$nm"
+            break
+          done
+
+          if [ -n "$NEED_NAME" ]; then
+            echo "🔁 自愈补跑：$NEED_NAME 档今天还没跑过 → 补跑"
             echo "should_run=1" >> "$GITHUB_OUTPUT"
-            echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
+            echo "slot=${NEED_NAME}(补跑)" >> "$GITHUB_OUTPUT"
           else
-            echo "⏭ 未命中五档窗口（当前 $NOW_H:$NOW_M）→ 跳过本轮（只做闸门判断，约 10 秒）"
+            echo "⏭ 五档都已跑过或未到时间 → 跳过本轮"
             echo "should_run=0" >> "$GITHUB_OUTPUT"
             echo "slot=none" >> "$GITHUB_OUTPUT"
           fi

@@ -80,11 +80,19 @@ def publish(incoming: Path, store: Path, log=print) -> dict:
         for archive in sorted(key_dir.glob(f"*{ARCHIVE_SUFFIX}")):
             period = archive.name[: -len(ARCHIVE_SUFFIX)]
             info = next((x for x in published if x["key"] == key_dir.name and x["period"] == period), {})
+            # ⚠ 2026-11-22 根因修复（实测数据仓 320-325 期 files=0 rawBytes=0）：
+            #   原来对「本轮未重新打包的期」default 成 0，导致 manifest 元数据缺失。
+            #   修法：没有本轮 info 时，从 tar.gz **实测**文件数与解压字节数。
+            if info.get("files") and info.get("rawBytes"):
+                _files = int(info["files"])
+                _raw = int(info["rawBytes"])
+            else:
+                _files, _raw = _archive_stats(archive)
             entries[period] = {
                 "archive": archive.name,
                 "archiveBytes": archive.stat().st_size,
-                "files": info.get("files", 0),
-                "rawBytes": info.get("rawBytes", 0),
+                "files": _files,
+                "rawBytes": _raw,
                 "sha256": info.get("sha256") or _sha256(archive),
             }
         periods = sorted(entries, key=_period_no)
@@ -112,6 +120,30 @@ def publish(incoming: Path, store: Path, log=print) -> dict:
 def _period_no(name: str) -> int:
     digits = "".join(c for c in name.split("_")[-1] if c.isdigit())
     return int(digits or 0)
+
+
+def _archive_stats(archive: Path) -> tuple[int, int]:
+    """从 tar.gz 实测 (文件数, 解压后字节数)。
+
+    ## 为什么需要（2026-11-22 根因修复）
+    manifest 每轮只填「本轮重新打包的期」的 files/rawBytes，
+    其余期 default 成 0 —— 实测数据仓 320-325 期全部 files=0。
+    这里从归档文件本身实测，保证每一期都有真实元数据。
+    """
+    import tarfile
+
+    files = 0
+    raw = 0
+    try:
+        with tarfile.open(archive, "r:gz") as t:
+            for m in t.getmembers():
+                if m.isdir():
+                    continue
+                files += 1
+                raw += int(m.size or 0)
+    except (OSError, tarfile.TarError):
+        return (0, 0)
+    return (files, raw)
 
 
 def _sha256(path: Path) -> str:

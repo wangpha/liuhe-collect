@@ -105,13 +105,47 @@ def unpack(archive: Path, period_dir: Path, expected_sha256: str = "", expected_
             tar.extractall(period_dir)
 
     actual = sum(1 for p in period_dir.rglob("*") if p.is_file())
+
+    # ⚠ 2026-11-22 根因修复（实测数据仓 320-325 期 manifest files=0）：
+    #   原来 `passed = (expected_files == 0 or actual == expected_files)`，
+    #   expected_files=0 时永远 True —— 空包、解压失败、缺核心产物都发现不了。
+    #   现在加三层校验，expected_files=0 也能真校验。
+    try:
+        with tarfile.open(archive, "r:gz") as _t:
+            _members = [m for m in _t.getmembers() if not m.isdir()]
+        in_archive = len(_members)
+        _names = {m.name.rsplit("/", 1)[-1] for m in _members}
+    except (OSError, tarfile.TarError):
+        in_archive = -1
+        _names = set()
+
+    # 核心产物：三源都必有的
+    CORE = {"posts.json", "users.json"}
+    missing_core = sorted(CORE - _names)
+
+    # 校验三项
+    ok_nonempty = actual > 0                     # ① 解压后非空
+    ok_count = (in_archive == actual)            # ② 解压数与归档成员数一致
+    ok_core = not missing_core                   # ③ 核心产物齐
+    ok_expected = (expected_files == 0) or (actual == expected_files)   # ④ 期望值（有才比）
+
+    passed = ok_nonempty and ok_count and ok_core and ok_expected
+
     return {
         "period": period_dir.name,
         "dir": str(period_dir),
         "files": actual,
+        "inArchive": in_archive,
         "expectedFiles": expected_files,
+        "missingCore": missing_core,
         "sha256": sha,
-        "passed": bool(expected_files == 0 or actual == expected_files),
+        "checks": {
+            "非空": ok_nonempty,
+            "成员数一致": ok_count,
+            "核心产物齐": ok_core,
+            "期望文件数": ok_expected,
+        },
+        "passed": passed,
     }
 
 
