@@ -1604,8 +1604,8 @@ jobs:
     #   修法：needs 加入 gate；条件不用 always() 包裹 should_run；
     #        并显式拒绝上游 skipped（gate 跳过时 merge 全 skipped）。
     needs: [gate, merge_dahkg, merge_aocai, merge_tuku]
-    if: needs.gate.outputs.should_run == '1' && always() && !cancelled() && github.event.inputs.dry_publish != 'true' && !contains(needs.*.result, 'failure')
     if: needs.gate.outputs.should_run == '1' && !cancelled() && github.event.inputs.dry_publish != 'true' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'skipped')
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: 检出代码
