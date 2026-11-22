@@ -2672,8 +2672,25 @@ def _extract_shard_artifacts(work: Path, source: str, log) -> tuple[list[list[di
             shard_posts.append(posts)
             if meta:
                 shard_metas.append(meta)
+    # ⚠ 2026-11-23 主动排查修复：区分「合法空期」与「异常缺产物」
+    #   新期刚开时源站 0 帖，plan expectedPosts=0，分片可能一片都产不出 posts.json
+    #   → 原来直接 SystemExit，导致每天 12:00 第一档必然失败。
+    #   现在：expectedPosts=0 时允许空，生成空产物正常 publish；
+    #         expectedPosts>0 才报错（那才是真异常）。
+    _expected_posts = int(((plan.get("counts") or {}).get("expectedPosts")) or 0)
     if not shard_posts:
-        raise SystemExit("[merge-summary] ❌ 没找到任何分片产物包（products_*.tar.gz）")
+        if _expected_posts == 0:
+            log(
+                "[merge-summary] ⚠ 本期 plan 预期 0 帖（新期刚开），"
+                "各分片无产物 → 按**合法空期**处理，生成空产物继续"
+            )
+            shard_posts = [[]]
+            shard_metas = shard_metas or []
+        else:
+            raise SystemExit(
+                f"[merge-summary] ❌ 没找到任何分片产物包（products_*.tar.gz）"
+                f"，但 plan 预期 {_expected_posts} 帖 → 真异常，拒绝交付"
+            )
 
     image_members: list[tuple[Path, str]] = []      # (tar 路径, 成员名)
     for tf in cache_tars:
@@ -3000,6 +3017,9 @@ def do_merge_summary(args) -> int:
             generated_at=str(meta.get("generatedAt") or ""),
             lottery_name=_source.source_label(source),
             date_text=backfill.fallback_date(display),
+            # ⚠ 2026-11-23 主动排查修复：合法空期（新期刚开 0 帖）时
+            #   plan expectedPosts=0，允许产出空产物而不是抛 TextReportError。
+            allow_empty=(_expected_posts == 0),
         )
     except Exception as exc:  # noqa: BLE001
         log(f"[merge-summary] ❌ 文字版生成失败（拒绝交付残缺产物）：{type(exc).__name__}: {exc}")

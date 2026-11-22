@@ -173,6 +173,8 @@ jobs:
         id: gate
         env:
           DATA_TOKEN: ${{ secrets.LIUHE_DATA_TOKEN }}
+          # 查「有没有在跑的 run」需要读 actions:read
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -eu
           # 手动触发一律放行（slot 由 inputs 或 run_id 承载）
@@ -181,6 +183,30 @@ jobs:
             echo "should_run=1" >> "$GITHUB_OUTPUT"
             echo "slot=manual" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+
+          # ------------------------------------------------------------------
+          # ⚠ 2026-11-23 主动排查修复：先查「有没有正在跑的 run」
+          # ------------------------------------------------------------------
+          # 隐患：cron 触发时 concurrency group 退化成 run_id → 完全不串行。
+          #   12:05 开跑（~15 分钟），12:15 又触发 → gate 查 manifest 发现还没更新
+          #   → 判「该档没跑」→ 重复开跑 → 两轮同时 publish → git push 冲突。
+          # 修法：直接查 GitHub API「有没有 in_progress 的 crawl.yml run」，
+          #   有就跳过。这是**事实判断**，不是推算。
+          GH_TOKEN="${GITHUB_TOKEN:-}"
+          REPO_SLUG="${GITHUB_REPOSITORY:-}"
+          SELF_RUN="${GITHUB_RUN_ID:-0}"
+          if [ -n "$GH_TOKEN" ] && [ -n "$REPO_SLUG" ]; then
+            RUNNING=$(curl -sS --max-time 30               -H "Authorization: Bearer $GH_TOKEN"               -H "Accept: application/vnd.github+json"               "https://api.github.com/repos/$REPO_SLUG/actions/workflows/crawl.yml/runs?status=in_progress&per_page=20"               2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);s=[r for r in (d.get('workflow_runs') or []) if str(r.get('id'))!='$SELF_RUN'];print(len(s))" 2>/dev/null || echo "-1")
+            echo "在跑的 run 数（除自己）= ${RUNNING}"
+            if [ "$RUNNING" = "-1" ]; then
+              echo "⚠ 查不到在跑 run（API 失败），按无并发继续"
+            elif [ "$RUNNING" -gt 0 ]; then
+              echo "⏭ 已有 $RUNNING 个 run 在跑 → 跳过本轮（避免重复跑 + push 冲突）"
+              echo "should_run=0" >> "$GITHUB_OUTPUT"
+              echo "slot=busy" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
 
           # 北京时间（GitHub runner 是 UTC，用 TZ 转换）
@@ -1780,7 +1806,19 @@ jobs:
           fi
           [ -z "$PERIODS" ] && PERIODS="?"
           git commit -m "data: 云端采集(分片) 期${PERIODS} $(date -u +%Y-%m-%dT%H:%M:%SZ) run#${{ github.run_number }}"
-          git push
+          # ⚠ 2026-11-23 主动排查修复：并发两个 run 同时 publish 时，
+          #   后者 push 会 non-fast-forward 失败。加 pull --rebase + 有限重试兜底。
+          _pushed=0
+          for _try in 1 2 3; do
+            if git push; then _pushed=1; break; fi
+            echo "push 第 ${_try} 次失败，pull --rebase 后重试…"
+            git pull --rebase --autostash origin HEAD 2>/dev/null || true
+            sleep 3
+          done
+          if [ "$_pushed" != "1" ]; then
+            echo "::error::git push 连续 3 次失败（数据未推送到数据仓）"
+            exit 1
+          fi
       - name: 上传合并结果
         if: always()
         uses: actions/upload-artifact@v4
