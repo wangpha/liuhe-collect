@@ -3101,6 +3101,24 @@ def do_merge_summary(args) -> int:
             log(f"[merge-summary]    各片上报: {shard_desc}（合计 {sum(per_shard)}）")
             # 不算失败，继续走后续流程（fullText 还原 / 产物生成 / 五道防线）
             missing = []
+        elif not missing and not extra:
+            # ⚠ 2026-11-24 根因修复（run 45274224739 实测：日志打印
+            #   「943 帖 != 可达上限 943 帖」—— 数字明明相等却判失败）：
+            #   原条件 `if planned_set and not missing and extra and _extra_ok:`
+            #   要求 `extra` **非空**才算通过。但「帖数正好等于上限」时
+            #   `extra` 为空列表 → 条件为 False → 落入 else 分支 → raise SystemExit(41)。
+            #   这是纯粹的**逻辑漏洞**：数量相等恰恰是最理想的情况，却被判失败。
+            #
+            #   正确三分类：
+            #     missing 非空            → 真缺帖，失败
+            #     missing 空 + extra 非空  → 合法实时增量，通过
+            #     missing 空 + extra 空    → 数量正好相等，**通过**（本分支）
+            log(
+                f"[merge-summary] ✅ 汇总 {len(merged)} 帖 = 可达上限 {target} 帖"
+                f"（数量正好相等，无缺失无多余）"
+            )
+            log(f"[merge-summary]    各片上报: {shard_desc}（合计 {sum(per_shard)}）")
+            missing = []
         else:
             log(f"[merge-summary] ❌ 汇总后 {len(merged)} 帖 != 可达上限 {target} 帖"
                 f"（groups 并集）")
