@@ -2923,8 +2923,34 @@ def do_merge_summary(args) -> int:
                 rc_mismatch += 1
             ocr["fullText"] = _ms.build_fulltext_from_rows(rows, rc, ocr.get("rowIndexes"))
             n_ft += 1
-    log(f"[merge-summary] fullText 还原 {n_ft} 张（其中按 rowCount 截断 {n_trunc} 张，"
-        f"无缓存 {n_nocache} 张）")
+    # ⚠ 2026-11-23 根因修复（审查发现 L2：这段原来零断言，静默失败）
+    #   历史 run 实录「fullText 还原 0 张（无缓存 413 张）」仍然继续跑 →
+    #   图内文字（OCR 结果）全丢，产物照样交付，属于内容缺失。
+    #   现在按「无缓存比例」分级：
+    #     ≤5%  正常（新图在分片还没跑完时 merge，属合法增量）
+    #     5-30% 告警（记进 knownDiff，不阻断）
+    #     >30%  判失败（内容大面积缺失，拒绝交付残缺产物）
+    _ft_total = n_ft + n_nocache
+    _ft_miss_rate = (n_nocache / _ft_total) if _ft_total else 0.0
+    log(
+        f"[merge-summary] fullText 还原 {n_ft}/{_ft_total} 张"
+        f"（其中按 rowCount 截断 {n_trunc} 张，无缓存 {n_nocache} 张，"
+        f"缺失率 {_ft_miss_rate * 100:.1f}%）"
+    )
+    # 注意：此处 passed 尚未定义（防线段在更后面才 `passed = True`），
+    # 所以这里只置一个标志，等防线段再合并进 passed。
+    _ft_failed = False
+    if _ft_total and _ft_miss_rate > 0.30:
+        log(
+            f"[merge-summary] ❌ fullText 缺失率 {_ft_miss_rate * 100:.1f}% > 30%"
+            f"（{n_nocache}/{_ft_total} 张图无 OCR 缓存）→ 图内文字大面积缺失，拒绝交付"
+        )
+        _ft_failed = True
+    elif _ft_total and _ft_miss_rate > 0.05:
+        log(
+            f"[merge-summary] ⚠ fullText 缺失率 {_ft_miss_rate * 100:.1f}%"
+            f"（{n_nocache}/{_ft_total}）→ 记入已知差异，不阻断"
+        )
 
     # ---------- ⑥ 纯函数链 ----------
     users = _scraper.build_users(merged)
@@ -3055,6 +3081,10 @@ def do_merge_summary(args) -> int:
 
     # ---------- ⑨ 防线 ----------
     passed = True
+    # 合并 ⑤ 段算出的 fullText 缺失判定（那段在 passed 定义之前，只能先存标志）
+    if _ft_failed:
+        passed = False
+        log("[merge-summary] ❌ fullText 缺失率超阈值 → 本轮判不通过")
     period_check = _period.check_posts_period(merged, period)
     log(f"[防线4] 逐帖期号校验：检查 {period_check['checked']} 帖，错误 {period_check['wrongCount']} 个")
     if not period_check["passed"]:
@@ -3103,6 +3133,18 @@ def do_merge_summary(args) -> int:
     # merge 里读 unfinished 清单 → 对仍缺的 id 逐个补抓（只读源站，不重跑全片）。
     # 补到的帖追加进 merged；补不到的如实列出（交给防线1 判失败）。
     # ==========================================================================
+    # ⚠ 2026-11-23 修正（审查发现 L1：上一版写错，_catch.get("details") 恒为空）
+    #   `_reconcile.probe_details` 返回的是 {"exists","periods","created","unknown"}，
+    #   它是「求证帖子是否还存在」，**不返回帖子内容** —— 所以补抓恒 0 帖，
+    #   日志却打「补抓完成」，比不修更危险。
+    #
+    # merge 的职责是「只汇总、不重采集」（文档 4.2），不能像 do_run 那样
+    # 用 `_run_module_main` 重跑采集模块。
+    #
+    # 所以正确行为是：**如实报告缺口，交给防线1 判定**。
+    #   · 缺的帖在源站仍存在 → 防线1 判 missing → 整轮失败（宁可失败也不静默丢数据）
+    #   · 缺的帖源站已删 → 防线1 归到 disappeared，不判失败
+    #   · 下一轮重跑时这些帖会重新进入 plan，自然补上
     try:
         _unfinished_ids = _collect_unfinished(work, source, log)
     except Exception as _exc:  # noqa: BLE001
@@ -3110,32 +3152,19 @@ def do_merge_summary(args) -> int:
         _unfinished_ids = []
     if _unfinished_ids:
         _got = {int(p_.get("articleId") or 0) for p_ in merged if p_.get("articleId")}
-        _still_missing = [x for x in _unfinished_ids if x not in _got]
+        _still_missing = sorted(x for x in _unfinished_ids if x not in _got)
         if _still_missing:
             log(
-                f"[merge] 分片遗留 {len(_unfinished_ids)} 帖，其中 {len(_still_missing)} 帖"
-                f"产物里仍缺 → 开始补抓"
+                f"[merge] ⚠ 分片遗留 {len(_unfinished_ids)} 帖（预算截断），"
+                f"其中 {len(_still_missing)} 帖产物里仍缺：{_still_missing[:15]}"
             )
-            try:
-                _catch = _reconcile.probe_details(
-                    source, _still_missing, log=log, target_period=period
-                )
-                _fetched = _catch.get("details") or {}
-                _added = 0
-                for _aid in _still_missing:
-                    _d = _fetched.get(_aid) or _fetched.get(str(_aid))
-                    if isinstance(_d, dict) and _d:
-                        merged.append(_d)
-                        _added += 1
-                log(
-                    f"[merge] unfinished 补抓完成：新增 {_added}/{len(_still_missing)} 帖"
-                    + ("" if _added == len(_still_missing)
-                       else f"；仍未拿到 {len(_still_missing) - _added} 帖（交给防线1 判定）")
-                )
-            except Exception as _exc:  # noqa: BLE001
-                log(f"[merge] ⚠ unfinished 补抓异常：{type(_exc).__name__}: {_exc}")
+            log(
+                "[merge] merge 只汇总不重采集（文档 4.2），不在此补抓；"
+                "这些帖交由【防线1 独立对账】判定——源站仍存在则判 missing 并整轮失败，"
+                "源站已删则归入 disappeared，下一轮 plan 会重新收录"
+            )
         else:
-            log(f"[merge] 分片遗留 {len(_unfinished_ids)} 帖，产物已全部补齐 → 无需补抓")
+            log(f"[merge] 分片遗留 {len(_unfinished_ids)} 帖，产物已全部包含 → 无缺口")
 
     # ==========================================================================
     # ⑨c 防线 1/2/3 完整实现（2026-11-23 根因修复）
