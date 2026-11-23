@@ -364,9 +364,29 @@ jobs:
             tuku|aocai|dahkg) echo "sources=[\"$REQ\"]" >> "$GITHUB_OUTPUT" ;;
             *) echo "未知源: $REQ" >&2; exit 2 ;;
           esac
-          python -c "import json;n=13;print('shards_dahkg='+json.dumps(list(range(n))));print('count_dahkg='+str(n))" >> "$GITHUB_OUTPUT"
-          python -c "import json;n=5;print('shards_aocai='+json.dumps(list(range(n))));print('count_aocai='+str(n))" >> "$GITHUB_OUTPUT"
-          python -c "import json;n=2;print('shards_tuku='+json.dumps(list(range(n))));print('count_tuku='+str(n))" >> "$GITHUB_OUTPUT"
+          # ⚠ 2026-11-24 根因修复（run 45227188302 实测：20 片全 success 但 merge 找不到任何产物）：
+          #   原来这里把 13 / 5 / 2 硬编码，与 env.SHARD_MAP 完全脱钩。
+          #   plan 按 SHARD_MAP=18 分组，分片 job 却收到 --shards 13
+          #   → `[shard] ⚠ plan 的分片数 18 与本次 --shards 13 不一致，退回 id 取模`
+          #   → id % 13 与 plan 分组对不上 → 每片取到 0 帖 → 无 posts.json → merge 失败。
+          #   现在统一从 SHARD_MAP 解析（唯一事实源），三处从此必然同源。
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          raw = os.environ.get("SHARD_MAP", "").strip()
+          m = {}
+          for part in raw.split(","):
+              if ":" in part:
+                  k, _, v = part.partition(":")
+                  try:
+                      m[k.strip()] = max(1, int(v.strip()))
+                  except ValueError:
+                      pass
+          for src, default in (("dahkg", 13), ("aocai", 5), ("tuku", 2)):
+              n = m.get(src, default)
+              print(f"shards_{src}=" + json.dumps(list(range(n))))
+              print(f"count_{src}=" + str(n))
+          print(f"# SHARD_MAP={raw} → {m}")
+          PY
           cat "$GITHUB_OUTPUT"
 
   # ---------------- Job 0：清理（图片 2 天轮转 + 产物 30 期轮转）----------------
