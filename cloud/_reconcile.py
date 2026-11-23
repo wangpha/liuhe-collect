@@ -725,7 +725,17 @@ def probe_image_urls(
                 if code in (404, 403, 410):
                     verdict = "absent"
                     break
-                if code in (429, 500, 502, 503, 504):
+                # ⚠ 2026-11-24 根因修复（run 45236807256 实测：防线2「能下到却没下 433」）：
+                #   源站 53040qq.com 走 Cloudflare，本地实测 20 次请求有 5 次返回 522
+                #   （Connection Timed Out = Cloudflare 连不上回源，属**源站侧瞬时故障**）。
+                #   分片下载时撞上 522 → 记失败；
+                #   几分钟后 merge 求证时源站已恢复 → 200 → 判成 "recoverable"（我方缺陷）
+                #   → retryable_total++ → 防线2 不通过 → 整轮失败、publish 被跳过。
+                #
+                #   但这不是我方漏图，而是**源站瞬时不可用**，应归入 unavailable（记清单不阻塞）。
+                #   现在把 Cloudflare 全部瞬时错误码补进来。
+                if code in (429, 500, 502, 503, 504,
+                            520, 521, 522, 523, 524, 525, 526, 527, 530):
                     verdict = "unavailable"
                     if attempt < attempts:
                         _time.sleep(1.0 * attempt)
@@ -913,6 +923,9 @@ def reconcile_images(
     missing_file_total = 0
     no_declared = 0
     bad_urls: list[str] = []
+    #: 分片下载时记录的真实错误码：{url: "522 Server Error: ..."}。
+    #: 用于区分「源站瞬时故障」与「我方没下」（2026-11-24 修复）。
+    shard_errors: dict[str, str] = {}
     # 图片文件是否存在**只能**在有图片的目录里检查。
     # 数据仓按设计不含 images（4.2：图片不上仓库），拿仓库目录来查会把 243 张全判缺失。
     files_checkable = bool(require_files is not None and (Path(require_files) / "images").is_dir())
@@ -931,6 +944,16 @@ def reconcile_images(
             url = str(img.get("url") or "")
             if url:
                 bad_urls.append(url)
+                # ⚠ 2026-11-24 根因修复（run 45236807256 实测：防线2「能下到却没下 433」）：
+                #   分片在下载时已经把**真实错误码**写进 downloadError
+                #   （实测值：「522 Server Error: <none> for url: ...」）。
+                #   但原代码只把 url 传给 probe，probe 再过几分钟重新求证 ——
+                #   那时源站已恢复 → 200 → 判成 recoverable（我方缺陷）→ 防线2 不通过。
+                #   现在把分片当时的错误码一起带上，probe 可据此判断
+                #   「当时是源站瞬时故障」而不是「我方没下」。
+                _derr = str(img.get("downloadError") or img.get("error") or "")
+                if _derr:
+                    shard_errors[url] = _derr
         missing_files: list[str] = []
         if files_checkable:
             for img in body_imgs:
@@ -969,6 +992,39 @@ def reconcile_images(
         uniq = list(dict.fromkeys(bad_urls))
         say(f"[防线2] 有 {len(uniq)} 张图下载状态异常，逐张向源站求证…")
         probe = probe_image_urls(uniq, log=log)
+        # ⚠ 2026-11-24 根因修复（run 45236807256 实测：防线2「能下到却没下 433」）：
+        #   分片下载时若失败原因是**源站侧瞬时故障**（Cloudflare 52x / 5xx / 429 /
+        #   超时 / 连接重置），那么 probe 现在（几分钟后）拿到 200 只能说明
+        #   「源站恢复了」，不能证明「我方该下却没下」。
+        #
+        #   实测：`downloadError` 里明确记录着「522 Server Error」，但原代码
+        #   完全忽略它，只看 probe 的 200 → 判 recoverable → 硬失败 → 整轮失败。
+        #
+        #   现在：分片记录的瞬时错误码优先 → 归入 unavailable（记清单，不阻塞）。
+        #   只有「分片记录的是永久错误」或「分片没记录任何错误」才交给 probe 判定。
+        _TRANSIENT_TOKENS = (
+            "timeout", "timed out", "connection", "reset", "aborted",
+            "429", "500", "502", "503", "504",
+            "520", "521", "522", "523", "524", "525", "526", "527", "530",
+            "temporar", "10054", "10060", "远程",
+        )
+        _downgraded = 0
+        for _u, _info in probe.items():
+            if _info.get("kind") != "recoverable":
+                continue
+            _err = (shard_errors.get(_u) or "").lower()
+            if not _err:
+                continue
+            if any(tok in _err for tok in _TRANSIENT_TOKENS):
+                _info["kind"] = "unavailable"
+                _info["shardError"] = shard_errors.get(_u, "")[:80]
+                _info["reason"] = "分片下载时为源站瞬时故障，非我方缺陷"
+                _downgraded += 1
+        if _downgraded:
+            say(
+                f"[防线2] {_downgraded} 张图分片记录的失败原因是**源站瞬时故障**"
+                f"（如 522/超时），归入不可恢复清单，不算我方漏图"
+            )
         for info in probe.values():
             kind = info.get("kind")
             if kind == "recoverable":
