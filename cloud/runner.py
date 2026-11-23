@@ -3052,14 +3052,23 @@ def do_merge_summary(args) -> int:
         # ---- 只多不少：plan 生成后源站新增了新帖（合法实时增量）----
         # 严格校验：extra 里的帖必须
         #   ① 帖子 ID 唯一（不重复）
-        #   ② 作者存在于 plan 里（是已知作者的帖子，不是凭空冒出来的）
-        #   ③ 该帖来自**恰好一个**分片（不是多片重复抓）
+        #   ② 该帖来自**恰好一个**分片（不是多片重复抓）
+        #
+        # ⚠ 2026-11-24 根因修复（run 45236807256 实测：aocai 多 1 帖被误判失败）：
+        #   原校验③「作者必须存在于 plan 的 userToShard 里」→ 把「plan 生成后
+        #   新用户发的新帖」判成异常。但 plan 到 merge 隔 20+ 分钟，新用户发帖
+        #   是**完全合法**的实时增量，用户明确要求「老用户有新增内容也实时识别」，
+        #   新用户同理。
+        #   实测案例：帖 3233439 作者 2150182 不在 plan 里 → 判失败 → 整轮失败。
+        #
+        #   现在：作者不在 plan 里**不再判失败**，改为如实记录（新作者帖）。
+        #   仍然保留的硬校验：重复 id 必须为 0（防止多片重复抓）。
         _extra_ok = False
         if planned_set and not missing and extra:
             _dup_ids = len(merged) - len(got_ids)
-            # 作者校验：plan 里有 userToShard 时检查
+            # 统计「新作者帖」（仅用于日志，不判失败）
             _u2s = plan.get("userToShard") or {}
-            _bad_authors = []
+            _new_authors = []
             _extra_set = set(extra)
             for _p in merged:
                 try:
@@ -3071,13 +3080,17 @@ def do_merge_summary(args) -> int:
                 _uid = str(_p.get("senderId") or _p.get("userid")
                            or _p.get("userId") or "")
                 if _u2s and _uid and _uid not in _u2s:
-                    _bad_authors.append((_aid, _uid))
-            _extra_ok = (_dup_ids == 0) and (not _bad_authors)
+                    _new_authors.append((_aid, _uid))
+            _extra_ok = (_dup_ids == 0)
             if not _extra_ok:
                 log(
                     f"[merge-summary] ❌ 多出的 {len(extra)} 帖未通过校验："
-                    f"重复 id {_dup_ids} 个，作者不在 plan 里 {len(_bad_authors)} 个"
-                    f"{_bad_authors[:3]}"
+                    f"重复 id {_dup_ids} 个"
+                )
+            elif _new_authors:
+                log(
+                    f"[merge-summary] ✅ 多出 {len(_new_authors)} 帖来自**新作者**"
+                    f"（plan 生成后新用户发帖，合法实时增量）：{_new_authors[:3]}"
                 )
         if planned_set and not missing and extra and _extra_ok:
             log(
