@@ -748,27 +748,24 @@ def do_plan(args) -> int:
         #   日志里 `[plan] 每片预计 OCR 分钟：[52.2 × 13]` 早已算出这个数，但只打印不处理。
         #
         #   现在：预抓之后按「每片耗时预算」重算片数。
-        #   公式：需要片数 = ceil(总图数 × 单图秒 / (分片预算秒 × 安全系数))
-        #   · 单图秒用 budget 表的实测值（当前 CPU）
-        #   · 分片预算从 env LIUHE_SHARD_JOB_TIMEOUT 读（workflow 实际给的值）
-        #   · 安全系数 0.75（留 25% 给前置/后置步骤）
-        _total_imgs_now = sum(max(1, weights.get(aid, 1)) for aid in union_ids)
-        if _total_imgs_now > 0 and shard_n > 1:
+        #
+        #   ⚠ 2026-11-24 修正（首版实现用了错误的输入）：
+        #     `weights[aid]` 的单位是「预估耗时秒数 × 10」（见 _item_image_weight 的
+        #     `return max(1, int(round(secs * 10)))`），**不是图数**。
+        #     首版把它当图数算，得出「105938 图」（实际 3829），放大了 27.7 倍。
+        #     正确的做法：直接用它 —— 它本身就是「全片总耗时估算（秒 × 10）」，
+        #     这比「图数 × 单图秒」更准（已含回复分页、下载、面积分档）。
+        _total_weight = sum(max(1, weights.get(aid, 1)) for aid in union_ids)
+        if _total_weight > 0 and shard_n > 1:
             try:
                 from . import budget as _budget
 
                 _shard_to, _ = _budget.timeouts_from_env()
-                _cpu_name = _budget.read_cpu_model_name()
-                _e2e, _hit, _ = _budget._resolve_e2e(
-                    _cpu_name, _budget.RUNNER_CPU_E2E_SECONDS,
-                    _budget.UNKNOWN_CPU_E2E_SECONDS,
-                )
+                # weights 单位 = 秒 × 10 → 总预估秒数
+                _total_secs = _total_weight / 10.0
                 # 每片可用秒数：总预算 × 0.75（留 25% 给检出/装依赖/恢复缓存/打包上传）
                 _per_shard_s = float(_shard_to) * 0.75
-                # 真实单图秒：E2E 是「命中缓存也走一遍」的端到端时间，
-                # 未命中的新图更慢。用 1.25 倍 E2E 覆盖这个差异（安全侧）。
-                _sec_per_img = float(_e2e) * 1.25
-                _need = int(-(-(_total_imgs_now * _sec_per_img) // max(1.0, _per_shard_s)))
+                _need = int(-(-_total_secs // max(1.0, _per_shard_s)))
                 _need = max(1, _need)
                 # 上限：GitHub Free 单次 20 并发。
                 # ⚠ 2026-11-24 修正：原来写死 dahkg 上限 14，但实测 aocai 0 图、
@@ -787,18 +784,16 @@ def do_plan(args) -> int:
                 _need = min(_need, _cap)
                 if _need > shard_n:
                     log(
-                        f"[plan] ⚠ 按耗时预算重算片数：{_total_imgs_now} 图 × "
-                        f"{_sec_per_img:.3f} 秒/图 = "
-                        f"{_total_imgs_now * _sec_per_img / 60:.1f} 分钟总量，"
-                        f"每片预算 {_per_shard_s / 60:.1f} 分钟 → 需要 {_need} 片"
-                        f"（原 {shard_n} 片会每片 {_total_imgs_now * _sec_per_img / shard_n / 60:.1f} 分钟，超时）"
+                        f"[plan] ⚠ 按耗时预算重算片数：全片预估 {_total_secs / 60:.1f} 分钟"
+                        f"（权重 {_total_weight} ÷ 10），每片预算 {_per_shard_s / 60:.1f} 分钟"
+                        f" → 需要 {_need} 片"
+                        f"（原 {shard_n} 片会每片 {_total_secs / shard_n / 60:.1f} 分钟，超时）"
                     )
                     shard_n = _need
                 else:
                     log(
-                        f"[plan] 片数够用：{_total_imgs_now} 图 × {_sec_per_img:.3f} 秒"
-                        f" ÷ {shard_n} 片 = 每片 "
-                        f"{_total_imgs_now * _sec_per_img / shard_n / 60:.1f} 分钟"
+                        f"[plan] 片数够用：全片预估 {_total_secs / 60:.1f} 分钟"
+                        f" ÷ {shard_n} 片 = 每片 {_total_secs / shard_n / 60:.1f} 分钟"
                         f"（预算 {_per_shard_s / 60:.1f} 分钟）"
                     )
             except Exception as _exc:  # noqa: BLE001 - 重算失败不能拖垮 plan
