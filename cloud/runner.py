@@ -3124,6 +3124,18 @@ def do_merge_summary(args) -> int:
     # ---------- ⑤ fullText 还原（rowCount 截断）----------
     n_ft = n_trunc = n_nocache = 0
     rc_mismatch = 0
+    # ⚠ 2026-11-24 根因修复（run 45262734964 实测：fullText 缺失率 30.8% 判失败）：
+    #   原统计把「图片根本没下载到（localPath 为空）」也算进「无 OCR 缓存」，
+    #   于是「图片下载失败」被当成「OCR 缓存缺失」，两个不同问题混成一个数字。
+    #
+    #   实测本片：38 张图里 29 张无 localPath（522 下载失败），9 张有 localPath。
+    #   → 29/38 = 76% 被算成"无缓存"，但真实原因是图片没下来。
+    #
+    #   现在分开统计：
+    #     · n_not_downloaded：localPath 为空 → 图片没下载（属防线2 的范畴，已单独判定）
+    #     · n_nocache：有图片文件但 OCR 缓存里没有对应 rows → 这才是"OCR 缓存缺失"
+    #   fullText 缺失率只用「有图片文件但没 OCR 结果」算，不再冤枉下载失败。
+    n_not_downloaded = 0
     for p in merged:
         for im in _iter_images(p):
             lp = str((im or {}).get("localPath") or "")
@@ -3132,6 +3144,10 @@ def do_merge_summary(args) -> int:
             if not isinstance(ocr, dict):
                 ocr = {}
                 im["ocr"] = ocr
+            if not key:
+                # 图片没下载 → 谈不上 OCR，归防线2 统计，不计入 fullText 缺失率
+                n_not_downloaded += 1
+                continue
             rows = ocr_rows.get(key)
             if rows is None:
                 n_nocache += 1
@@ -3154,7 +3170,8 @@ def do_merge_summary(args) -> int:
     log(
         f"[merge-summary] fullText 还原 {n_ft}/{_ft_total} 张"
         f"（其中按 rowCount 截断 {n_trunc} 张，无缓存 {n_nocache} 张，"
-        f"缺失率 {_ft_miss_rate * 100:.1f}%）"
+        f"缺失率 {_ft_miss_rate * 100:.1f}%；"
+        f"另有 {n_not_downloaded} 张图**未下载**，归防线2 判定，不计入本缺失率）"
     )
     # 注意：此处 passed 尚未定义（防线段在更后面才 `passed = True`），
     # 所以这里只置一个标志，等防线段再合并进 passed。

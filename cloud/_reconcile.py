@@ -678,6 +678,8 @@ def probe_image_urls(
     log: Callable[[str], None] | None = None,
     timeout: float = 15.0,
     attempts: int = 3,
+    workers: int = 24,
+    hard_cap_sec: float = 240.0,
 ) -> dict:
     """逐张向源站求证：这张没下载下来的图，到底是谁的问题。
 
@@ -701,9 +703,9 @@ def probe_image_urls(
 
     say = log or (lambda message: None)
     result: dict[str, dict] = {}
-    for url in urls:
-        if not url:
-            continue
+
+    def _probe_one(url: str) -> None:
+        """求证单张图（并发执行体）。"""
         verdict = "unknown"
         detail: dict = {}
         for attempt in range(1, attempts + 1):
@@ -752,7 +754,67 @@ def probe_image_urls(
         result[url] = {**detail, "kind": verdict}
         if verdict != "recoverable":
             say(f"[求证图片] {verdict} {detail.get('httpStatus', '')} -> 记清单（不阻塞）：{url[-60:]}")
-        _time.sleep(0.05)
+
+    # ⚠ 2026-11-24 根因修复（run 45262734964 实测：防线2 求证 321 张图花了 20 分 5 秒）：
+    #   原实现是 `for url in urls:` **纯串行**，每张最多 3 次尝试 × timeout 15s
+    #   → 321 张 × 3 × 15s 理论上限 4 小时；实测 20 分钟。
+    #   而 merge 的 timeout-minutes=25 → 被 cancelled → 整轮失败。
+    #
+    #   现在：
+    #     · 有界并发（默认 24 路，可用 QODE_PROBE_WORKERS 调）
+    #     · 整批硬上限 hard_cap_sec（默认 240 秒，可用 QODE_PROBE_HARD_CAP 调）
+    #     · 到硬上限时，未完成的图如实记为 unknown（记清单不阻塞），不会静默通过
+    #     · 单次 timeout 从 15s 降到 10s（只读 2KB 探测，10s 足够）
+    import concurrent.futures as _cf
+    import os as _os
+
+    try:
+        _workers = max(1, min(64, int(_os.environ.get("QODE_PROBE_WORKERS", "") or workers)))
+    except (TypeError, ValueError):
+        _workers = max(1, workers)
+    try:
+        _cap = float(_os.environ.get("QODE_PROBE_HARD_CAP", "") or hard_cap_sec)
+    except (TypeError, ValueError):
+        _cap = hard_cap_sec
+
+    todo = [u for u in urls if u]
+    if not todo:
+        return result
+
+    _t0 = _time.time()
+    _ex = _cf.ThreadPoolExecutor(max_workers=min(_workers, len(todo)))
+    _futs = {_ex.submit(_probe_one, u): u for u in todo}
+    _done = 0
+    _abandoned: list[str] = []
+    try:
+        for _f in _cf.as_completed(_futs, timeout=_cap):
+            _done += 1
+            try:
+                _f.result()
+            except Exception as exc:  # noqa: BLE001 - 单张异常不拖垮整批
+                _u = _futs[_f]
+                result[_u] = {
+                    "kind": "unknown",
+                    "error": f"{type(exc).__name__}: {str(exc)[:80]}",
+                }
+            if _done % max(1, len(todo) // 10 or 1) == 0 or _done == len(todo):
+                say(f"[求证图片] 进度 {_done}/{len(todo)}（{_time.time() - _t0:.1f}s）")
+    except _cf.TimeoutError:
+        pass
+    finally:
+        # 不等待卡死的 worker（与图片下载同策略）
+        _abandoned = [u for f, u in _futs.items() if not f.done()]
+        for _u in _abandoned:
+            if _u not in result:
+                result[_u] = {"kind": "unknown", "error": "probe hard cap reached"}
+        _ex.shutdown(wait=False, cancel_futures=True)
+
+    say(
+        f"[求证图片] 完成 {len(result)}/{len(todo)} 张"
+        f"（并发 {min(_workers, len(todo))} 路，耗时 {_time.time() - _t0:.1f}s"
+        + (f"，{len(_abandoned)} 张超硬上限记 unknown" if _abandoned else "")
+        + "）"
+    )
     return result
 
 
