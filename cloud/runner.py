@@ -679,7 +679,17 @@ def do_plan(args) -> int:
     hist_period = int((hist_cost.get("_period") or 0)) if isinstance(hist_cost, dict) else 0
     use_hist = bool(hist_cost) and (hist_period in (0, period, display))
 
-    if shard_n > 1 and union_ids:
+    # ⚠ 2026-11-24 根因修复（run 45229710099 实测：tuku 1 片时 merge 缺 3 帖）
+    #   原条件 `shard_n > 1` → 1 片时不生成 shardPlan
+    #   → 分片 job 的 planned_ids = None（日志「模式=?」）
+    #   → _patch_shard 退回 `id % 1 == 0` 全收，但**只是过滤，不改变抓取逻辑**
+    #   → 模块原生流程只用单一排序 → 抓到 935 帖
+    #   而 plan 的「多排序并集」是 938 帖 → merge 断言缺 3 帖 → 失败
+    #
+    #   现在：shard_n >= 1 都生成 shardPlan，1 片时 groups = {0: 全部 union_ids}
+    #   → 分片能拿到明确的 planned_ids，_patch_shard 走 plan 均衡分组路径，
+    #     与 merge 的 groups 并集完全一致。
+    if shard_n >= 1 and union_ids:
         if prefetched:
             # ⚠ 2026-11-21 根因修复（消除 2.25-2.55 倍失衡）：
             #   原来用 `detArea`（图片面积和）当权重，漏了「详情/回复的网络成本」
