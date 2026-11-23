@@ -7,64 +7,125 @@ jobs:
   diag:
     name: "测源站图片可达性"
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
-      - name: 打印 runner 公网 IP
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 安装依赖（与生产一致）
+        working-directory: repo
+        run: |
+          pip install --quiet requests urllib3 charset-normalizer idna certifi
+
+      - name: 打印 runner 公网 IP 与区域
         run: |
           echo "=== 公网 IP ==="
           curl -sS --max-time 10 https://api.ipify.org || echo "(取不到)"
           echo
           echo "=== 出口区域 ==="
-          curl -sS --max-time 10 https://ipinfo.io/json 2>/dev/null | head -20 || echo "(取不到)"
+          curl -sS --max-time 10 https://ipinfo.io/json 2>/dev/null | head -12 || true
 
-      - name: 测 53040qq.com（云端失败的 host）
+      - name: ⭐ 用生产代码同一条路径下载（关键）
+        working-directory: repo
+        env:
+          LIUHE_CORE_PATH: ${{ github.workspace }}/repo
+          PYTHONPATH: ${{ github.workspace }}/repo
         run: |
-          set -u
-          U="https://www43fdsafe3e32fdsafdsaf.53040qq.com/posts_singapore/1534326/1794750485955_770_573_.png"
-          echo "=== 测 $U ==="
-          echo "--- HEAD ---"
-          curl -sS -I --max-time 25 -A "Mozilla/5.0" "$U" 2>&1 | head -15 || echo "HEAD 失败"
-          echo "--- GET（带 Mozilla UA）---"
-          curl -sS -o /tmp/a.png --max-time 40 -A "Mozilla/5.0" \
-            -w "HTTP %{http_code}  %{size_download}B  %{time_total}s  %{time_connect}s connect\n" \
-            "$U" 2>&1 || echo "GET 失败"
-          ls -l /tmp/a.png 2>/dev/null || true
-          echo "--- GET（python-requests UA，模拟旧代码）---"
-          curl -sS -o /tmp/b.png --max-time 40 -A "python-requests/2.32.3" \
-            -w "HTTP %{http_code}  %{size_download}B  %{time_total}s\n" \
-            "$U" 2>&1 || echo "GET 失败"
-          echo "--- GET（不带 UA）---"
-          curl -sS -o /tmp/c.png --max-time 40 -A "" \
-            -w "HTTP %{http_code}  %{size_download}B  %{time_total}s\n" \
-            "$U" 2>&1 || echo "GET 失败"
-
-      - name: 测 0ltx3a.com（云端成功的 host）
-        run: |
-          set -u
-          # 用同一期里 0ltx3a.com 的一张图（若已知就替换）
-          U="https://20281023vv.0ltx3a.com/"
-          echo "=== 测 $U（只测连通性）==="
-          curl -sS -I --max-time 25 -A "Mozilla/5.0" "$U" 2>&1 | head -10 || echo "失败"
-
-      - name: 测 DNS 解析
-        run: |
-          echo "=== 53040qq.com DNS ==="
-          getent hosts www43fdsafe3e32fdsafdsaf.53040qq.com || echo "解析失败"
-          echo "=== 0ltx3a.com DNS ==="
-          getent hosts 20281023vv.0ltx3a.com || echo "解析失败"
-
-      - name: 测 Python requests（与生产代码同路径）
-        run: |
-          pip install --quiet requests
           python - <<'PY'
-          import requests, time
-          U = "https://www43fdsafe3e32fdsafdsaf.53040qq.com/posts_singapore/1534326/1794750485955_770_573_.png"
-          for ua in ("python-requests/2.32.3", "Mozilla/5.0 (X11; Linux x86_64)"):
+          import sys, time, traceback
+          from pathlib import Path
+          sys.path.insert(0, str(Path.cwd()))
+
+          URL = "https://www43fdsafe3e32fdsafdsaf.53040qq.com/posts_singapore/1534326/1794750485955_770_573_.png"
+
+          print("=" * 80)
+          print("① 裸 requests（诊断已验证成功）")
+          print("=" * 80)
+          import requests
+          t0 = time.time()
+          try:
+              r = requests.get(URL, timeout=(8, 30))
+              print(f"  HTTP {r.status_code}  {len(r.content)}B  {time.time()-t0:.2f}s")
+          except Exception as e:
+              print(f"  ❌ {type(e).__name__}: {str(e)[:150]}  {time.time()-t0:.2f}s")
+
+          print()
+          print("=" * 80)
+          print("② 生产代码 get_session() + headers（真实路径）")
+          print("=" * 80)
+          try:
+              from core import scraper
+              sess = scraper.get_session()
+              print(f"  trust_env = {sess.trust_env}")
+              print(f"  UA = {sess.headers.get('User-Agent')}")
+              print(f"  Referer = {sess.headers.get('Referer')}")
+              print(f"  BASE = {scraper.BASE}")
+
+              headers = {
+                  "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                  "Referer": scraper.BASE + "/",
+              }
+              print(f"  请求头 Accept = {headers['Accept']}")
+              print(f"  请求头 Referer = {headers['Referer']}")
+              print(f"  proxy = {scraper.proxy_pool().pick()}")
+
               t0 = time.time()
+              resp = sess.get(URL, stream=True, timeout=(8, 30), headers=headers, proxies=None)
+              print(f"  HTTP {resp.status_code}  {time.time()-t0:.2f}s")
+              print(f"  Content-Type: {resp.headers.get('content-type')}")
+              data = resp.content
+              print(f"  下载 {len(data)} 字节")
+              print(f"  前12字节: {data[:12]!r}")
+          except Exception as e:
+              print(f"  ❌ {type(e).__name__}: {str(e)[:200]}  {time.time()-t0:.2f}s")
+              traceback.print_exc()
+
+          print()
+          print("=" * 80)
+          print("③ 生产函数 download_image（完整逻辑，含 image_is_intact）")
+          print("=" * 80)
+          try:
+              from core import scraper
+              dst = Path("/tmp/prod_test.png")
+              if dst.exists():
+                  dst.unlink()
+              t0 = time.time()
+              status = scraper.download_image(URL, dst, 0.0, attempts=3, timeout=(8, 30))
+              print(f"  status = {status!r}  {time.time()-t0:.2f}s")
+              if dst.exists():
+                  print(f"  文件 {dst.stat().st_size} 字节  image_is_intact={scraper.image_is_intact(dst)}")
+              else:
+                  print("  ❌ 文件不存在")
+          except Exception as e:
+              print(f"  ❌ {type(e).__name__}: {str(e)[:200]}  {time.time()-t0:.2f}s")
+              traceback.print_exc()
+
+          print()
+          print("=" * 80)
+          print("④ 对比：0ltx3a.com（云端成功的 host）")
+          print("=" * 80)
+          URL2 = "https://20281023vv.0ltx3a.com/"
+          try:
+              r2 = requests.get(URL2, timeout=(8, 30))
+              print(f"  裸 requests: HTTP {r2.status_code}  {len(r2.content)}B")
+          except Exception as e:
+              print(f"  ❌ {type(e).__name__}: {str(e)[:120]}")
+      - name: DNS 解析
+        run: |
+          echo "=== 53040qq.com DNS（runner 视角）==="
+          getent hosts www43fdsafe3e32fdsafdsaf.53040qq.com || echo "解析失败"
+          python - <<'PY'
+          import socket
+          for h in ("www43fdsafe3e32fdsafdsaf.53040qq.com",):
               try:
-                  r = requests.get(U, timeout=(8, 30), headers={"User-Agent": ua})
-                  print(f"  UA={ua[:30]!r}: HTTP {r.status_code}  {len(r.content)}B  {time.time()-t0:.1f}s")
-                  print(f"    前12字节: {r.content[:12]!r}")
+                  print(f"{h} -> {sorted({x[4][0] for x in socket.getaddrinfo(h, 443)})}")
               except Exception as e:
-                  print(f"  UA={ua[:30]!r}: {type(e).__name__}: {str(e)[:120]}  {time.time()-t0:.1f}s")
+                  print(f"{h}: {type(e).__name__}: {e}")
           PY
