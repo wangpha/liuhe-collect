@@ -1839,8 +1839,20 @@ def _install_sigterm_surrender(work: Path, source: str, shard_index: int,
             # 2026-11-19 踩坑：handler 里直接用 `_guard` → NameError 被 except 吞掉
             # → 文件没写、只打了「写 unfinished 失败」 → 分片「优雅退出」但交付物缺失。
             from . import _guard
+            # ⚠ 2026-11-24 根因修复（run 45285554854 实测：SIGTERM 时
+            #   「写 unfinished 失败：FileNotFoundError: .../work/unfinished/」）：
+            #   分片开跑前的预写**成功**了（日志「已在开跑前预写 unfinished（29 帖）」），
+            #   但 SIGTERM 时同一个路径却 FileNotFoundError。
+            #   原因是 handler 在信号上下文里执行，`Path.mkdir` 在解释器退出流程中
+            #   可能因 cwd/父目录状态变化而失败。
+            #   修法：先显式 os.makedirs（不依赖 Path 缓存），再写。
+            _unf_dir = Path(work) / "unfinished"
+            try:
+                _unf_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:  # noqa: BLE001 - 已存在或权限问题，交给下面写时暴露
+                pass
             _guard.save_json(
-                work / "unfinished" / f"unfinished_{source}_{shard_index}.json",
+                _unf_dir / f"unfinished_{source}_{shard_index}.json",
                 {
                     "source": source,
                     "shard": shard_index,
