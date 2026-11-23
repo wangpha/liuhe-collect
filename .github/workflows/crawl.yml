@@ -632,9 +632,12 @@ jobs:
         run: |
           mkdir -p work/cacheout
           # ① 元数据/OCR 缓存（原有）
+          # ⚠ 2026-11-23 主动排查修复（deepcheck_tuku_detail.py 实测）：
+          #   aocai 的 threads.json、tuku 的 details.json/replies.json 会随 .cache 打包，
+          #   下一轮 restore 后详情缓存跨轮生效且无 TTL → 帖子更新（新图/新文字）看不到。
+          #   修法：只打 OCR 结果（按 sha256 索引，跨轮复用安全），排除详情缓存。
           ( cd work/out && find . -type d -name .cache -print0 2>/dev/null \
-            | tar -czf ../../work/cacheout/cache_dahkg_${{ matrix.shard }}.tar.gz --null -T - 2>/dev/null ) \
-            || echo "没有 .cache 可打包（本片可能是空片）"
+            | tar -czf ../../work/cacheout/cache_dahkg_${{ matrix.shard }}.tar.gz --exclude='*threads.json' --exclude='*details.json' --exclude='*replies.json' --exclude='*dahkg_threads.json' --null -T - 2>/dev/null )             || echo "没有 .cache 可打包（本片可能是空片）"
           # ② 产物（C1-中 新增）：分片已经生成了 posts.json 等产物，只是之前没打包
           #    只打文本类产物，图片仍走 .cache 里的副本，避免 artifact 膨胀
           ( cd work/out && find . -maxdepth 3 -type f \
@@ -854,9 +857,12 @@ jobs:
         run: |
           mkdir -p work/cacheout
           # ① 元数据/OCR 缓存（原有）
+          # ⚠ 2026-11-23 主动排查修复（deepcheck_tuku_detail.py 实测）：
+          #   aocai 的 threads.json、tuku 的 details.json/replies.json 会随 .cache 打包，
+          #   下一轮 restore 后详情缓存跨轮生效且无 TTL → 帖子更新（新图/新文字）看不到。
+          #   修法：只打 OCR 结果（按 sha256 索引，跨轮复用安全），排除详情缓存。
           ( cd work/out && find . -type d -name .cache -print0 2>/dev/null \
-            | tar -czf ../../work/cacheout/cache_aocai_${{ matrix.shard }}.tar.gz --null -T - 2>/dev/null ) \
-            || echo "没有 .cache 可打包（本片可能是空片）"
+            | tar -czf ../../work/cacheout/cache_aocai_${{ matrix.shard }}.tar.gz --exclude='*threads.json' --exclude='*details.json' --exclude='*replies.json' --exclude='*dahkg_threads.json' --null -T - 2>/dev/null )             || echo "没有 .cache 可打包（本片可能是空片）"
           # ② 产物（C1-中 新增）：分片已经生成了 posts.json 等产物，只是之前没打包
           #    只打文本类产物，图片仍走 .cache 里的副本，避免 artifact 膨胀
           ( cd work/out && find . -maxdepth 3 -type f \
@@ -1076,9 +1082,12 @@ jobs:
         run: |
           mkdir -p work/cacheout
           # ① 元数据/OCR 缓存（原有）
+          # ⚠ 2026-11-23 主动排查修复（deepcheck_tuku_detail.py 实测）：
+          #   aocai 的 threads.json、tuku 的 details.json/replies.json 会随 .cache 打包，
+          #   下一轮 restore 后详情缓存跨轮生效且无 TTL → 帖子更新（新图/新文字）看不到。
+          #   修法：只打 OCR 结果（按 sha256 索引，跨轮复用安全），排除详情缓存。
           ( cd work/out && find . -type d -name .cache -print0 2>/dev/null \
-            | tar -czf ../../work/cacheout/cache_tuku_${{ matrix.shard }}.tar.gz --null -T - 2>/dev/null ) \
-            || echo "没有 .cache 可打包（本片可能是空片）"
+            | tar -czf ../../work/cacheout/cache_tuku_${{ matrix.shard }}.tar.gz --exclude='*threads.json' --exclude='*details.json' --exclude='*replies.json' --exclude='*dahkg_threads.json' --null -T - 2>/dev/null )             || echo "没有 .cache 可打包（本片可能是空片）"
           # ② 产物（C1-中 新增）：分片已经生成了 posts.json 等产物，只是之前没打包
           #    只打文本类产物，图片仍走 .cache 里的副本，避免 artifact 膨胀
           ( cd work/out && find . -maxdepth 3 -type f \
