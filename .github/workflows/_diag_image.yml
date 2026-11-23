@@ -1,0 +1,70 @@
+name: 诊断-图片可达性（临时）
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    name: "测源站图片可达性"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: 打印 runner 公网 IP
+        run: |
+          echo "=== 公网 IP ==="
+          curl -sS --max-time 10 https://api.ipify.org || echo "(取不到)"
+          echo
+          echo "=== 出口区域 ==="
+          curl -sS --max-time 10 https://ipinfo.io/json 2>/dev/null | head -20 || echo "(取不到)"
+
+      - name: 测 53040qq.com（云端失败的 host）
+        run: |
+          set -u
+          U="https://www43fdsafe3e32fdsafdsaf.53040qq.com/posts_singapore/1534326/1794750485955_770_573_.png"
+          echo "=== 测 $U ==="
+          echo "--- HEAD ---"
+          curl -sS -I --max-time 25 -A "Mozilla/5.0" "$U" 2>&1 | head -15 || echo "HEAD 失败"
+          echo "--- GET（带 Mozilla UA）---"
+          curl -sS -o /tmp/a.png --max-time 40 -A "Mozilla/5.0" \
+            -w "HTTP %{http_code}  %{size_download}B  %{time_total}s  %{time_connect}s connect\n" \
+            "$U" 2>&1 || echo "GET 失败"
+          ls -l /tmp/a.png 2>/dev/null || true
+          echo "--- GET（python-requests UA，模拟旧代码）---"
+          curl -sS -o /tmp/b.png --max-time 40 -A "python-requests/2.32.3" \
+            -w "HTTP %{http_code}  %{size_download}B  %{time_total}s\n" \
+            "$U" 2>&1 || echo "GET 失败"
+          echo "--- GET（不带 UA）---"
+          curl -sS -o /tmp/c.png --max-time 40 -A "" \
+            -w "HTTP %{http_code}  %{size_download}B  %{time_total}s\n" \
+            "$U" 2>&1 || echo "GET 失败"
+
+      - name: 测 0ltx3a.com（云端成功的 host）
+        run: |
+          set -u
+          # 用同一期里 0ltx3a.com 的一张图（若已知就替换）
+          U="https://20281023vv.0ltx3a.com/"
+          echo "=== 测 $U（只测连通性）==="
+          curl -sS -I --max-time 25 -A "Mozilla/5.0" "$U" 2>&1 | head -10 || echo "失败"
+
+      - name: 测 DNS 解析
+        run: |
+          echo "=== 53040qq.com DNS ==="
+          getent hosts www43fdsafe3e32fdsafdsaf.53040qq.com || echo "解析失败"
+          echo "=== 0ltx3a.com DNS ==="
+          getent hosts 20281023vv.0ltx3a.com || echo "解析失败"
+
+      - name: 测 Python requests（与生产代码同路径）
+        run: |
+          pip install --quiet requests
+          python - <<'PY'
+          import requests, time
+          U = "https://www43fdsafe3e32fdsafdsaf.53040qq.com/posts_singapore/1534326/1794750485955_770_573_.png"
+          for ua in ("python-requests/2.32.3", "Mozilla/5.0 (X11; Linux x86_64)"):
+              t0 = time.time()
+              try:
+                  r = requests.get(U, timeout=(8, 30), headers={"User-Agent": ua})
+                  print(f"  UA={ua[:30]!r}: HTTP {r.status_code}  {len(r.content)}B  {time.time()-t0:.1f}s")
+                  print(f"    前12字节: {r.content[:12]!r}")
+              except Exception as e:
+                  print(f"  UA={ua[:30]!r}: {type(e).__name__}: {str(e)[:120]}  {time.time()-t0:.1f}s")
+          PY
