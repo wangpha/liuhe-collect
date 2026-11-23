@@ -61,7 +61,7 @@ on:
         default: "0"
         type: string
       slot:
-        description: "档位（12:00/15:00/18:00/20:15/20:50）。20:50 会锁定台账期号不换期；空=不锁"
+        description: "档位（12:00/15:00/18:00/20:10/20:40）。20:40 会锁定台账期号不换期；空=不锁"
         required: false
         default: ""
         type: string
@@ -83,7 +83,7 @@ on:
   # ✅ 生产定时任务已启用（2026-11-20 Gate 1–5 全部通过）
   # 每天五轮（北京时间）= UTC 时区；按 317 期真实发布节奏定的档位：
   #   12:00 → 04:00Z   15:00 → 07:00Z   18:00 → 10:00Z
-  #   20:15 → 12:15Z   20:50 → 12:50Z（跑完约 21:08，赶在开奖前）
+  #   20:10 → 12:10Z   20:40 → 12:40Z（跑完约 21:00，赶在开奖前）
   # 去掉原来的 23:00：20:50 之后的数据不需要。
   # 云端定时（2026-11-20 启用：Gate 1–5 全部通过后解除注释）
   # GitHub 服务器自己按点跑，与本机开关机无关。
@@ -104,7 +104,7 @@ on:
   #   · 新增 `gate` job 用**北京时间**判断是否该跑五档，不该跑直接 exit 0
   #   · 五档命中窗口各宽 10 分钟（覆盖 cron 延迟）：
   #       12:00-12:09 / 15:00-15:09 / 18:00-18:09 / 20:10-20:19 / 20:40-20:49
-#   ⚠ 20:15 档实际为 20:10（cron */10 只在 0/10/20/30/40/50 触发，20:15 窗口只能命中 20:20，
+#   ⚠ 20:10 档（原设计 20:15，已改）：窗口 20:10-20:39，cron 每 5 分钟必命中，
 #     而 20:20 起跑 15-20 分钟会压到 21:31 开奖，故提前到 20:10）
   #   · 仓库是 public → Actions 分钟数免费，144 次/天的空跑无成本
   # ------------------------------------------------------------------------
@@ -139,7 +139,7 @@ on:
 #
 # 改为按「档位 + 日期」分组：
 #   · 同一档位（同一天同一个 slot）→ 仍串行，防重复触发
-#   · 不同档位（12:00 / 15:00 / 18:00 / 20:15 / 20:50）→ 各自独立，互不排队
+#   · 不同档位（12:00 / 15:00 / 18:00 / 20:10 / 20:40）→ 各自独立，互不排队
 #   · 手动触发（无 slot）→ 用 run_id，完全不排队
 #
 # 数据安全：publish 步骤用 git pull --rebase，且数据仓是 append-only（每期一个文件），
@@ -419,7 +419,7 @@ jobs:
         run: |
           set -o pipefail
           python -m cloud.runner --plan --source "${{ matrix.source }}" \
-            --work work --state work/store/state --period "${{ github.event.inputs.period || '0' }}" --slot "${{ github.event.inputs.slot || '' }}" 2>&1 | tee "work/plan_${{ matrix.source }}.log"
+            --work work --state work/store/state --period "${{ github.event.inputs.period || '0' }}" --slot "${{ needs.gate.outputs.slot || github.event.inputs.slot || '' }}" 2>&1 | tee "work/plan_${{ matrix.source }}.log"
       - name: 失败/超时诊断（写 Step Summary）
         if: failure()
         run: |

@@ -3090,6 +3090,54 @@ def do_merge_summary(args) -> int:
             f"（拒绝交付残缺产物）"
         )
     # ==========================================================================
+    # ⑨b-2 补抓分片遗留的 unfinished 帖（2026-11-23 根因修复）
+    # --------------------------------------------------------------------------
+    # ## 问题
+    # 分片因预算到点会写 `work/unfinished/unfinished_<源>_<片>.json`，
+    # 日志明确说「交 merge 补抓」。
+    # 但 `_collect_unfinished` 唯一的调用点在 `do_run`（本地完整采集），
+    # 云端跑的是 `do_merge_summary` —— **从来不读它**。
+    # 后果：预算截断的帖永远补不回来，日志却在骗人。
+    #
+    # ## 修法
+    # merge 里读 unfinished 清单 → 对仍缺的 id 逐个补抓（只读源站，不重跑全片）。
+    # 补到的帖追加进 merged；补不到的如实列出（交给防线1 判失败）。
+    # ==========================================================================
+    try:
+        _unfinished_ids = _collect_unfinished(work, source, log)
+    except Exception as _exc:  # noqa: BLE001
+        log(f"[merge] ⚠ 读 unfinished 清单失败（不影响本轮）：{type(_exc).__name__}: {_exc}")
+        _unfinished_ids = []
+    if _unfinished_ids:
+        _got = {int(p_.get("articleId") or 0) for p_ in merged if p_.get("articleId")}
+        _still_missing = [x for x in _unfinished_ids if x not in _got]
+        if _still_missing:
+            log(
+                f"[merge] 分片遗留 {len(_unfinished_ids)} 帖，其中 {len(_still_missing)} 帖"
+                f"产物里仍缺 → 开始补抓"
+            )
+            try:
+                _catch = _reconcile.probe_details(
+                    source, _still_missing, log=log, target_period=period
+                )
+                _fetched = _catch.get("details") or {}
+                _added = 0
+                for _aid in _still_missing:
+                    _d = _fetched.get(_aid) or _fetched.get(str(_aid))
+                    if isinstance(_d, dict) and _d:
+                        merged.append(_d)
+                        _added += 1
+                log(
+                    f"[merge] unfinished 补抓完成：新增 {_added}/{len(_still_missing)} 帖"
+                    + ("" if _added == len(_still_missing)
+                       else f"；仍未拿到 {len(_still_missing) - _added} 帖（交给防线1 判定）")
+                )
+            except Exception as _exc:  # noqa: BLE001
+                log(f"[merge] ⚠ unfinished 补抓异常：{type(_exc).__name__}: {_exc}")
+        else:
+            log(f"[merge] 分片遗留 {len(_unfinished_ids)} 帖，产物已全部补齐 → 无需补抓")
+
+    # ==========================================================================
     # ⑨c 防线 1/2/3 完整实现（2026-11-23 根因修复）
     # --------------------------------------------------------------------------
     # ## 为什么加
@@ -3248,6 +3296,143 @@ def do_merge_summary(args) -> int:
         passed = False
 
     passed = bool(passed)
+
+    # ==========================================================================
+    # ⑨d state 持久化（2026-11-23 根因修复）
+    # --------------------------------------------------------------------------
+    # ## 问题
+    # do_run（本地完整采集）会写四个 state 文件，但 do_merge_summary（云端 merge）
+    # **一个都不写**。而 do_run 自己的注释已写明设计意图：
+    #   「plan job 里也写了一份，但 plan job 不提交数据仓（只有 cleanup 与 publish
+    #     会 commit/push），所以 plan 写的台账会随 job 结束丢失 → 下一轮又从头分组
+    #     → 跨轮不稳定。merge 跑在 publish 之前、且 publish 会 git add -A 提交 state，
+    #     因此在这里补写才能真正确保「老用户归属不变」。」
+    #
+    # 云端从不执行 do_run → 这条设计在云端从未生效：
+    #   · user_shard_<源>.json 永远缺失 → 每轮重新分片 → 老用户换片 → 缓存命中率崩
+    #   · hashsnapshot_<源>_<期>.json 永远缺失 → 内容变更识别失效
+    #   · imagecost_<源>.json 永远缺失 → 分片成本基线永远过期
+    #   · snapshot_<源>_<期>.json 永远缺失 → 防线3 单调性永远走「首次」分支
+    # ==========================================================================
+    if passed:
+        _state_dir = work / "state"
+        try:
+            _state_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+        # ① 用户分片台账
+        try:
+            _u2s = plan.get("userToShard") or {}
+            if _u2s:
+                _mapping = {}
+                for _k, _v in _u2s.items():
+                    try:
+                        _mapping[str(_k)] = int(_v)
+                    except (TypeError, ValueError):
+                        continue
+                _n_shards = len(plan.get("shards") or []) or 0
+                _guard.save_json(
+                    _state_dir / f"user_shard_{source}.json",
+                    {
+                        "period": period,
+                        "shards": _n_shards,
+                        "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "_note": "按用户分片：同一作者固定落同一片，跨轮稳定；"
+                                 "新用户进入当前最轻的片",
+                        "_writtenBy": "do_merge_summary",
+                        "userToShard": _mapping,
+                    },
+                )
+                log(
+                    f"[merge-summary] 已落盘用户分片台账 user_shard_{source}.json："
+                    f"{len(_mapping)} 个作者 → {_n_shards} 片（供下一轮沿用，保证归属稳定）"
+                )
+            else:
+                log("[merge-summary] ⚠ plan 里没有 userToShard（未走按用户分组），本轮不更新台账")
+        except Exception as _exc:  # noqa: BLE001
+            log(f"[merge-summary] ⚠ 写用户分片台账失败（不影响产物）：{type(_exc).__name__}: {_exc}")
+
+        # ② 内容指纹快照
+        try:
+            _hashes = plan.get("postHashes") or {}
+            if _hashes:
+                _guard.save_json(
+                    _state_dir / f"hashsnapshot_{source}_{period}.json",
+                    {
+                        "period": period,
+                        "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "_note": "每帖 title/content/images/replies 四个 hash；供下一轮内容变更识别",
+                        "_writtenBy": "do_merge_summary",
+                        "hashes": _hashes,
+                    },
+                )
+                log(
+                    f"[merge-summary] 已落盘内容指纹快照 hashsnapshot_{source}_{period}.json："
+                    f"{len(_hashes)} 帖"
+                )
+            else:
+                log("[merge-summary] ⚠ plan 里没有 postHashes（可能预抓失败），本轮不更新内容指纹快照")
+        except Exception as _exc:  # noqa: BLE001
+            log(f"[merge-summary] ⚠ 写内容指纹快照失败（不影响产物）：{type(_exc).__name__}: {_exc}")
+
+        # ③ 分片成本基线（每帖图片数与像素面积，供下一轮均衡分片）
+        try:
+            def _imgs_of(_p: dict) -> list[str]:
+                out: list[str] = []
+                for _im in (_p.get("images") or []):
+                    _u = str((_im or {}).get("url") or "")
+                    if _u:
+                        out.append(_u)
+                return out
+
+            _cost = {}
+            _total_imgs = 0
+            for _p in merged:
+                _aid = int(_p.get("articleId") or 0)
+                if not _aid:
+                    continue
+                _urls = _imgs_of(_p)
+                _total_imgs += len(_urls)
+                _cost[str(_aid)] = {"count": len(_urls), "detArea": 0}
+            _guard.save_json(
+                _state_dir / f"imagecost_{source}.json",
+                {
+                    "_period": period,
+                    "_updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "_note": "每帖 count=正文图+回复图张数；detArea=det 输入端像素和"
+                             "（merge 阶段无 det 尺寸信息，记 0）；供下一轮分片均衡",
+                    "_writtenBy": "do_merge_summary",
+                    "cost": _cost,
+                },
+            )
+            log(
+                f"[merge-summary] 已落盘分片成本基线 imagecost_{source}.json："
+                f"{len(_cost)} 帖，合计 {_total_imgs} 图（供下一轮分片均衡）"
+            )
+        except Exception as _exc:  # noqa: BLE001
+            log(f"[merge-summary] ⚠ 写分片成本基线失败（不影响产物）：{type(_exc).__name__}: {_exc}")
+
+        # ④ 帖 id 快照（供下一轮防线3 单调性比对）
+        try:
+            _ids = sorted({int(_p.get("articleId") or 0) for _p in merged
+                           if _p.get("articleId")})
+            _guard.save_json(
+                _state_dir / f"snapshot_{source}_{period}.json",
+                {
+                    "source": source,
+                    "period": period,
+                    "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "_note": "本轮产物帖 id 列表；供下一轮防线3 单调性比对（丢帖即报警）",
+                    "_writtenBy": "do_merge_summary",
+                    "ids": _ids,
+                },
+            )
+            log(f"[merge-summary] 已落盘帖 id 快照 snapshot_{source}_{period}.json：{len(_ids)} 帖")
+        except Exception as _exc:  # noqa: BLE001
+            log(f"[merge-summary] ⚠ 写帖 id 快照失败（不影响产物）：{type(_exc).__name__}: {_exc}")
+    else:
+        log("[merge-summary] 存在未通过项，**不更新** state 基线（避免污染下一轮）")
 
     # ---------- ⑩ 已知差异标注（条件 2）----------
     known_diff = {
