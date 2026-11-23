@@ -739,6 +739,71 @@ def do_plan(args) -> int:
         if prev_period not in (0, period, display):
             log(f"[plan] 上轮台账期号 {prev_period} ≠ 本轮 {period}，按新期重新建台账")
             prev_map = {}
+
+        # ⚠ 2026-11-23 根因修复（数据完整性专项审计 + 18:00 档实测）：
+        #   原代码 `shard_n` 从环境变量 SHARD_MAP 读死值（13），
+        #   预抓拿到真实总图数后**没有重算**，导致：
+        #     18:00 档 15687 图 / 13 片 = 每片 1207 图 → OCR 需 52.2 分钟
+        #     而分片预算只有 20 分钟 → 必然 SIGTERM → 无 posts.json → 数据丢失
+        #   日志里 `[plan] 每片预计 OCR 分钟：[52.2 × 13]` 早已算出这个数，但只打印不处理。
+        #
+        #   现在：预抓之后按「每片耗时预算」重算片数。
+        #   公式：需要片数 = ceil(总图数 × 单图秒 / (分片预算秒 × 安全系数))
+        #   · 单图秒用 budget 表的实测值（当前 CPU）
+        #   · 分片预算从 env LIUHE_SHARD_JOB_TIMEOUT 读（workflow 实际给的值）
+        #   · 安全系数 0.75（留 25% 给前置/后置步骤）
+        _total_imgs_now = sum(max(1, weights.get(aid, 1)) for aid in union_ids)
+        if _total_imgs_now > 0 and shard_n > 1:
+            try:
+                from . import budget as _budget
+
+                _shard_to, _ = _budget.timeouts_from_env()
+                _cpu_name = _budget.read_cpu_model_name()
+                _e2e, _hit, _ = _budget._resolve_e2e(
+                    _cpu_name, _budget.RUNNER_CPU_E2E_SECONDS,
+                    _budget.UNKNOWN_CPU_E2E_SECONDS,
+                )
+                # 每片可用秒数：总预算 × 0.75（留 25% 给检出/装依赖/恢复缓存/打包上传）
+                _per_shard_s = float(_shard_to) * 0.75
+                # 真实单图秒：E2E 是「命中缓存也走一遍」的端到端时间，
+                # 未命中的新图更慢。用 1.25 倍 E2E 覆盖这个差异（安全侧）。
+                _sec_per_img = float(_e2e) * 1.25
+                _need = int(-(-(_total_imgs_now * _sec_per_img) // max(1.0, _per_shard_s)))
+                _need = max(1, _need)
+                # 上限：GitHub Free 单次 20 并发。
+                # ⚠ 2026-11-24 修正：原来写死 dahkg 上限 14，但实测 aocai 0 图、
+                #   tuku 340 图，它们不需要那么多片。上限应 = 20 - 其他源占位。
+                _others = 0
+                _raw_map = os.environ.get("SHARD_MAP", "").strip()
+                for _part in _raw_map.split(","):
+                    if ":" in _part:
+                        _k, _, _v = _part.partition(":")
+                        if _k.strip() != source:
+                            try:
+                                _others += max(1, int(_v.strip()))
+                            except ValueError:
+                                pass
+                _cap = max(1, 20 - _others)
+                _need = min(_need, _cap)
+                if _need > shard_n:
+                    log(
+                        f"[plan] ⚠ 按耗时预算重算片数：{_total_imgs_now} 图 × "
+                        f"{_sec_per_img:.3f} 秒/图 = "
+                        f"{_total_imgs_now * _sec_per_img / 60:.1f} 分钟总量，"
+                        f"每片预算 {_per_shard_s / 60:.1f} 分钟 → 需要 {_need} 片"
+                        f"（原 {shard_n} 片会每片 {_total_imgs_now * _sec_per_img / shard_n / 60:.1f} 分钟，超时）"
+                    )
+                    shard_n = _need
+                else:
+                    log(
+                        f"[plan] 片数够用：{_total_imgs_now} 图 × {_sec_per_img:.3f} 秒"
+                        f" ÷ {shard_n} 片 = 每片 "
+                        f"{_total_imgs_now * _sec_per_img / shard_n / 60:.1f} 分钟"
+                        f"（预算 {_per_shard_s / 60:.1f} 分钟）"
+                    )
+            except Exception as _exc:  # noqa: BLE001 - 重算失败不能拖垮 plan
+                log(f"[plan] ⚠ 片数重算失败（沿用 {shard_n}）：{type(_exc).__name__}: {_exc}")
+
         user_groups, user_to_shard = _group_by_user(user_weights, shard_n, prev=prev_map)
 
         # 5.1 三条断言（用户 2026-11-17 方案 3 第 5.1 条）——不通过直接失败，不启动 shard
@@ -1476,11 +1541,20 @@ def _fill_missing_items(source: str, picked: list[dict], planned_ids, period: in
         log(f"[shard] ✅ 扫列表 {len(picked)} 帖 = plan 本片 {len(planned_ids)} 帖（无漏帖）")
         return picked, []
 
-    if len(missing) > _MISSING_FIX_MAX:
-        log(f"[shard] ⚠ 扫列表漏 {len(missing)} 帖（超过补齐上限 {_MISSING_FIX_MAX}），"
-            f"只补前 {_MISSING_FIX_MAX} 帖，其余交 merge")
-    todo = missing[:_MISSING_FIX_MAX]
-    log(f"[shard] ⚠ 扫列表漏 {len(missing)} 帖（分页抖动），按 id 抓详情补齐：{todo[:8]}")
+    # ⚠ 2026-11-23 根因修复（数据完整性专项审计发现）：
+    #   原代码 `_MISSING_FIX_MAX = 50` → `todo = missing[:50]`，
+    #   且 `failed += missing[50:]` 把这 106 帖**一次详情请求都不发**就判死。
+    #   而 unfinished 补抓链本身是断的（raise SystemExit 在收集之前），
+    #   → 这些帖永久丢失，且按 ID 升序每轮丢同一批。
+    #
+    #   现在：不再硬截断，每条 ID 都尝试。
+    #   用「已用时间」做软保护（不是硬上限）：补抓累计超过 _MISSING_FIX_BUDGET 秒
+    #   才停手，把**剩下的**如实写 unfinished（此时是「时间真不够」，不是「故意不试」）。
+    todo = list(missing)
+    log(
+        f"[shard] ⚠ 扫列表漏 {len(missing)} 帖（分页抖动），按 id 逐个抓详情补齐"
+        f"（上限按时间 {_MISSING_FIX_BUDGET}s，不按条数截断）"
+    )
 
     # ⚠ 2026-11-21 根因修复（run 44913469222 实测缺 1 帖 3230714）：
     #   分片扫列表漏 1 帖后按 id 补抓，但源站 `/getbbsreply` 那一刻返回非 JSON
@@ -1497,10 +1571,25 @@ def _fill_missing_items(source: str, picked: list[dict], planned_ids, period: in
     #   结构性缺口仍有完整的上报与拦截路径。
     _REFILL_TRIES = 3
     _REFILL_BACKOFF = (1.0, 2.0)
+    # 补抓的总时间预算（秒）。超时后剩余 ID 如实写 unfinished，不再硬编码条数。
+    try:
+        _MISSING_FIX_BUDGET = float(os.environ.get("LIUHE_MISSING_FIX_SEC", "300") or 300)
+    except (TypeError, ValueError):
+        _MISSING_FIX_BUDGET = 300.0
 
     fixed = 0
     failed: list[int] = []
-    for aid in todo:
+    _fix_t0 = time.time()
+    _skipped_by_time: list[int] = []
+    for _idx, aid in enumerate(todo):
+        # 时间软保护：超过预算就停手，剩下的如实记录（不是静默丢弃）
+        if time.time() - _fix_t0 > _MISSING_FIX_BUDGET:
+            _skipped_by_time = todo[_idx:]
+            log(
+                f"[shard] ⚠ 补抓已用 {time.time() - _fix_t0:.0f}s（预算 {_MISSING_FIX_BUDGET:.0f}s），"
+                f"剩余 {len(_skipped_by_time)} 帖如实写 unfinished 交后续处理"
+            )
+            break
         row = None
         for _try in range(_REFILL_TRIES):
             row = _fetch_missing_row(source, aid, period)
@@ -1517,9 +1606,14 @@ def _fill_missing_items(source: str, picked: list[dict], planned_ids, period: in
             fixed += 1
         else:
             failed.append(aid)
-    failed += missing[_MISSING_FIX_MAX:]
-    log(f"[shard] ✅ 已补齐 {fixed}/{len(todo)} 帖"
-        + (f"；补不上 {len(failed)} 帖交 merge：{failed[:8]}" if failed else ""))
+    # 时间预算用尽而跳过的，也算「未补上」（如实上报，不静默）
+    if _skipped_by_time:
+        failed += _skipped_by_time
+    log(
+        f"[shard] ✅ 已补齐 {fixed}/{len(todo)} 帖"
+        + (f"；未补上 {len(failed)} 帖（含时间预算跳过 {len(_skipped_by_time)} 帖）："
+           f"{failed[:8]}" if failed else "")
+    )
     return picked, failed
 
 
@@ -2403,6 +2497,35 @@ def do_shard(args) -> int:
     rest_ids: list[int] = []
     budget_est: dict = {}
     budget_dec: dict = {}
+
+    # ⚠ 2026-11-23 根因修复（数据完整性专项审计 P0-2/A2）：
+    #   分片被 SIGKILL（超出 kill-after）时 SIGTERM handler 不执行 → 无 unfinished 文件，
+    #   但 products 包因 `if: always()` 恒打包、`|| echo` 吞错、124/143→exit 0，
+    #   于是「分片 success、artifact 完整、内容空」→ merge 打一行 warning 跳过 → 数据静默丢失。
+    #
+    #   修法：**一开跑就把 planned_ids 全部写进 unfinished**。
+    #   · 正常跑完 → 覆盖成实际未处理的（或空）
+    #   · 被 SIGKILL → 文件还在，记录了「本该处理哪些」，merge 能看到真实缺口
+    _pre_unfinished = work / "unfinished" / f"unfinished_{source}_{shard_index}.json"
+    if planned_ids:
+        try:
+            _guard.save_json(
+                _pre_unfinished,
+                {
+                    "source": source,
+                    "shard": shard_index,
+                    "ids": sorted(int(x) for x in planned_ids),
+                    "reason": "开跑前预写（若被 SIGKILL 则据此判断缺口）",
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            )
+            log(
+                f"[shard] 已在开跑前预写 unfinished（{len(planned_ids)} 帖）"
+                f"→ 即使被 SIGKILL 也能追踪缺口"
+            )
+        except Exception as _exc:  # noqa: BLE001 - 预写失败不能拖垮分片
+            log(f"[shard] ⚠ 预写 unfinished 失败（不影响采集）：{type(_exc).__name__}: {_exc}")
+
     if planned_ids:
         from . import budget as _budget
 
@@ -2840,6 +2963,84 @@ def do_merge_summary(args) -> int:
                     planned.add(int(_aid))
                 except (TypeError, ValueError):
                     continue
+        # ⚠ 2026-11-23 根因修复（数据完整性专项审计 P0-2）：
+        #   原代码 `raise SystemExit(41)`（数量断言）排在 unfinished 收集之前，
+        #   导致「补抓链」在它唯一需要生效的场景（缺帖）下永远执行不到 ——
+        #   不缺帖时才执行，而那时它没用。100% 断链。
+        #
+        #   现在：在算 missing 之前，先读 unfinished 清单并**真实补抓**，
+        #   补到的帖追加进 merged / got_ids，补不到的才如实留给断言。
+        _unf_ids = _collect_unfinished(work, source, log)
+        if _unf_ids:
+            _still = sorted(x for x in _unf_ids if x not in got_ids)
+            if _still:
+                log(
+                    f"[merge-summary] 分片遗留 {len(_unf_ids)} 帖（预算截断），"
+                    f"其中 {len(_still)} 帖产物里仍缺 → 开始按 id 补抓"
+                )
+                _t_unf = time.time()
+                try:
+                    _unf_budget = float(os.environ.get("LIUHE_MERGE_UNFINISHED_SEC", "600") or 600)
+                except (TypeError, ValueError):
+                    _unf_budget = 600.0
+                _fixed_unf = 0
+                _fail_unf: list[int] = []
+                for _aid in _still:
+                    if time.time() - _t_unf > _unf_budget:
+                        _fail_unf.extend(_still[_still.index(_aid):])
+                        log(
+                            f"[merge-summary] ⚠ unfinished 补抓已用 "
+                            f"{time.time() - _t_unf:.0f}s（预算 {_unf_budget:.0f}s），"
+                            f"剩余如实上报"
+                        )
+                        break
+                    _row = None
+                    for _try in range(2):
+                        _row = _fetch_missing_row(source, int(_aid), period)
+                        if _row:
+                            break
+                        if _try < 1:
+                            time.sleep(1.0)
+                    if not _row:
+                        _fail_unf.append(int(_aid))
+                        continue
+                    # 列表行 → post 字典（复用 core 的 build_post）
+                    try:
+                        if source == "dahkg":
+                            from core import forum as _fm2
+
+                            _post = _fm2.build_post_from_row(_row) if hasattr(
+                                _fm2, "build_post_from_row") else None
+                            if _post is None:
+                                _post = _scraper.build_post(_row, None)
+                        elif source == "aocai":
+                            _post = _scraper.build_post(_row, None)
+                        else:
+                            _post = _scraper.build_post(_row, None)
+                    except Exception as _exc:  # noqa: BLE001
+                        log(
+                            f"[merge-summary] ⚠ unfinished#{_aid} 转 post 失败："
+                            f"{type(_exc).__name__}: {_exc}"
+                        )
+                        _fail_unf.append(int(_aid))
+                        continue
+                    if not _post:
+                        _fail_unf.append(int(_aid))
+                        continue
+                    merged.append(_post)
+                    got_ids.add(int(_aid))
+                    _fixed_unf += 1
+                log(
+                    f"[merge-summary] unfinished 补抓完成：成功 {_fixed_unf}/{len(_still)} 帖"
+                    + (f"；仍缺 {len(_fail_unf)} 帖：{_fail_unf[:10]}" if _fail_unf else "")
+                )
+                # 补抓后重新算各片上报总数（用于日志一致性）
+                per_shard = [len(ps or []) for ps in shard_posts]
+                if _fixed_unf:
+                    per_shard.append(_fixed_unf)
+            else:
+                log(f"[merge-summary] 分片遗留 {len(_unf_ids)} 帖，产物已全部包含 → 无缺口")
+
         missing = sorted(planned_set - got_ids) if planned_set else []
         extra = sorted(got_ids - planned_set) if planned_set else []
         shard_desc = ", ".join(f"shard{i}={n}" for i, n in enumerate(per_shard))

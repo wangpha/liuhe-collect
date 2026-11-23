@@ -154,7 +154,7 @@ env:
   PYTHONIOENCODING: "utf-8"
   # 每源分片数（唯一事实源）：plan 用它算「按累计图片数」的均衡分组，
   # shard job 的 matrix 用它取下标 —— 两处必须同源，否则分组与下标对不上。
-  SHARD_MAP: "dahkg:13,aocai:5,tuku:2"
+  SHARD_MAP: "dahkg:18,aocai:1,tuku:1"   # 2026-11-24：dahkg 15687 图 / aocai 0 图 / tuku 340 图 → 并发位让给 dahkg
 
 jobs:
   # ---------------- JobG：定时闸门（高频 cron + 北京时间判断五档）----------------

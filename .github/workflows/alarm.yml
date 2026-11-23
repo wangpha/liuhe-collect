@@ -135,13 +135,32 @@ jobs:
           else
             RUN_MIN=170   # 2026-11-23：349→170（配合 3 小时一次 schedule，缩短空档）
           fi
-          END=$(( $(date +%s) + RUN_MIN*60 ))   # 正常 170 分钟（略小于 timeout 180）
-          FIRED=""                          # 已触发的档位（本 job 内去重）
+          END=$(( $(date +%s) + RUN_MIN*60 ))
+          FIRED=""
           ROUND=0
+
+          # ⚠ 2026-11-24 根因修复（用户实测：20:10 档完全没触发）
+          #   诚实记录：2026-11-23 20:07 的 schedule 延迟 11 分钟（20:18:37 才启动），
+          #   而原逻辑只在「当前分钟 == 档位 且 秒<20」时触发 → 20:10 已过 → 永远不补。
+          #   现在增加「补偿窗口」：档位过去 ≤ GRACE_MIN 分钟内且今天还没触发过 → 立即补。
+          #   用户要求「延迟不能超过 5 分钟」，所以 GRACE_MIN=5。
+          GRACE_MIN=5
+          LATE_FIRED=""     # 补触发记录（与 FIRED 分开，日志更清楚）
+
+          now_min() {  # 当前北京时间「当天第几分钟」
+            local hh mm
+            hh=$(TZ=Asia/Shanghai date '+%H')
+            mm=$(TZ=Asia/Shanghai date '+%M')
+            echo $(( 10#$hh * 60 + 10#$mm ))
+          }
+          slot_min() {  # 档位「当天第几分钟」
+            local hh=${1%%:*} mm=${1##*:}
+            echo $(( 10#$hh * 60 + 10#$mm ))
+          }
 
           echo "闹钟启动：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
           echo "结束时间：$(TZ=Asia/Shanghai date -d "@$END" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '?')"
-          echo "档位：$SLOTS"
+          echo "档位：$SLOTS  补偿窗口：${GRACE_MIN} 分钟"
           echo "--------------------------------------------------------"
 
           while [ "$(date +%s)" -lt "$END" ]; do
@@ -149,32 +168,48 @@ jobs:
             BJ=$(TZ=Asia/Shanghai date '+%H:%M')
             BJS=$(TZ=Asia/Shanghai date '+%S')
             BJYMD=$(TZ=Asia/Shanghai date '+%Y-%m-%d')
+            BJM=$(now_min)
 
             for S in $SLOTS; do
+              KEY="${BJYMD}T${S}"
+              SM=$(slot_min "$S")
+              DELTA=$(( BJM - SM ))
+              HIT=0
+              # ① 准点：当前分钟 == 档位，且秒数 < 20（保证每档只触发一次）
               if [ "$BJ" = "$S" ] && [ "$(echo $BJS | sed 's/^0*//')" -lt 20 ] 2>/dev/null; then
-                KEY="${BJYMD}T${S}"
-                # 本 job 内去重
-                case " $FIRED " in
+                HIT=1
+              fi
+              # ② 补偿：档位已过 1..GRACE_MIN 分钟（启动晚了/机器慢），且本 job 还没补过
+              if [ "$DELTA" -ge 1 ] && [ "$DELTA" -le "$GRACE_MIN" ]; then
+                case " $FIRED $LATE_FIRED " in
                   *" $KEY "*) ;;
-                  *)
-                    echo "[$(TZ=Asia/Shanghai date '+%H:%M:%S')] 🎯 命中档位 $S → 触发主流程"
-                    CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 40 \
-                      -X POST \
-                      -H "Authorization: Bearer $GH_TOKEN" \
-                      -H "Accept: application/vnd.github+json" \
-                      -H "Content-Type: application/json" \
-                      "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/crawl.yml/dispatches" \
-                      -d "{\"ref\":\"main\",\"inputs\":{\"source\":\"all\"}}" 2>/dev/null || echo "000")
-                    echo "    HTTP $CODE $([ "$CODE" = "204" ] && echo '✅ 已触发' || echo '⚠ 触发失败')"
-                    FIRED="$FIRED $KEY"
-                    ;;
+                  *) HIT=2 ;;
+                esac
+              fi
+              if [ "$HIT" -ne 0 ]; then
+                if [ "$HIT" = 2 ]; then
+                  echo "[$(TZ=Asia/Shanghai date '+%H:%M:%S')] 🕐 补偿档位 $S（已过 ${DELTA} 分钟，窗口 ${GRACE_MIN} 分）→ 触发主流程"
+                else
+                  echo "[$(TZ=Asia/Shanghai date '+%H:%M:%S')] 🎯 命中档位 $S → 触发主流程"
+                fi
+                CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 40 \
+                  -X POST \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "Content-Type: application/json" \
+                  "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/crawl.yml/dispatches" \
+                  -d "{\"ref\":\"main\",\"inputs\":{\"source\":\"all\"}}" 2>/dev/null || echo "000")
+                echo "    HTTP $CODE $([ "$CODE" = "204" ] && echo '✅ 已触发' || echo '⚠ 触发失败')"
+                case " $FIRED $LATE_FIRED " in
+                  *" $KEY "*) ;;
+                  *) if [ "$HIT" = 2 ]; then LATE_FIRED="$LATE_FIRED $KEY"; else FIRED="$FIRED $KEY"; fi ;;
                 esac
               fi
             done
 
             # 每 30 轮（10 分钟）打一次心跳，避免日志被截断看不出还活着
             if [ $((ROUND % 30)) -eq 0 ]; then
-              echo "[心跳 $(TZ=Asia/Shanghai date '+%H:%M:%S')] 第 $ROUND 轮，已触发：${FIRED:- 无}"
+              echo "[心跳 $(TZ=Asia/Shanghai date '+%H:%M:%S')] 第 $ROUND 轮，准点：${FIRED:- 无}｜补偿：${LATE_FIRED:- 无}"
             fi
 
             sleep 20
@@ -182,5 +217,6 @@ jobs:
 
           echo "--------------------------------------------------------"
           echo "闹钟到期退出：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
-          echo "本轮共触发档位：${FIRED:- 无}"
-          # 到期后由下一个 schedule（每 6 小时）自动重启
+          echo "本轮准点触发：${FIRED:- 无}"
+          echo "本轮补偿触发：${LATE_FIRED:- 无}"
+          # 到期后由下一个 schedule 自动重启
