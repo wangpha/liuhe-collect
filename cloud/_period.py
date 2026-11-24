@@ -332,11 +332,28 @@ def _fetch_first_page(source: str) -> list[dict]:
         # resolve_target 是该源的权威期号来源 → **先把它作为一条种子行**。
         # 否则「该期还没有帖子 / 源站 502」会被误判成「第1页无期号」→ 无台账时直接中止。
         seeds = [{"periods": int(latest)}]
+        # ⚠ 2026-11-25 根因修复（run 45479568938 实测：
+        #   「计划 tuku」耗时 5.4 分钟，其中「期号判定」阶段独占 **137 秒**，
+        #   日志里有 40+ 条
+        #     [网络] /unite49/h5/article/search 第 1/2 次失败（接口返回失败: 操作成功）
+        #     [网络] /unite49/h5/article/search 第 1/2 次失败（HTTPSConnectionPool ... Max retries exceeded）
+        #   ）：
+        #   原来这里调 `fetch_period_posts(49, latest, 1, 0.0)`，
+        #   而它内部 `_fetch_period_windows(..., sorts_mode=None)`
+        #   → `period_sorts(None)` = (1,0,2,4,5,6,7,8,9,15) **共 10 个排序**
+        #   → 为「确认期号」这一个目的发了 10 次列表请求（每次还可能重试 2 轮）
+        #   → 20-40 次请求 × 每次 0.7-1.8 秒退避 = 137 秒纯等待。
+        #
+        #   但期号已经由 resolve_target 拿到（`latest`），这里抓帖子**只是为了
+        #   多几条 seed 行**，完全不需要遍历 10 个排序。
+        #
+        #   修法：改用 `search_page(...)` 单次请求（1 页 1 个排序），
+        #         拿到多少 seeds 算多少 —— seed 的作用只是「防止空页被误判」，1 条就够。
         try:
-            posts, _meta = scraper.fetch_period_posts(49, int(latest), 1, 0.0)
+            page_rows = scraper.search_page(2, 1, 1, 0.0, number=int(latest))
         except Exception:  # noqa: BLE001 - 抓帖子失败不影响期号结论
-            posts = []
-        for row in posts or []:
+            page_rows = []
+        for row in page_rows or []:
             try:
                 seeds.append({"periods": int(str(row.get("periods") or row.get("period") or latest))})
             except (TypeError, ValueError):
