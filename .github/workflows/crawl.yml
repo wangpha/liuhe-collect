@@ -165,8 +165,8 @@ jobs:
   gate:
     name: "JobG 定时闸门"
     runs-on: ubuntu-24.04
-    # ⚠ 2026-11-24：自我续命需要 workflow_dispatch 权限
-    timeout-minutes: 12
+    # ⚠ 2026-11-24：自我续命最长睡 340 分钟（GitHub 单 job 上限 360）
+    timeout-minutes: 355
     permissions:
       actions: write
       contents: read
@@ -222,15 +222,25 @@ jobs:
           if [ "$TOMORROW" = "1" ]; then
             SLEEP_MIN=$((1440 - NOW_MIN + NEXT_TARGET))
           fi
-          if [ "$SLEEP_MIN" -gt 300 ]; then
-            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟（>300，超单 job 上限）→ 不续命"
-            SLEEP_MIN=0
+          # ⚠ 2026-11-24 根因修复（run 45433084506 实测：
+          #   「距 12:00 还有 710 分钟（>300，超单 job 上限）→ 不续命」）：
+          #   夜里 20:40 之后到次日 12:00 有 15 小时空档，单 job 睡不了那么久。
+          #   改成**分段接力**：每次最多睡 340 分钟，睡醒后 dispatch 一次自己，
+          #   新的 gate 再算「还差多少」→ 继续睡 → 如此接力直到目标档位。
+          #   这样即使只有一次触发成功，链条也能跨越整夜空档。
+          MAX_SLEEP=340
+          RELAY=0
+          if [ "$SLEEP_MIN" -gt "$MAX_SLEEP" ]; then
+            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟（>${MAX_SLEEP}）→ 分段接力：先睡 ${MAX_SLEEP} 分钟再续"
+            SLEEP_MIN=$MAX_SLEEP
+            RELAY=1
           fi
           if [ "$SLEEP_MIN" -gt 0 ]; then
-            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟 → 睡到点后 dispatch 自己"
+            echo "  本次睡 $SLEEP_MIN 分钟（目标 $NEXT_NAME，接力=$RELAY）"
           else
             echo "  本次不续命"
           fi
+          echo "relay=$RELAY" >> "$GITHUB_OUTPUT"
           echo "sleep_min=$SLEEP_MIN" >> "$GITHUB_OUTPUT"
           echo "next_wake=$NEXT_NAME" >> "$GITHUB_OUTPUT"
 
