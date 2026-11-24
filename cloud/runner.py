@@ -3282,8 +3282,22 @@ def do_merge_summary(args) -> int:
                         f"**源站已删/隐藏**（不算漏帖）：{sorted(_gone)[:10]}"
                     )
                     missing = [x for x in missing if x not in _gone]
-                    # 重新计算总量用于断言
-                    target = target - len(_gone) if target else target
+                    # ⚠ 2026-11-24 第二次根因修复（run 45382356685 实测：
+                    #   「✅ 缺失的 4 帖中有 4 帖源站已删」之后仍报
+                    #   「❌ 汇总后 797 帖 != 可达上限 786 帖」）：
+                    #   只改 `missing` 不够 —— `planned_set` 里仍有这 4 个已删帖，
+                    #   而 `target = len(planned_set)` 也没变；
+                    #   797（产物，含 11 条新帖） vs 786（含 4 个已删帖的上限）
+                    #   永远对不上。而且我又减了一次 target（786-4=782）→ 更错。
+                    #
+                    #   正确：把已删帖从**基线**里移除，让 target 与产物口径一致；
+                    #   这样 797 - (786-4) = 15 全部落进 extra（合法新帖）。
+                    planned_set -= _gone
+                    target = len(planned_set) if planned_set else target
+                    log(
+                        f"[merge-summary]    已删帖从基线移除后：可达上限 {target} 帖"
+                        f"（原 {target + len(_gone)}）"
+                    )
                 else:
                     log(
                         f"[merge-summary] ⚠ 缺失的 {len(missing)} 帖在源站**仍存在**"
