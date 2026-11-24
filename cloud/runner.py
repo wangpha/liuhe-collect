@@ -1589,6 +1589,18 @@ def _fill_missing_items(source: str, picked: list[dict], planned_ids, period: in
         log(f"[shard] ✅ 扫列表 {len(picked)} 帖 = plan 本片 {len(planned_ids)} 帖（无漏帖）")
         return picked, []
 
+    # ⚠ 2026-11-24 根因修复（run 45312401858 实测：tuku 分片 #1 报
+    #   `UnboundLocalError: cannot access local variable '_MISSING_FIX_BUDGET'`
+    #   → 模块异常 → 本片 0 帖 → merge 缺 517 帖 → 整轮失败）：
+    #   上一轮我把 `_MISSING_FIX_BUDGET` 的定义写在了**日志使用之后**，
+    #   Python 把它当局部变量 → 首次使用即 UnboundLocalError。
+    #   现在把定义提到最前面（在 todo/log 之前）。
+    # 补抓的总时间预算（秒）。超时后剩余 ID 如实写 unfinished，不再硬编码条数。
+    try:
+        _MISSING_FIX_BUDGET = float(os.environ.get("LIUHE_MISSING_FIX_SEC", "300") or 300)
+    except (TypeError, ValueError):
+        _MISSING_FIX_BUDGET = 300.0
+
     # ⚠ 2026-11-23 根因修复（数据完整性专项审计发现）：
     #   原代码 `_MISSING_FIX_MAX = 50` → `todo = missing[:50]`，
     #   且 `failed += missing[50:]` 把这 106 帖**一次详情请求都不发**就判死。
@@ -1601,7 +1613,7 @@ def _fill_missing_items(source: str, picked: list[dict], planned_ids, period: in
     todo = list(missing)
     log(
         f"[shard] ⚠ 扫列表漏 {len(missing)} 帖（分页抖动），按 id 逐个抓详情补齐"
-        f"（上限按时间 {_MISSING_FIX_BUDGET}s，不按条数截断）"
+        f"（上限按时间 {_MISSING_FIX_BUDGET:.0f}s，不按条数截断）"
     )
 
     # ⚠ 2026-11-21 根因修复（run 44913469222 实测缺 1 帖 3230714）：
@@ -1619,11 +1631,6 @@ def _fill_missing_items(source: str, picked: list[dict], planned_ids, period: in
     #   结构性缺口仍有完整的上报与拦截路径。
     _REFILL_TRIES = 3
     _REFILL_BACKOFF = (1.0, 2.0)
-    # 补抓的总时间预算（秒）。超时后剩余 ID 如实写 unfinished，不再硬编码条数。
-    try:
-        _MISSING_FIX_BUDGET = float(os.environ.get("LIUHE_MISSING_FIX_SEC", "300") or 300)
-    except (TypeError, ValueError):
-        _MISSING_FIX_BUDGET = 300.0
 
     fixed = 0
     failed: list[int] = []
