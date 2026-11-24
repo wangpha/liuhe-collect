@@ -297,13 +297,26 @@ jobs:
           fi
 
           echo "→ 到点，dispatch crawl.yml（source=all）"
+          # ⚠ 2026-11-25 根因修复：dispatch 时必须显式传 slot。
+          #   原代码只传 source=all → gate 收到 inputs.slot="" →
+          #   11:55 时 NOW_MIN=715 < 720，窗口判断不命中 →
+          #   走「手动触发」分支 → slot_out="manual"（因为 11:55 没有已过档位）
+          #   → completedSlots 记不到 "12:00"
+          #   → 下一轮 gate 判「12:00 还没跑」→ 重复补跑。
+          #   现在把本次的目标档位名（NEXT_NAME）一起传进去。
+          SLOT_TARGET="${NEXT_NAME:-}"
+          # 「明天12:00」要转成 "12:00"
+          case "$SLOT_TARGET" in
+            明天*) SLOT_TARGET="${SLOT_TARGET#明天}" ;;
+          esac
+          echo "  传入 slot = ${SLOT_TARGET:-（空）}"
           for k in 1 2 3; do
             CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 \
               -X POST \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/crawl.yml/dispatches" \
-              -d '{"ref":"main","inputs":{"source":"all"}}' || echo 000)
+              -d "{\"ref\":\"main\",\"inputs\":{\"source\":\"all\",\"slot\":\"${SLOT_TARGET}\"}}" || echo 000)
             echo "  dispatch 返回 $CODE"
             if [ "$CODE" = "204" ] || [ "$CODE" = "200" ]; then
               echo "  ✅ 续命成功（下一次已排队）"
