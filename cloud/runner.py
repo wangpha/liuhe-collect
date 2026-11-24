@@ -510,17 +510,97 @@ def _prefetch_post_costs(
                 raw = scraper.api_get("/unite49/h5/article/detail", {"articleId": aid}, delay=0)
                 # #9（2026-11-18 修）：pictureList 元素字段是 imageUrl/pictureUrl，**没有 url**，
                 # 直接取 pic["url"] 会全部为 None → 权重恒为 1（假均衡）。改用 core 的同一函数。
-                imgs = scraper.images_from_picture_list((raw or {}).get("pictureList") or [])
-                urls += [str(im.get("url") or "") for im in imgs if im.get("url")]
-                _body_urls = [str(im.get("url") or "") for im in imgs if im.get("url")]
+                #
+                # ⚠ 2026-11-24 根因修复（run 45382356685 实测：tuku#0 分片
+                #   「本片 957 图」但实际 OCR 处理了 **1126 张**，8 批全跑完后
+                #   1240s 时第 8 批超时 → SIGTERM → work/out 无产物 → 空包
+                #   → merge 只收到 shard1 的 878 帖 → 缺 868 帖 → 整轮失败）：
+                #
+                #   根因：`core/scraper.py::process_detail` 的 `images` 由**三个来源**合并：
+                #     ① raw.pictureList            （source="detail.picture"）
+                #     ② item.pictureList           （source="list.pictureList"）
+                #     ③ description HTML 内嵌 <img>（source="description.html"）  ← 最多！
+                #   而这里只算 ①，漏了 ② ③
+                #   → postCost.count 严重偏低（实测 1394 帖里 1267 帖 count=0）
+                #   → 分片容量估算偏低 → 预算内跑不完 → SIGTERM → 产物空。
+                #
+                #   修复：与 process_detail 完全同口径（三来源合并去重）。
+                _imgs = scraper.images_from_picture_list((raw or {}).get("pictureList") or [])
+                _body_urls = [str(im.get("url") or "") for im in _imgs if im.get("url")]
+                # ③ description HTML 内嵌图（process_detail 的 html_to_text 分支）
+                try:
+                    import re as _re
+
+                    _html_src = str(
+                        (raw or {}).get("description")
+                        or (raw or {}).get("content")
+                        or (raw or {}).get("zhaiyao")
+                        or ""
+                    )
+                    _inline = _re.findall(
+                        r"<img[^>]+src=[\"']([^\"']+)[\"']", _html_src, flags=_re.I
+                    )
+                    for _u in _inline:
+                        _u = _u.strip()
+                        if _u and _u not in _body_urls:
+                            _body_urls.append(_u)
+                except Exception:  # noqa: BLE001 - 解析失败就用 pictureList 的值
+                    pass
+                urls += _body_urls
+                # ⚠ 2026-11-24 根因修复（run 45382356685 实测）：tuku 的图片 79%
+                #   在**回复图和评论图**里（产物实测：正文 225 / 回复 434 / 评论 438），
+                #   而原代码写死 `replyCount=0, replyUrls=[]` → 完全没算 →
+                #   postCost 严重偏低 → 分片容量估算偏低 → 预算内跑不完 → SIGTERM
+                #   → work/out 无产物 → 空包 → merge 缺 868 帖。
+                #
+                #   现在：从详情接口读回复数和楼中楼图（不额外发请求，raw 里已有）。
+                _reps_raw = (
+                    (raw or {}).get("replyList")
+                    or (raw or {}).get("replys")
+                    or (raw or {}).get("replies")
+                    or []
+                )
+                _reply_urls: list[str] = []
+                try:
+                    for _r in (_reps_raw if isinstance(_reps_raw, list) else []):
+                        for _key in ("img", "imgs", "pictureList"):
+                            _v = (_r or {}).get(_key)
+                            if not _v:
+                                continue
+                            _txt = str(_v).strip()
+                            if _txt in {"", "None", "null", "[]", "{}"}:
+                                continue
+                            if _txt.startswith("["):
+                                try:
+                                    _arr = json.loads(_txt)
+                                except Exception:  # noqa: BLE001
+                                    _arr = None
+                                if isinstance(_arr, list):
+                                    for _x in _arr:
+                                        _s = str(_x).strip()
+                                        if _s and _s not in {"None", "null"}:
+                                            _reply_urls.append(_s)
+                                    continue
+                            for _u in _txt.split(","):
+                                _u = _u.strip()
+                                if _u and _u not in {"None", "null"}:
+                                    _reply_urls.append(_u)
+                except Exception:  # noqa: BLE001 - 解析失败就用上面的正文统计
+                    pass
+                # 回复数：用于估算「详情+回复分页」的网络成本
+                _reply_n = max(
+                    len(_reps_raw) if isinstance(_reps_raw, list) else 0,
+                    int((raw or {}).get("replyPoint") or 0),
+                )
+                urls += _reply_urls
                 return aid, {
                     "count": len(urls),
                     "detArea": sum(_det_input_area(u) for u in urls),
-                    "bodyCount": len(urls),
-                    "replyCount": 0,
+                    "bodyCount": len(_body_urls),
+                    "replyCount": _reply_n,
                     "bodyUrls": _body_urls,
-                    "replyUrls": [],
-                    "imgCount": len(_body_urls),
+                    "replyUrls": _reply_urls,
+                    "imgCount": len(_body_urls) + len(_reply_urls),
                     **_post_content_hashes(raw or {}, []),
                 }
         except Exception:  # noqa: BLE001 - 预抓失败不算致命，后面有兜底

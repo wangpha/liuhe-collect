@@ -456,6 +456,23 @@ jobs:
           repository: wangpha/liuhe-data
           token: ${{ secrets.LIUHE_DATA_TOKEN }}
           path: repo/work/store
+      # ⚠ 2026-11-24 根因修复（数据完整性专项）：`work/state` 从来没有跨轮持久化。
+      #   实测：merge 落盘的 imagecost_<源>.json / user_shard_<源>.json /
+      #   snapshot_<期>.json / hashsnapshot_<源>_<期>.json 只作为 `run-<源>-<run_id>`
+      #   artifact 上传（保留 90 天后过期），**下一轮 plan 从不下载它** →
+      #   ① imagecost 永远缺失 → plan 的 `use_hist` 分支永远不生效
+      #      → 每轮都退回 prefetch 估算 → 估算偏差（tuku 实测 957 vs 实际 1126 图）
+      #   ② user_shard 缺失 → 用户分片归属每轮漂移 → 缓存命中率不稳定
+      #   ③ snapshot 缺失 → 防线3「新增内容不漏」没有基线，每轮都是「首次」
+      #   修法：用 actions/cache 持久化 work/state（key 带 run_id，restore-keys 复用上一轮）。
+      - name: 恢复跨轮状态（imagecost / user_shard / snapshot）
+        uses: actions/cache@v4
+        with:
+          path: repo/work/state
+          key: state-${{ matrix.source }}-${{ github.run_id }}
+          restore-keys: |
+            state-${{ matrix.source }}-
+            state-
       - name: 安装依赖
         working-directory: repo
         run: |
@@ -1325,6 +1342,17 @@ jobs:
       #   上一版在这里 save 全局池 → 要压缩上传 20+ 万 OCR 文件，
       #   实测耗时 16.8 分被 Watchdog 取消（与已删除的 ocr-merge-v3 同一坑）。
       #   缓存改由各分片自己 save（key 带片号，无冲突）。
+      # ⚠ 2026-11-24 根因修复：把 merge 落盘的跨轮状态存回 actions/cache，
+      #   否则 imagecost / user_shard / snapshot 随 runner 销毁 → 下一轮 plan 拿不到。
+      - name: 保存跨轮状态（供下一轮 plan 用）
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: repo/work/state
+          key: state-dahkg-${{ github.run_id }}
+          restore-keys: |
+            state-dahkg-
+            state-
       - name: 上传产物（数据类，不含图片）
         if: always()
         uses: actions/upload-artifact@v4
@@ -1483,6 +1511,17 @@ jobs:
       #   上一版在这里 save 全局池 → 要压缩上传 20+ 万 OCR 文件，
       #   实测耗时 16.8 分被 Watchdog 取消（与已删除的 ocr-merge-v3 同一坑）。
       #   缓存改由各分片自己 save（key 带片号，无冲突）。
+      # ⚠ 2026-11-24 根因修复：把 merge 落盘的跨轮状态存回 actions/cache，
+      #   否则 imagecost / user_shard / snapshot 随 runner 销毁 → 下一轮 plan 拿不到。
+      - name: 保存跨轮状态（供下一轮 plan 用）
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: repo/work/state
+          key: state-aocai-${{ github.run_id }}
+          restore-keys: |
+            state-aocai-
+            state-
       - name: 上传产物（数据类，不含图片）
         if: always()
         uses: actions/upload-artifact@v4
@@ -1641,6 +1680,17 @@ jobs:
       #   上一版在这里 save 全局池 → 要压缩上传 20+ 万 OCR 文件，
       #   实测耗时 16.8 分被 Watchdog 取消（与已删除的 ocr-merge-v3 同一坑）。
       #   缓存改由各分片自己 save（key 带片号，无冲突）。
+      # ⚠ 2026-11-24 根因修复：把 merge 落盘的跨轮状态存回 actions/cache，
+      #   否则 imagecost / user_shard / snapshot 随 runner 销毁 → 下一轮 plan 拿不到。
+      - name: 保存跨轮状态（供下一轮 plan 用）
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: repo/work/state
+          key: state-tuku-${{ github.run_id }}
+          restore-keys: |
+            state-tuku-
+            state-
       - name: 上传产物（数据类，不含图片）
         if: always()
         uses: actions/upload-artifact@v4
