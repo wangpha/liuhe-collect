@@ -228,7 +228,12 @@ jobs:
           if [ "$TOMORROW" = "1" ]; then
             SLEEP_MIN=$((1440 - NOW_MIN + NEXT_TARGET))
           fi
-          MAX_SLEEP=340
+          # ⚠ 2026-11-25：340 → 320。
+          #   job timeout=355，340 只留 15 分钟余量；
+          #   checkout/装 gh/让位检查/dispatch 重试要 1-2 分钟，
+          #   但若 GitHub 排队或启动慢会吃掉余量 → 睡到一半被强杀 → 接力断链。
+          #   320 留 35 分钟余量，代价只是多一轮接力（无害）。
+          MAX_SLEEP=320
           RELAY=0
           if [ "$SLEEP_MIN" -gt "$MAX_SLEEP" ]; then
             echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟（>${MAX_SLEEP}）→ 分段接力：先睡 ${MAX_SLEEP} 分钟"
