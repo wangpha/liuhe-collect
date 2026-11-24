@@ -3177,6 +3177,49 @@ def do_merge_summary(args) -> int:
                     f"[merge-summary] ✅ 多出 {len(_new_authors)} 帖来自**新作者**"
                     f"（plan 生成后新用户发帖，合法实时增量）：{_new_authors[:3]}"
                 )
+        # ⚠ 2026-11-24 根因修复（run 45316538853 实测：aocai 缺 1 帖 + 多 3 帖 → 判失败）：
+        #   实测日志：
+        #     缺失 ID（1 个）: [3233463]
+        #     多出 ID（3 个）: [3233586, 3233587, 3233588]
+        #     416（上限）+ 3（新帖）- 1（缺）= 418
+        #   被缺的 3233463 是**源站已删**（对方删帖/被隐藏），而 3 条是**新发**帖。
+        #   这是完全正常的实时变化，但原代码因为「有缺也有多」直接 raise SystemExit(41)。
+        #
+        #   而「源站已删」的求证（probe_details）原来在 L603 的防线1 里 ——
+        #   **在数量断言之后**，永远执行不到（和 earlier 修的 unfinished 是同一类顺序错误）。
+        #
+        #   修法：数量断言之前，先对缺失的帖**逐条求证**：
+        #     · 源站已删/已隐藏 → 从 missing 移除，记入 disappeared（不判失败）
+        #     · 源站仍存在      → 保留在 missing（真缺帖，判失败）
+        if missing:
+            try:
+                _probe_ids = set(missing[:200])      # 上限 200，避免拖慢
+                _pr = _reconcile.probe_details(
+                    source, sorted(_probe_ids), log=log, target_period=period,
+                )
+                _gone = set()
+                for _aid in _probe_ids:
+                    if not (_pr.get("exists") or {}).get(_aid, True):
+                        _gone.add(int(_aid))
+                if _gone:
+                    log(
+                        f"[merge-summary] ✅ 缺失的 {len(missing)} 帖中有 {len(_gone)} 帖"
+                        f"**源站已删/隐藏**（不算漏帖）：{sorted(_gone)[:10]}"
+                    )
+                    missing = [x for x in missing if x not in _gone]
+                    # 重新计算总量用于断言
+                    target = target - len(_gone) if target else target
+                else:
+                    log(
+                        f"[merge-summary] ⚠ 缺失的 {len(missing)} 帖在源站**仍存在**"
+                        f"（真漏帖，继续判失败）"
+                    )
+            except Exception as _exc:  # noqa: BLE001 - 求证失败不改变判定
+                log(
+                    f"[merge-summary] ⚠ 缺失帖求证失败（按原判定继续）："
+                    f"{type(_exc).__name__}: {_exc}"
+                )
+
         if planned_set and not missing and extra and _extra_ok:
             log(
                 f"[merge-summary] ✅ 汇总 {len(merged)} 帖 = 上限 {target} 帖 + "
