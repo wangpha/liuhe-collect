@@ -1,131 +1,36 @@
 name: 诊断-图片可达性（临时）
-
 on:
   workflow_dispatch:
-
 jobs:
   diag:
-    name: "测源站图片可达性"
+    name: "测源站实时可达率"
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-        with:
-          path: repo
-
-      - name: 安装 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: 安装依赖（与生产一致）
-        working-directory: repo
+      - name: 测 53040qq.com 20 次（真实图片）
         run: |
-          pip install --quiet requests urllib3 charset-normalizer idna certifi
-
-      - name: 打印 runner 公网 IP 与区域
+          set -u
+          URLS="
+          https://www43fdsafe3e32fdsafdsaf.53040qq.com/posts_singapore/1544731/1795442023597_716_1452_.png
+          https://www43fdsafe3e32fdsafdsaf.53040qq.com/posts_singapore/1544668/1795441554542_1224_1313_.png
+          https://www43fdsafe3e32fdsafdsaf.53040qq.com/posts_singapore/1544773/1795443223123_1080_1452_.png
+          "
+          OK=0; E522=0; OTHER=0
+          for round in 1 2 3 4 5 6 7; do
+            for U in $URLS; do
+              [ -z "$U" ] && continue
+              CODE=$(curl -sS -o /dev/null -A "Mozilla/5.0" -w "%{http_code}" --max-time 25 "$U" 2>/dev/null || echo "000")
+              case "$CODE" in
+                200) OK=$((OK+1)) ;;
+                522) E522=$((E522+1)) ;;
+                *)   OTHER=$((OTHER+1)); echo "  其他: $CODE" ;;
+              esac
+            done
+          done
+          echo "=== 结果 ==="
+          echo "200: $OK / 522: $E522 / 其他: $OTHER"
+          echo "总: $((OK + E522 + OTHER))"
+      - name: 测 CF-RAY 节点
         run: |
-          echo "=== 公网 IP ==="
-          curl -sS --max-time 10 https://api.ipify.org || echo "(取不到)"
-          echo
-          echo "=== 出口区域 ==="
-          curl -sS --max-time 10 https://ipinfo.io/json 2>/dev/null | head -12 || true
-
-      - name: ⭐ 用生产代码同一条路径下载（关键）
-        working-directory: repo
-        env:
-          LIUHE_CORE_PATH: ${{ github.workspace }}/repo
-          PYTHONPATH: ${{ github.workspace }}/repo
-        run: |
-          python - <<'PY'
-          import sys, time, traceback
-          from pathlib import Path
-          sys.path.insert(0, str(Path.cwd()))
-
-          URL = "https://www43fdsafe3e32fdsafdsaf.53040qq.com/posts_singapore/1534326/1794750485955_770_573_.png"
-
-          print("=" * 80)
-          print("① 裸 requests（诊断已验证成功）")
-          print("=" * 80)
-          import requests
-          t0 = time.time()
-          try:
-              r = requests.get(URL, timeout=(8, 30))
-              print(f"  HTTP {r.status_code}  {len(r.content)}B  {time.time()-t0:.2f}s")
-          except Exception as e:
-              print(f"  ❌ {type(e).__name__}: {str(e)[:150]}  {time.time()-t0:.2f}s")
-
-          print()
-          print("=" * 80)
-          print("② 生产代码 get_session() + headers（真实路径）")
-          print("=" * 80)
-          try:
-              from core import scraper
-              sess = scraper.get_session()
-              print(f"  trust_env = {sess.trust_env}")
-              print(f"  UA = {sess.headers.get('User-Agent')}")
-              print(f"  Referer = {sess.headers.get('Referer')}")
-              print(f"  BASE = {scraper.BASE}")
-
-              headers = {
-                  "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-                  "Referer": scraper.BASE + "/",
-              }
-              print(f"  请求头 Accept = {headers['Accept']}")
-              print(f"  请求头 Referer = {headers['Referer']}")
-              print(f"  proxy = {scraper.proxy_pool().pick()}")
-
-              t0 = time.time()
-              resp = sess.get(URL, stream=True, timeout=(8, 30), headers=headers, proxies=None)
-              print(f"  HTTP {resp.status_code}  {time.time()-t0:.2f}s")
-              print(f"  Content-Type: {resp.headers.get('content-type')}")
-              data = resp.content
-              print(f"  下载 {len(data)} 字节")
-              print(f"  前12字节: {data[:12]!r}")
-          except Exception as e:
-              print(f"  ❌ {type(e).__name__}: {str(e)[:200]}  {time.time()-t0:.2f}s")
-              traceback.print_exc()
-
-          print()
-          print("=" * 80)
-          print("③ 生产函数 download_image（完整逻辑，含 image_is_intact）")
-          print("=" * 80)
-          try:
-              from core import scraper
-              dst = Path("/tmp/prod_test.png")
-              if dst.exists():
-                  dst.unlink()
-              t0 = time.time()
-              status = scraper.download_image(URL, dst, 0.0, attempts=3, timeout=(8, 30))
-              print(f"  status = {status!r}  {time.time()-t0:.2f}s")
-              if dst.exists():
-                  print(f"  文件 {dst.stat().st_size} 字节  image_is_intact={scraper.image_is_intact(dst)}")
-              else:
-                  print("  ❌ 文件不存在")
-          except Exception as e:
-              print(f"  ❌ {type(e).__name__}: {str(e)[:200]}  {time.time()-t0:.2f}s")
-              traceback.print_exc()
-
-          print()
-          print("=" * 80)
-          print("④ 对比：0ltx3a.com（云端成功的 host）")
-          print("=" * 80)
-          URL2 = "https://20281023vv.0ltx3a.com/"
-          try:
-              r2 = requests.get(URL2, timeout=(8, 30))
-              print(f"  裸 requests: HTTP {r2.status_code}  {len(r2.content)}B")
-          except Exception as e:
-              print(f"  ❌ {type(e).__name__}: {str(e)[:120]}")
-      - name: DNS 解析
-        run: |
-          echo "=== 53040qq.com DNS（runner 视角）==="
-          getent hosts www43fdsafe3e32fdsafdsaf.53040qq.com || echo "解析失败"
-          python - <<'PY'
-          import socket
-          for h in ("www43fdsafe3e32fdsafdsaf.53040qq.com",):
-              try:
-                  print(f"{h} -> {sorted({x[4][0] for x in socket.getaddrinfo(h, 443)})}")
-              except Exception as e:
-                  print(f"{h}: {type(e).__name__}: {e}")
-          PY
+          U="https://www43fdsafe3e32fdsafdsaf.53040qq.com/posts_singapore/1544731/1795442023597_716_1452_.png"
+          curl -sS -o /dev/null -D - --max-time 25 "$U" 2>&1 | grep -Ei "cf-ray|cf-cache-status|HTTP/" | head -5
