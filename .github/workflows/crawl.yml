@@ -262,6 +262,60 @@ jobs:
             exit 0
           fi
 
+          # ==================================================================
+          # ⚠ 2026-11-24 根因修复（实测：今天 schedule 理论 288 次只触发 2 次，
+          #   alarm.yml 理论 8 次只触发 2 次 → 五档只完成 1 档）
+          #
+          #   GitHub 的 schedule 是 best-effort，高负载时延迟甚至丢弃。
+          #   原来三层保障（高频 cron / 自愈补跑 / 外部 cron）中，
+          #   前两层**都依赖 schedule 触发**，schedule 失效则全失效。
+          #
+          #   现在加第 4 层：**自我续命**。
+          #   本次 gate 跑完 → 算出「下一次该被触发的时刻」→
+          #   sleep 到那个时刻 → workflow_dispatch 一次自己。
+          #   这样只要**任意一次**触发成功，链条就能自我延续，
+          #   完全不依赖 schedule 的可信度，也不需要外部 cron 服务。
+          # ==================================================================
+          echo "---- 自我续命规划 ----"
+          # 目标时刻 = 下一个「档位 - 5 分钟」（留 5 分钟给 gate 自身耗时）
+          NEXT_TARGET=""
+          NEXT_NAME=""
+          i=0
+          for sm in $SLOTS_MIN; do
+            i=$((i+1))
+            nm=$(echo "$SLOTS_NAME" | cut -d' ' -f$i)
+            tgt=$((sm - 5))
+            if [ "$tgt" -gt "$NOW_MIN" ]; then
+              NEXT_TARGET=$tgt
+              NEXT_NAME=$nm
+              break
+            fi
+          done
+          # 今天的档都过了 → 目标 = 明天 12:00 前 5 分钟（即 715 分）
+          TOMORROW=0
+          if [ -z "$NEXT_TARGET" ]; then
+            NEXT_TARGET=715
+            NEXT_NAME="明天12:00"
+            TOMORROW=1
+          fi
+          SLEEP_MIN=$((NEXT_TARGET - NOW_MIN))
+          if [ "$TOMORROW" = "1" ]; then
+            SLEEP_MIN=$((1440 - NOW_MIN + NEXT_TARGET))
+          fi
+          # 上限保护：单 job 6 小时，留余量 → 最多睡 300 分钟
+          if [ "$SLEEP_MIN" -gt 300 ]; then
+            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟（>300）→ 不续命，等 schedule"
+            SLEEP_MIN=0
+          fi
+          if [ "$SLEEP_MIN" -gt 0 ]; then
+            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟 → 睡到点后 dispatch 自己"
+            echo "next_wake=$NEXT_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "  本次不续命"
+            echo "next_wake=none" >> "$GITHUB_OUTPUT"
+          fi
+          echo "sleep_min=$SLEEP_MIN" >> "$GITHUB_OUTPUT"
+
           # 手动/外部触发（IS_MANUAL=1）：不要求落在窗口内，直接放行
           # slot 优先用 inputs.slot，否则用「最接近的已过档位」标注
           if [ "$IS_MANUAL" = "1" ]; then
@@ -367,59 +421,6 @@ jobs:
             echo "slot=none" >> "$GITHUB_OUTPUT"
           fi
 
-          # ==================================================================
-          # ⚠ 2026-11-24 根因修复（实测：今天 schedule 理论 288 次只触发 2 次，
-          #   alarm.yml 理论 8 次只触发 2 次 → 五档只完成 1 档）
-          #
-          #   GitHub 的 schedule 是 best-effort，高负载时延迟甚至丢弃。
-          #   原来三层保障（高频 cron / 自愈补跑 / 外部 cron）中，
-          #   前两层**都依赖 schedule 触发**，schedule 失效则全失效。
-          #
-          #   现在加第 4 层：**自我续命**。
-          #   本次 gate 跑完 → 算出「下一次该被触发的时刻」→
-          #   sleep 到那个时刻 → workflow_dispatch 一次自己。
-          #   这样只要**任意一次**触发成功，链条就能自我延续，
-          #   完全不依赖 schedule 的可信度，也不需要外部 cron 服务。
-          # ==================================================================
-          echo "---- 自我续命规划 ----"
-          # 目标时刻 = 下一个「档位 - 5 分钟」（留 5 分钟给 gate 自身耗时）
-          NEXT_TARGET=""
-          NEXT_NAME=""
-          i=0
-          for sm in $SLOTS_MIN; do
-            i=$((i+1))
-            nm=$(echo "$SLOTS_NAME" | cut -d' ' -f$i)
-            tgt=$((sm - 5))
-            if [ "$tgt" -gt "$NOW_MIN" ]; then
-              NEXT_TARGET=$tgt
-              NEXT_NAME=$nm
-              break
-            fi
-          done
-          # 今天的档都过了 → 目标 = 明天 12:00 前 5 分钟（即 715 分）
-          TOMORROW=0
-          if [ -z "$NEXT_TARGET" ]; then
-            NEXT_TARGET=715
-            NEXT_NAME="明天12:00"
-            TOMORROW=1
-          fi
-          SLEEP_MIN=$((NEXT_TARGET - NOW_MIN))
-          if [ "$TOMORROW" = "1" ]; then
-            SLEEP_MIN=$((1440 - NOW_MIN + NEXT_TARGET))
-          fi
-          # 上限保护：单 job 6 小时，留余量 → 最多睡 300 分钟
-          if [ "$SLEEP_MIN" -gt 300 ]; then
-            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟（>300）→ 不续命，等 schedule"
-            SLEEP_MIN=0
-          fi
-          if [ "$SLEEP_MIN" -gt 0 ]; then
-            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟 → 睡到点后 dispatch 自己"
-            echo "next_wake=$NEXT_NAME" >> "$GITHUB_OUTPUT"
-          else
-            echo "  本次不续命"
-            echo "next_wake=none" >> "$GITHUB_OUTPUT"
-          fi
-          echo "sleep_min=$SLEEP_MIN" >> "$GITHUB_OUTPUT"
 
       - name: 自我续命（睡到下一次档位后 dispatch 自己）
         if: always() && steps.gate.outputs.sleep_min != '' && steps.gate.outputs.sleep_min != '0'
