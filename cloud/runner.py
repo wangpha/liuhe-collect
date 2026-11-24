@@ -2686,6 +2686,29 @@ def do_shard(args) -> int:
             },
         )
         log(f"[shard] ⚠ {len(_miss)} 帖补不上，已写 unfinished 交 merge：{sorted(_miss)[:8]}")
+    else:
+        # ⚠ 2026-11-24 根因修复（run 45291007783 实测：merge 报「分片遗留 563 帖」→
+        #   误补抓 34 帖 → 那 34 帖没有图片/OCR → fullText 缺失率 36.4% → 整轮失败）：
+        #
+        #   我上一轮加的「开跑前预写 unfinished（全部 planned_ids）」有个致命缺口：
+        #   分片**顺利跑完全部帖**时（rest_ids 空、_miss 空），没有任何代码覆盖或删除
+        #   预写的文件 → 该文件残留「全部帖都未完成」的假记录
+        #   → merge 读到后当成 563 帖遗留，把其中 34 帖误判为缺口去补抓
+        #   → 补抓的帖只有列表行+详情，**没有图片下载、没有 OCR**
+        #   → 它们的图片全部没有 OCR 缓存 → fullText 缺失率飙升。
+        #
+        #   现在：分片无遗漏时**删除**预写的 unfinished 文件（它是"还没跑完"的占位，
+        #   跑完了就该消失）。只有真遗漏（rest_ids / _miss 非空）才保留。
+        if planned_ids:
+            try:
+                if _pre_unfinished.exists():
+                    _pre_unfinished.unlink()
+                    log(
+                        f"[shard] ✅ 本片无遗漏 → 删除开跑前预写的 unfinished"
+                        f"（{len(planned_ids)} 帖全部处理完毕）"
+                    )
+            except Exception as _exc:  # noqa: BLE001 - 删不掉只告警，不阻断
+                log(f"[shard] ⚠ 删除预写 unfinished 失败：{type(_exc).__name__}: {_exc}")
 
     log(
         f"[shard] {source} 本片：源站本期共 {sink.get('total', 0)} 帖 / {sink.get('imagesTotal', 0)} 图，"
