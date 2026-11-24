@@ -2808,7 +2808,18 @@ def do_shard(args) -> int:
         #
         #   现在：分片无遗漏时**删除**预写的 unfinished 文件（它是"还没跑完"的占位，
         #   跑完了就该消失）。只有真遗漏（rest_ids / _miss 非空）才保留。
-        if planned_ids:
+        #
+        # ⚠ 2026-11-24 第二次根因修复（run 45373762964 实测：dahkg 缺 2 帖
+        #   1544888 / 1545473，merge 报「真漏帖」）：
+        #   上面这个删除逻辑**没检查 rest_ids**！完整链路是：
+        #     L143-172  budget transfer > 0 → planned_ids = set(taken)（60 → 59）
+        #               → rest_ids（1 帖）写进 unfinished，交 merge 补抓
+        #     L226-238  _miss 为空（因为 _slice_items 里 59 == 59「无漏帖」）→ 走 else
+        #     L252-261  **直接删除 _pre_unfinished** → rest_ids 里的那帖永久丢失！
+        #   → merge 报「缺失 1544888（属 group[2]）/ 1545473（属 group[15]）」
+        #   修法：只有当**本片真的没有遗留**（rest_ids 空 且 _miss 空）时才删；
+        #         有 rest_ids 时必须保留，且内容要是 rest_ids（不是预写的全量）。
+        if planned_ids and not rest_ids:
             try:
                 if _pre_unfinished.exists():
                     _pre_unfinished.unlink()
@@ -2818,6 +2829,11 @@ def do_shard(args) -> int:
                     )
             except Exception as _exc:  # noqa: BLE001 - 删不掉只告警，不阻断
                 log(f"[shard] ⚠ 删除预写 unfinished 失败：{type(_exc).__name__}: {_exc}")
+        elif rest_ids:
+            log(
+                f"[shard] ⏸ 本片有 {len(rest_ids)} 帖因容量截断未处理 → "
+                f"保留 unfinished 交 merge/下一轮补抓：{sorted(rest_ids)[:8]}"
+            )
 
     log(
         f"[shard] {source} 本片：源站本期共 {sink.get('total', 0)} 帖 / {sink.get('imagesTotal', 0)} 图，"
