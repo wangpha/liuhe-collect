@@ -3332,7 +3332,32 @@ def do_merge_summary(args) -> int:
         #   仍然保留的硬校验：重复 id 必须为 0（防止多片重复抓）。
         _extra_ok = False
         if planned_set and not missing and extra:
-            _dup_ids = len(merged) - len(got_ids)
+            # ⚠ 2026-11-24 根因修复（run 45427593746 实测：aocai
+            #   「重算后 missing=0 / extra=4」却仍报「210 帖 != 可达上限 206 帖」）：
+            #
+            #   原代码 `_dup_ids = len(merged) - len(got_ids)` 当「重复 id 数」用，
+            #   但这两者口径不同：
+            #     · merged 是 **list**（可能含 articleId=0 的占位、可能同 id 多条）
+            #     · got_ids 是 **set**（去重后的 int 集合）
+            #   实测 aocai：len(merged)=210，len(got_ids)=211 → _dup_ids = **-1**
+            #   → `_extra_ok = (_dup_ids == 0)` = False → 明明 missing=0/extra=4
+            #     是合法增量，却因为 -1 != 0 被判失败。
+            #
+            #   正确判据：直接统计「merged 里 articleId 出现次数 > 1」的 id 数量。
+            from collections import Counter as _Counter
+
+            _id_counts = _Counter()
+            _zero_id = 0
+            for _p in merged:
+                try:
+                    _aid0 = int(_p.get("articleId") or 0)
+                except (TypeError, ValueError):
+                    _aid0 = 0
+                if _aid0 <= 0:
+                    _zero_id += 1
+                    continue
+                _id_counts[_aid0] += 1
+            _dup_ids = sum(1 for _n in _id_counts.values() if _n > 1)
             # 统计「新作者帖」（仅用于日志，不判失败）
             _u2s = plan.get("userToShard") or {}
             _new_authors = []
@@ -3349,6 +3374,11 @@ def do_merge_summary(args) -> int:
                 if _u2s and _uid and _uid not in _u2s:
                     _new_authors.append((_aid, _uid))
             _extra_ok = (_dup_ids == 0)
+            if _zero_id:
+                log(
+                    f"[merge-summary] ⚠ 有 {_zero_id} 条帖的 articleId<=0"
+                    f"（占位/补抓未回填），不计入重复统计"
+                )
             if not _extra_ok:
                 log(
                     f"[merge-summary] ❌ 多出的 {len(extra)} 帖未通过校验："
