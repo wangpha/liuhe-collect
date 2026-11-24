@@ -621,6 +621,11 @@ jobs:
           #   改成 1200s(20 分) → 1+20 = 21 分 < 25 分，稳。分片容量 15 分钟（USABLE_RATIO=0.6）也够。
           # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
           SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1200"
+          # ⚠ 2026-11-24 根因修复（run 45316538853 实测：分片预估 7.3 分钟实际 21.5 分钟
+          #   → 7 个分片 SIGTERM）：media 阶段（下载+重试+OCR）必须有时间预算，
+          #   否则 522 把某批下载拖到 8 分钟，循环仍会继续跑后续批次直到 SIGTERM。
+          #   1000 秒 = SHARD_TO(1200) - 200（留打包/上传/收尾）
+          export LIUHE_MEDIA_BUDGET_SEC=1000
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
@@ -847,6 +852,11 @@ jobs:
           #   改成 1200s(20 分) → 1+20 = 21 分 < 25 分，稳。分片容量 15 分钟（USABLE_RATIO=0.6）也够。
           # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
           SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1200"
+          # ⚠ 2026-11-24 根因修复（run 45316538853 实测：分片预估 7.3 分钟实际 21.5 分钟
+          #   → 7 个分片 SIGTERM）：media 阶段（下载+重试+OCR）必须有时间预算，
+          #   否则 522 把某批下载拖到 8 分钟，循环仍会继续跑后续批次直到 SIGTERM。
+          #   1000 秒 = SHARD_TO(1200) - 200（留打包/上传/收尾）
+          export LIUHE_MEDIA_BUDGET_SEC=1000
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
@@ -1073,6 +1083,11 @@ jobs:
           #   改成 1200s(20 分) → 1+20 = 21 分 < 25 分，稳。分片容量 15 分钟（USABLE_RATIO=0.6）也够。
           # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
           SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1200"
+          # ⚠ 2026-11-24 根因修复（run 45316538853 实测：分片预估 7.3 分钟实际 21.5 分钟
+          #   → 7 个分片 SIGTERM）：media 阶段（下载+重试+OCR）必须有时间预算，
+          #   否则 522 把某批下载拖到 8 分钟，循环仍会继续跑后续批次直到 SIGTERM。
+          #   1000 秒 = SHARD_TO(1200) - 200（留打包/上传/收尾）
+          export LIUHE_MEDIA_BUDGET_SEC=1000
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
