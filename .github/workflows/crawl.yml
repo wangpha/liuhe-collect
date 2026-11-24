@@ -162,36 +162,37 @@ jobs:
   #   低频 cron（每天 5 条）实测命中率 0/9（分钟数完全错位，偏差最远 453 分钟）。
   #   改成每 10 分钟跑一次 + 在这里用**北京时间**判断是否命中五档窗口。
   #   这是**纯云端**方案，与本地电脑开关机无关（用户铁律）。
-  gate:
-    name: "JobG 定时闸门"
+  # ========================================================================
+  # JobC：续命链（独立 job，不与 gate 抢并发、不阻塞下游、可随时取消）
+  #
+  # ⚠ 2026-11-24 根因修复（第 4 次修这个点，前面三次都被推翻）：
+  #   实测 run 45433951724：把续命放进 gate 后 →
+  #     · gate 睡 340 分钟 → plan 依赖 gate → **整条链路被阻塞**（只有 1 个 job 在跑）
+  #     · 占用 1 个并发位（Free 只有 20）
+  #     · `gh run cancel` 取消不掉（bash sleep 不响应 SIGTERM）
+  #   结论：续命必须独立成 job，且**不被任何 job 依赖**。
+  #
+  # 设计：
+  #   · 与 gate 并行启动，互不依赖
+  #   · 算「距下一次该醒还有多少分钟」→ 最多睡 340 分钟 → dispatch 一次自己
+  #   · 分段接力：睡醒后再 dispatch，新的 chain 再算「还差多少」，直到目标档位
+  #   · 效果：只要任意一次触发成功（schedule / alarm / 手动），
+  #     链条就能跨越整夜空档，不再依赖 schedule 可信度
+  # ========================================================================
+  chain:
+    name: "JobC 续命链"
     runs-on: ubuntu-24.04
-    # ⚠ 2026-11-24：自我续命最长睡 340 分钟（GitHub 单 job 上限 360）
+    # GitHub 单 job 上限 360 分钟；留 5 分钟余量
     timeout-minutes: 355
     permissions:
       actions: write
       contents: read
-    outputs:
-      should_run: ${{ steps.gate.outputs.should_run }}
-      slot: ${{ steps.gate.outputs.slot }}
     steps:
-      # ==================================================================
-      # ⚠ 2026-11-24 根因修复（第 3 次，run 45432052811 实测仍未续命）：
-      #
-      #   续命逻辑原来写在 step「判断是否命中五档」的 run 里，
-      #   但那个 run 有 **三个 early exit 0**：
-      #     ① 防重复检查（已有 run 在跑）→ exit 0
-      #     ② 命中五档窗口              → exit 0
-      #     ③ 手动/外部触发             → exit 0
-      #   → sleep_min 根本没被写进 GITHUB_OUTPUT → 续命 step 的 if 条件不成立 → 跳过。
-      #   实测 run 45432052811：「已有 1 个 run 在跑 → 跳过本轮」就走了 ①。
-      #
-      #   修法：**把续命规划做成独立 step，放在所有判断之前**。
-      #   它只读取当前时间算「下一次该醒的时刻」，与是否放行完全无关。
-      # ==================================================================
-      - name: 续命规划（算下一次该醒的时刻）
-        id: chain
+      - name: 规划并睡到下一次档位，然后 dispatch 自己
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
+          set -u
           NOW_H=$(TZ=Asia/Shanghai date +%-H)
           NOW_M=$(TZ=Asia/Shanghai date +%-M)
           NOW_MIN=$(( NOW_H * 60 + NOW_M ))
@@ -199,6 +200,7 @@ jobs:
           SLOTS_NAME="12:00 15:00 18:00 20:10 20:40"
           echo "当前北京时间 $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')（当日第 $NOW_MIN 分）"
 
+          # 目标 = 下一个「档位 - 5 分钟」
           NEXT_TARGET=""
           NEXT_NAME=""
           i=0
@@ -222,28 +224,71 @@ jobs:
           if [ "$TOMORROW" = "1" ]; then
             SLEEP_MIN=$((1440 - NOW_MIN + NEXT_TARGET))
           fi
-          # ⚠ 2026-11-24 根因修复（run 45433084506 实测：
-          #   「距 12:00 还有 710 分钟（>300，超单 job 上限）→ 不续命」）：
-          #   夜里 20:40 之后到次日 12:00 有 15 小时空档，单 job 睡不了那么久。
-          #   改成**分段接力**：每次最多睡 340 分钟，睡醒后 dispatch 一次自己，
-          #   新的 gate 再算「还差多少」→ 继续睡 → 如此接力直到目标档位。
-          #   这样即使只有一次触发成功，链条也能跨越整夜空档。
           MAX_SLEEP=340
           RELAY=0
           if [ "$SLEEP_MIN" -gt "$MAX_SLEEP" ]; then
-            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟（>${MAX_SLEEP}）→ 分段接力：先睡 ${MAX_SLEEP} 分钟再续"
+            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟（>${MAX_SLEEP}）→ 分段接力：先睡 ${MAX_SLEEP} 分钟"
             SLEEP_MIN=$MAX_SLEEP
             RELAY=1
           fi
-          if [ "$SLEEP_MIN" -gt 0 ]; then
-            echo "  本次睡 $SLEEP_MIN 分钟（目标 $NEXT_NAME，接力=$RELAY）"
-          else
-            echo "  本次不续命"
+          if [ "$SLEEP_MIN" -le 0 ]; then
+            echo "  无需续命（已到目标时刻）→ 直接 dispatch"
+            SLEEP_MIN=0
           fi
-          echo "relay=$RELAY" >> "$GITHUB_OUTPUT"
-          echo "sleep_min=$SLEEP_MIN" >> "$GITHUB_OUTPUT"
-          echo "next_wake=$NEXT_NAME" >> "$GITHUB_OUTPUT"
+          echo "  本次睡 $SLEEP_MIN 分钟（目标 $NEXT_NAME，接力=$RELAY）"
 
+          LEFT=$((SLEEP_MIN * 60))
+          while [ "$LEFT" -gt 0 ]; do
+            CHUNK=300
+            if [ "$LEFT" -lt "$CHUNK" ]; then CHUNK=$LEFT; fi
+            sleep "$CHUNK"
+            LEFT=$((LEFT - CHUNK))
+            echo "  倒计时：还剩 $((LEFT / 60)) 分钟"
+          done
+
+          echo "→ 到点，dispatch crawl.yml（source=all）"
+          for k in 1 2 3; do
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 \
+              -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/crawl.yml/dispatches" \
+              -d '{"ref":"main","inputs":{"source":"all"}}' || echo 000)
+            echo "  dispatch 返回 $CODE"
+            if [ "$CODE" = "204" ] || [ "$CODE" = "200" ]; then
+              echo "  ✅ 续命成功（下一次已排队）"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "  ⚠ 续命失败 3 次（不阻断，schedule 仍是兜底）"
+
+  gate:
+    name: "JobG 定时闸门"
+    runs-on: ubuntu-24.04
+    # ⚠ 2026-11-24：续命已移到独立 job（chain），gate 保持短超时
+    timeout-minutes: 3
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      slot: ${{ steps.gate.outputs.slot }}
+    steps:
+      # ==================================================================
+      # ⚠ 2026-11-24 根因修复（第 3 次，run 45432052811 实测仍未续命）：
+      #
+      #   续命逻辑原来写在 step「判断是否命中五档」的 run 里，
+      #   但那个 run 有 **三个 early exit 0**：
+      #     ① 防重复检查（已有 run 在跑）→ exit 0
+      #     ② 命中五档窗口              → exit 0
+      #     ③ 手动/外部触发             → exit 0
+      #   → sleep_min 根本没被写进 GITHUB_OUTPUT → 续命 step 的 if 条件不成立 → 跳过。
+      #   实测 run 45432052811：「已有 1 个 run 在跑 → 跳过本轮」就走了 ①。
+      #
+      #   修法：**把续命规划做成独立 step，放在所有判断之前**。
+      #   它只读取当前时间算「下一次该醒的时刻」，与是否放行完全无关。
+      # ==================================================================
       - name: 判断是否命中五档（窗口 + 自愈补跑）
         id: gate
         env:
@@ -440,42 +485,6 @@ jobs:
             echo "slot=none" >> "$GITHUB_OUTPUT"
           fi
 
-
-      - name: 自我续命（睡到下一次档位后 dispatch 自己）
-        if: always() && steps.chain.outputs.sleep_min != '' && steps.chain.outputs.sleep_min != '0'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -u
-          SLEEP_MIN="${{ steps.chain.outputs.sleep_min }}"
-          NEXT_WAKE="${{ steps.chain.outputs.next_wake }}"
-          echo "续命：睡 ${SLEEP_MIN} 分钟（目标 $NEXT_WAKE）"
-          SECS=$((SLEEP_MIN * 60))
-          # 分片睡，便于日志看到进度（每 5 分钟一行）
-          LEFT=$SECS
-          while [ "$LEFT" -gt 0 ]; do
-            CHUNK=300
-            if [ "$LEFT" -lt "$CHUNK" ]; then CHUNK=$LEFT; fi
-            sleep "$CHUNK"
-            LEFT=$((LEFT - CHUNK))
-            echo "  续命倒计时：还剩 $((LEFT / 60)) 分钟"
-          done
-          echo "→ 到点，dispatch crawl.yml"
-          for i in 1 2 3; do
-            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 \
-              -X POST \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/crawl.yml/dispatches" \
-              -d '{"ref":"main","inputs":{"source":"all"}}' || echo 000)
-            echo "  dispatch 返回 $CODE"
-            if [ "$CODE" = "204" ] || [ "$CODE" = "200" ]; then
-              echo "  ✅ 续命成功（下一次 gate 已排队）"
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "  ⚠ 续命失败 3 次（不阻断本轮，schedule 仍是兜底）"
 
   # ---------------- JobP：决定跑哪些源 + 每源分片数 ----------------
   plan:
