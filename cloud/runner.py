@@ -3184,6 +3184,9 @@ def do_merge_summary(args) -> int:
             except (TypeError, ValueError):
                 continue
     target = len(planned_set) if planned_set else expected
+    # ⚠ 2026-11-25：帖子数口径的 target 单独存一份（`target` 后面会被复用成 Path）。
+    #   默认值 = 计划的可达上限；若后面求证到「源站已删帖」，这里会被更新。
+    _expected_posts_target = int(target)
     if planned_set and expected and len(planned_set) != expected:
         log(
             f"[merge-summary] ⚠ plan 内部不一致：shardPlan.groups 并集 {len(planned_set)}"
@@ -3431,6 +3434,12 @@ def do_merge_summary(args) -> int:
                     #   这样 797 - (786-4) = 15 全部落进 extra（合法新帖）。
                     planned_set -= _gone
                     target = len(planned_set) if planned_set else target
+                    # ⚠ 2026-11-25：把「帖子数口径的 target」另存一份。
+                    #   原因：`target` 这个变量名在本函数后面（解包图片那段）
+                    #   被复用成 `target = images_dir / rel`（Path），
+                    #   而 build_merged_meta 需要的是**帖子数**。
+                    #   不另存就会把 Path 传进去 → expected_override 变成无效值。
+                    _expected_posts_target = int(target)
                     # ⚠ 2026-11-24 第三次根因修复（run 45390849469 实测：
                     #   「✅ 缺失的 11 帖中有 11 帖源站已删」之后仍报
                     #   「❌ 汇总后 903 帖 != 可达上限 887 帖」）：
@@ -3633,6 +3642,17 @@ def do_merge_summary(args) -> int:
         template=shard_metas[0], shard_metas=shard_metas, merged_posts=merged, users=users,
         claims=claims, claim_stats=claim_stats, plan=plan_with_scan, images_unique=n_images,
         timings={"durationSec": 0.0, "rebuildDurationSec": 0.0, "claimsSec": claims_sec},
+        # ⚠ 2026-11-25 根因修复：把 do_merge_summary 里已按「源站已删帖」修正过的
+        #   target（= 去删帖后的可达上限）传给 build_merged_meta，
+        #   避免它用 plan 的原始 expectedPosts 二次判死。
+        #   实测 run 45502591279：本函数已判 313 帖合规（missing=0/extra=0），
+        #   但 build_merged_meta 仍用 317 判「少于预期」→ 整轮失败。
+        #
+        #   ⚠⚠ 注意：`target` 这个变量名在本函数后面（解包图片那段）
+        #   被复用成 `target = images_dir / rel`（Path 对象）！
+        #   所以必须在更早的地方把帖子数存进**独立变量**，不能用 locals() 兜底，
+        #   否则传进去的是 Path 而不是 int。
+        expected_override=_expected_posts_target,
     )
 
     # ---------- ⑧ 写产物 ----------

@@ -94,6 +94,7 @@ def build_merged_meta(
     plan: dict,
     images_unique: int,
     timings: dict,
+    expected_override: int | None = None,
 ) -> dict:
     """按三类规则重建全量 run_meta。
 
@@ -108,6 +109,20 @@ def build_merged_meta(
     period = int((plan or {}).get("period") or tpl.get("period") or 0)
 
     expected = int((((plan or {}).get("counts") or {}).get("expectedPosts")) or 0)
+    # ⚠ 2026-11-25 根因修复（run 45502591279 实测：aocai
+    #   「已删帖从基线移除后：可达上限 313 帖（原 317），重算后 missing=0 / extra=0」
+    #   之后仍报「❌ 汇总后 313 帖 != plan 预期 317 帖（少于预期，拒绝出产物）」）：
+    #
+    #   这是**两套并行的断言**：
+    #     · cloud/runner.py::do_merge_summary 的 `target` → 可被「源站已删帖」修正（早前已修）
+    #     · cloud/merge_summary.py::build_merged_meta 的 `expected` → 永远取
+    #       `plan.counts.expectedPosts`，**完全不知道** 已删帖的事
+    #   → 前者判 313 帖合规、后者判 313 < 317 违规 → 整轮失败。
+    #
+    #   修法：新增 `expected_override`，由 do_merge_summary 把修正后的 `target`
+    #         （= 去删帖后的可达上限）传进来，两套断言从此用同一个数。
+    if expected_override is not None and int(expected_override) > 0:
+        expected = int(expected_override)
     # ⚠ 2026-11-22 根因修复（run 44928228939 实测：tuku 956 帖 vs plan 预期 952 帖）：
     #   plan 生成时源站 952 帖，分片扫描时源站已 956 帖（新增 4 帖）。
     #   分片按 by-user 收下本片作者的新帖 → 汇总 956 帖。
