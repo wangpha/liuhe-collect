@@ -426,28 +426,74 @@ def _prefetch_post_costs(
 
                 detail = forum_mod.fetch_thread_detail(aid, 0, include_replies=True, delay=0.0, max_pages=50)
                 tiezi = (detail or {}).get("tiezi") or {}
-                reps = (detail or {}).get("replies") or []
-                urls += [u.strip() for u in str(tiezi.get("img") or "").split(",") if u.strip()]
-                body_count = len(urls)
-                for rep in reps:
-                    urls += [u.strip() for u in str(rep.get("img") or "").split(",") if u.strip()]
-                    # #10 同类：楼中楼 subList 的 img 也要统计
-                    for sub in (rep.get("subList") or []):
-                        urls += [
-                            u.strip()
-                            for u in str((sub or {}).get("img") or "").split(",")
-                            if u.strip()
-                        ]
-                _body_urls = [u.strip() for u in str(tiezi.get("img") or "").split(",") if u.strip()]
+                # ⚠ 2026-11-24 根因修复（run 45373762964 实测：aocai 分片「本片 711 图」
+                #   实际处理 4874 张图，偏差 6.9 倍 → 分片容量估算严重偏低
+                #   → 90% 预算用完只处理了部分批次 → 946 张图未下载 → 文字版生成失败）：
+                #
+                #   实测 `forum_mod.fetch_thread_detail()` 的真实返回结构：
+                #     detail keys = ['allComments', 'huitie', 'replyPages', 'tiezi', 'truncated']
+                #     → **没有 'replies' 字段**，回复在 'huitie' 里
+                #     原代码 `(detail).get("replies")` → 恒为 [] → replyUrls 全空
+                #
+                #   tiezi 的图片字段实测：
+                #     tiezi['imgs']   = '["https://.../1795437869005.jpg/midPic"]'   ← JSON 数组
+                #     tiezi['img']    = ''     ← 原代码读这个，永远空
+                #   回复行同理：huitie[i]['imgs'] 是 JSON 数组，没有 'img' 字段。
+                #
+                #   → 修复：读 'huitie' + 'imgs'，并解析 JSON 数组格式。
+                reps = (detail or {}).get("huitie") or []
+
+                def _urls_of(row: dict) -> list[str]:
+                    """取一行的图片 URL（兼容 JSON 数组 / 逗号分隔 / 各种空值）。
+
+                    ⚠ 2026-11-24 实测 aocai 的真实取值（必须全部排除）：
+                        tiezi["imgs"]      = ''          ← 空串
+                        tiezi["imgs"]      = '[]'        ← 空 JSON 数组
+                        tiezi["imgs"]      = '["https://..."]'  ← 有图
+                        huitie[i]["imgs"]  = 'None'      ← **字符串 "None"**（最常见）
+                        huitie[i]["imgs"]  = None        ← Python None
+                    漏掉字符串 "None" 会让 `"None".split(",")` → `["None"]`
+                    → 每帖虚增 1 张图，且 URL 是垃圾值。
+                    """
+                    import json as _j
+
+                    raw = (row or {}).get("imgs")
+                    if raw is None:
+                        raw = (row or {}).get("img")
+                    if isinstance(raw, list):
+                        return [str(x).strip() for x in raw if str(x).strip()]
+                    text = str(raw or "").strip()
+                    # 所有「看起来是空」的形态一律当无图
+                    if text in {"", "None", "null", "[]", "{}", '""', "''"}:
+                        return []
+                    if text.startswith("["):
+                        try:
+                            arr = _j.loads(text)
+                            if isinstance(arr, list):
+                                return [
+                                    str(x).strip() for x in arr
+                                    if str(x).strip() and str(x).strip() not in {"None", "null"}
+                                ]
+                        except Exception:  # noqa: BLE001 - 非法 JSON 就退回逗号分隔
+                            pass
+                    return [
+                        u.strip() for u in text.split(",")
+                        if u.strip() and u.strip() not in {"None", "null"}
+                    ]
+
+                _body_urls = _urls_of(tiezi)
+                urls += _body_urls
+                body_count = len(_body_urls)
                 _reply_urls: list[str] = []
                 for _r in reps:
-                    _reply_urls += [u.strip() for u in str(_r.get("img") or "").split(",") if u.strip()]
+                    _ru = _urls_of(_r)
+                    _reply_urls += _ru
+                    urls += _ru
+                    # #10 同类：楼中楼 subList 的图也要统计
                     for _sub in (_r.get("subList") or []):
-                        _reply_urls += [
-                            u.strip()
-                            for u in str((_sub or {}).get("img") or "").split(",")
-                            if u.strip()
-                        ]
+                        _su = _urls_of(_sub)
+                        _reply_urls += _su
+                        urls += _su
                 return aid, {
                     "count": len(urls),
                     "detArea": sum(_det_input_area(u) for u in urls),
