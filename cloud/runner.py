@@ -696,16 +696,59 @@ def do_plan(args) -> int:
             #   和「图片下载成本」→ 图少但回复多的帖子被严重低估 → 分到太多。
             #   现在把 prefetch 的真实数据（bodyUrls/replyUrls/replyCount/imgCount）
             #   喂进 _item_image_weight，权重 = OCR + 网络 + 下载 全成本。
+            #
+            # ⚠ 2026-11-24 根因修复（run 45307211275 实测：18 片命中率 25%~68% 差异巨大）：
+            #   `_item_image_weight` 对每张图**一律按 1.0 秒**计（假设 100% miss），
+            #   但实测命中率 68% 的分片实际耗时只有 25% 分片的一半。
+            #   → 权重相同、实际耗时差 2 倍 → 高 miss 的分片 SIGTERM（分片 #3 21.1 分 > 16 分预算）。
+            #
+            #   修法：按**本机已有 OCR 缓存池**估算「平均命中率」，给 OCR 成本打折：
+            #     hit_rate ≈ min(0.95, 缓存池条数 / 本轮全量图数)
+            #     OCR 成本 = 图数 × (hit_rate × HIT_COST + (1-hit_rate) × MISS_COST)
+            #   这是 plan 阶段唯一能拿到的真实信息（不需要下载图片算 sha）。
+            _pool_size = 0
+            try:
+                from . import budget as _budget
+
+                _cd = _find_ocr_cache_dir(work, out_root)
+                _pool_size = int(_budget.count_cached_ocr_unique(
+                    [_cd, work / "ocr-cache"] if _cd else [work / "ocr-cache"]
+                ))
+            except Exception:  # noqa: BLE001 - 拿不到池大小就退回 100% miss
+                _pool_size = 0
+            _total_imgs_all = sum(
+                max(0, int((prefetched.get(a) or {}).get("imgCount") or 0))
+                for a in union_ids
+            )
+            _est_hit = 0.0
+            if _pool_size > 0 and _total_imgs_all > 0:
+                _est_hit = min(0.95, _pool_size / float(_total_imgs_all))
+            _HIT_COST = 0.05          # 命中缓存的单图成本（实测 ~0.05s）
+            _MISS_COST = 1.0          # 未命中的单图成本
+            log(
+                f"[plan] 权重按缓存命中率打折：缓存池 {_pool_size} 条 / 全量 {_total_imgs_all} 图"
+                f" → 估算命中率 {_est_hit * 100:.0f}%"
+                f"（每图 OCR 成本 {_est_hit * _HIT_COST + (1 - _est_hit) * _MISS_COST:.3f} 秒，"
+                f"而非原来的 1.0 秒）"
+            )
             weights = {}
             for aid in union_ids:
                 meta_row = dict(union_meta.get(str(aid)) or {})
                 pf = prefetched.get(aid) or {}
                 if pf:
                     meta_row["_prefetch"] = pf
-                weights[aid] = _item_image_weight(meta_row)
+                _w_full = _item_image_weight(meta_row)
+                # _item_image_weight 里 OCR 部分按 1.0 秒/张计；
+                # 这里把「OCR 部分的超额成本」按命中率折算掉。
+                # 保守做法：按图数 × 节约比例 扣减
+                _n_img = max(0, int(pf.get("imgCount") or 0))
+                if _n_img and _est_hit > 0:
+                    _save = _n_img * (_MISS_COST - (_est_hit * _HIT_COST + (1 - _est_hit) * _MISS_COST)) * 10
+                    _w_full = max(1, int(round(_w_full - _save)))
+                weights[aid] = _w_full
             mode = "prefetch-fullcost"
             weight_src = (f"prepare 预抓实测 {len(prefetched)}/{len(union_ids)} 帖"
-                          f"（全成本权重：OCR+网络+下载）")
+                          f"（全成本权重，已按估算命中率 {_est_hit * 100:.0f}% 打折）")
         elif use_hist:
             weights = {}
             for aid in union_ids:
