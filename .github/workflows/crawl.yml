@@ -184,6 +184,21 @@ jobs:
     runs-on: ubuntu-24.04
     # GitHub 单 job 上限 360 分钟；留 5 分钟余量
     timeout-minutes: 355
+    # ⚠ 2026-11-25 根因修复（预见到的隐患，用 GitHub 原生互斥解决）：
+    #   每次 crawl.yml 触发都会起一个 JobC。若短时间内多次触发
+    #   （schedule + alarm + 手动叠加），会有多个 JobC 各自 sleep 到同一时刻，
+    #   然后同时 dispatch → 同档重复跑多次 → 并发爆掉 + 重复 publish。
+    #
+    #   job 级 concurrency 是 GitHub 原生互斥：
+    #     · group 固定 "liuhe-chain" → 同一时刻只有一个 chain 在跑
+    #     · cancel-in-progress: true → 新的 chain 起来时，把旧的（正在睡的）直接取消
+    #   这样无论触发多少次，永远只有一个 chain 存活，天然不会重复 dispatch。
+    #
+    #   注意：这是 **job 级** concurrency，不会影响 crawl.yml 的其他 job
+    #   （workflow 级会连业务 run 一起串行，那不行）。
+    concurrency:
+      group: liuhe-chain
+      cancel-in-progress: true
     permissions:
       actions: write
       contents: read
