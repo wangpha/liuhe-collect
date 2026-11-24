@@ -184,21 +184,10 @@ jobs:
     runs-on: ubuntu-24.04
     # GitHub 单 job 上限 360 分钟；留 5 分钟余量
     timeout-minutes: 355
-    # ⚠ 2026-11-25 根因修复（预见到的隐患，用 GitHub 原生互斥解决）：
-    #   每次 crawl.yml 触发都会起一个 JobC。若短时间内多次触发
-    #   （schedule + alarm + 手动叠加），会有多个 JobC 各自 sleep 到同一时刻，
-    #   然后同时 dispatch → 同档重复跑多次 → 并发爆掉 + 重复 publish。
-    #
-    #   job 级 concurrency 是 GitHub 原生互斥：
-    #     · group 固定 "liuhe-chain" → 同一时刻只有一个 chain 在跑
-    #     · cancel-in-progress: true → 新的 chain 起来时，把旧的（正在睡的）直接取消
-    #   这样无论触发多少次，永远只有一个 chain 存活，天然不会重复 dispatch。
-    #
-    #   注意：这是 **job 级** concurrency，不会影响 crawl.yml 的其他 job
-    #   （workflow 级会连业务 run 一起串行，那不行）。
-    concurrency:
-      group: liuhe-chain
-      cancel-in-progress: true
+    # ⚠ 2026-11-25 实测：job 级 concurrency **不跨 run 生效**
+    #   （实测 run 45445693213 与 45457216315 的 JobC 同时 in_progress，
+    #    group="liuhe-chain" 完全没起作用）。
+    #   跨 run 互斥只能靠「在 dispatch 前主动查 + 让位」，见下面 step 里的实现。
     permissions:
       actions: write
       contents: read
@@ -260,6 +249,47 @@ jobs:
             LEFT=$((LEFT - CHUNK))
             echo "  倒计时：还剩 $((LEFT / 60)) 分钟"
           done
+
+          # ⚠ 2026-11-25 根因修复（实测 job 级 concurrency 不跨 run 生效，
+          #   run 45445693213 与 45457216315 的 JobC 同时 in_progress）：
+          #   每次 crawl.yml 触发都会起一个 JobC。短时间内多次触发
+          #   （schedule + alarm + 手动叠加）→ 多个 JobC 各自 sleep 到同一时刻
+          #   → 同时 dispatch → 同档重复跑多次 → 并发爆掉 + 重复 publish。
+          #
+          #   修法：醒来后查「除自己外有没有别的 JobC 还在跑」。
+          #   有 → 我是旧的，让位退出（由最新那个负责 dispatch）。
+          #   用纯 bash（不依赖 python3，云端与本地都能跑）。
+          # ⚠ 2026-11-25 根因修复（实测 job 级 concurrency 不跨 run 生效，
+          #   run 45445693213 与 45457216315 的 JobC 同时 in_progress）：
+          #   每次 crawl.yml 触发都会起一个 JobC。短时间内多次触发
+          #   （schedule + alarm + 手动叠加）→ 多个 JobC 各自 sleep 到同一时刻
+          #   → 同时 dispatch → 同档重复跑多次 → 并发爆掉 + 重复 publish。
+          #
+          #   修法：醒来后查「有没有比我更新的 JobC 还在跑」，有就让位退出。
+          #   用 `gh api --jq`（runner 预装 gh CLI，比手工 grep JSON 可靠）。
+          echo "→ 检查是否已有更新的 JobC 在跑（防重复接力）"
+          NEWER_JC=0
+          RUN_IDS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?status=in_progress&per_page=30" \
+                       --jq '.workflow_runs[].id' 2>/dev/null || true)
+          echo "  在跑 run: $(echo $RUN_IDS | tr '"'"'\n'"'"' '"'"' '"'"')"
+          for rid in $RUN_IDS; do
+            [ "$rid" = "$GITHUB_RUN_ID" ] && continue
+            # 比我旧（id 更小）的不算
+            if [ "$rid" -lt "$GITHUB_RUN_ID" ] 2>/dev/null; then
+              continue
+            fi
+            HAS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/$rid/jobs" \
+                    --jq '[.jobs[] | select(.name == "JobC 续命链")] | length' 2>/dev/null || echo 0)
+            echo "    run $rid: JobC 数 = ${HAS:-0}"
+            if [ "${HAS:-0}" -gt 0 ] 2>/dev/null; then
+              NEWER_JC=$((NEWER_JC + 1))
+            fi
+          done
+          echo "  比我新的在跑 JobC 数 = ${NEWER_JC}"
+          if [ "${NEWER_JC:-0}" -gt 0 ]; then
+            echo "  ⏭ 已有 ${NEWER_JC} 个更新的 JobC → 本实例让位退出（由最新那个接力）"
+            exit 0
+          fi
 
           echo "→ 到点，dispatch crawl.yml（source=all）"
           for k in 1 2 3; do
