@@ -174,6 +174,66 @@ jobs:
       should_run: ${{ steps.gate.outputs.should_run }}
       slot: ${{ steps.gate.outputs.slot }}
     steps:
+      # ==================================================================
+      # ⚠ 2026-11-24 根因修复（第 3 次，run 45432052811 实测仍未续命）：
+      #
+      #   续命逻辑原来写在 step「判断是否命中五档」的 run 里，
+      #   但那个 run 有 **三个 early exit 0**：
+      #     ① 防重复检查（已有 run 在跑）→ exit 0
+      #     ② 命中五档窗口              → exit 0
+      #     ③ 手动/外部触发             → exit 0
+      #   → sleep_min 根本没被写进 GITHUB_OUTPUT → 续命 step 的 if 条件不成立 → 跳过。
+      #   实测 run 45432052811：「已有 1 个 run 在跑 → 跳过本轮」就走了 ①。
+      #
+      #   修法：**把续命规划做成独立 step，放在所有判断之前**。
+      #   它只读取当前时间算「下一次该醒的时刻」，与是否放行完全无关。
+      # ==================================================================
+      - name: 续命规划（算下一次该醒的时刻）
+        id: chain
+        run: |
+          set -eu
+          NOW_H=$(TZ=Asia/Shanghai date +%-H)
+          NOW_M=$(TZ=Asia/Shanghai date +%-M)
+          NOW_MIN=$(( NOW_H * 60 + NOW_M ))
+          SLOTS_MIN="720 900 1080 1210 1240"
+          SLOTS_NAME="12:00 15:00 18:00 20:10 20:40"
+          echo "当前北京时间 $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')（当日第 $NOW_MIN 分）"
+
+          NEXT_TARGET=""
+          NEXT_NAME=""
+          i=0
+          for sm in $SLOTS_MIN; do
+            i=$((i+1))
+            nm=$(echo "$SLOTS_NAME" | cut -d' ' -f$i)
+            tgt=$((sm - 5))
+            if [ "$tgt" -gt "$NOW_MIN" ]; then
+              NEXT_TARGET=$tgt
+              NEXT_NAME=$nm
+              break
+            fi
+          done
+          TOMORROW=0
+          if [ -z "$NEXT_TARGET" ]; then
+            NEXT_TARGET=715
+            NEXT_NAME="明天12:00"
+            TOMORROW=1
+          fi
+          SLEEP_MIN=$((NEXT_TARGET - NOW_MIN))
+          if [ "$TOMORROW" = "1" ]; then
+            SLEEP_MIN=$((1440 - NOW_MIN + NEXT_TARGET))
+          fi
+          if [ "$SLEEP_MIN" -gt 300 ]; then
+            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟（>300，超单 job 上限）→ 不续命"
+            SLEEP_MIN=0
+          fi
+          if [ "$SLEEP_MIN" -gt 0 ]; then
+            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟 → 睡到点后 dispatch 自己"
+          else
+            echo "  本次不续命"
+          fi
+          echo "sleep_min=$SLEEP_MIN" >> "$GITHUB_OUTPUT"
+          echo "next_wake=$NEXT_NAME" >> "$GITHUB_OUTPUT"
+
       - name: 判断是否命中五档（窗口 + 自愈补跑）
         id: gate
         env:
@@ -229,6 +289,8 @@ jobs:
           NOW_EPOCH=$(TZ=Asia/Shanghai date +%s)
           echo "当前北京时间: $NOW_S"
 
+
+
           # ------------------------------------------------------------------
           # 五档定义（分钟数从 0 点起的偏移）
           #   12:00 → 720    15:00 → 900    18:00 → 1080
@@ -262,59 +324,6 @@ jobs:
             exit 0
           fi
 
-          # ==================================================================
-          # ⚠ 2026-11-24 根因修复（实测：今天 schedule 理论 288 次只触发 2 次，
-          #   alarm.yml 理论 8 次只触发 2 次 → 五档只完成 1 档）
-          #
-          #   GitHub 的 schedule 是 best-effort，高负载时延迟甚至丢弃。
-          #   原来三层保障（高频 cron / 自愈补跑 / 外部 cron）中，
-          #   前两层**都依赖 schedule 触发**，schedule 失效则全失效。
-          #
-          #   现在加第 4 层：**自我续命**。
-          #   本次 gate 跑完 → 算出「下一次该被触发的时刻」→
-          #   sleep 到那个时刻 → workflow_dispatch 一次自己。
-          #   这样只要**任意一次**触发成功，链条就能自我延续，
-          #   完全不依赖 schedule 的可信度，也不需要外部 cron 服务。
-          # ==================================================================
-          echo "---- 自我续命规划 ----"
-          # 目标时刻 = 下一个「档位 - 5 分钟」（留 5 分钟给 gate 自身耗时）
-          NEXT_TARGET=""
-          NEXT_NAME=""
-          i=0
-          for sm in $SLOTS_MIN; do
-            i=$((i+1))
-            nm=$(echo "$SLOTS_NAME" | cut -d' ' -f$i)
-            tgt=$((sm - 5))
-            if [ "$tgt" -gt "$NOW_MIN" ]; then
-              NEXT_TARGET=$tgt
-              NEXT_NAME=$nm
-              break
-            fi
-          done
-          # 今天的档都过了 → 目标 = 明天 12:00 前 5 分钟（即 715 分）
-          TOMORROW=0
-          if [ -z "$NEXT_TARGET" ]; then
-            NEXT_TARGET=715
-            NEXT_NAME="明天12:00"
-            TOMORROW=1
-          fi
-          SLEEP_MIN=$((NEXT_TARGET - NOW_MIN))
-          if [ "$TOMORROW" = "1" ]; then
-            SLEEP_MIN=$((1440 - NOW_MIN + NEXT_TARGET))
-          fi
-          # 上限保护：单 job 6 小时，留余量 → 最多睡 300 分钟
-          if [ "$SLEEP_MIN" -gt 300 ]; then
-            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟（>300）→ 不续命，等 schedule"
-            SLEEP_MIN=0
-          fi
-          if [ "$SLEEP_MIN" -gt 0 ]; then
-            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟 → 睡到点后 dispatch 自己"
-            echo "next_wake=$NEXT_NAME" >> "$GITHUB_OUTPUT"
-          else
-            echo "  本次不续命"
-            echo "next_wake=none" >> "$GITHUB_OUTPUT"
-          fi
-          echo "sleep_min=$SLEEP_MIN" >> "$GITHUB_OUTPUT"
 
           # 手动/外部触发（IS_MANUAL=1）：不要求落在窗口内，直接放行
           # slot 优先用 inputs.slot，否则用「最接近的已过档位」标注
@@ -423,13 +432,13 @@ jobs:
 
 
       - name: 自我续命（睡到下一次档位后 dispatch 自己）
-        if: always() && steps.gate.outputs.sleep_min != '' && steps.gate.outputs.sleep_min != '0'
+        if: always() && steps.chain.outputs.sleep_min != '' && steps.chain.outputs.sleep_min != '0'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -u
-          SLEEP_MIN="${{ steps.gate.outputs.sleep_min }}"
-          NEXT_WAKE="${{ steps.gate.outputs.next_wake }}"
+          SLEEP_MIN="${{ steps.chain.outputs.sleep_min }}"
+          NEXT_WAKE="${{ steps.chain.outputs.next_wake }}"
           echo "续命：睡 ${SLEEP_MIN} 分钟（目标 $NEXT_WAKE）"
           SECS=$((SLEEP_MIN * 60))
           # 分片睡，便于日志看到进度（每 5 分钟一行）
