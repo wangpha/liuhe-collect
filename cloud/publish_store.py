@@ -39,7 +39,7 @@ def key_for(artifact_name: str, period_dir: Path) -> str:
     return NAME_MAP.get(period_dir.parent.name, period_dir.parent.name or "unknown")
 
 
-def publish(incoming: Path, store: Path, log=print) -> dict:
+def publish(incoming: Path, store: Path, log=print, slot: str = "") -> dict:
     incoming = Path(incoming)
     store = Path(store)
     data = store / "data"
@@ -99,6 +99,45 @@ def publish(incoming: Path, store: Path, log=print) -> dict:
         manifest[key_dir.name] = {"periods": periods, "count": len(periods), "entries": entries}
 
     store.mkdir(parents=True, exist_ok=True)
+    # ⚠ 2026-11-24 根因修复（实测：今天五档只完成 1 档，其余 4 档永不补跑）：
+    #
+    #   门控（JobG）的自愈补跑原来只用「manifest.generatedAt ≥ 该档时间」
+    #   判断「该档跑过了」：
+    #       if [ "$LAST_MIN_OF_DAY" -ge "$sm" ]; then _ran_this=1; fi
+    #   但这个判据是**错的**：
+    #       · generatedAt 只是「最后一次 publish 的时间」，不记录「跑过哪几档」
+    #       · 实测 23:24 发布后 generatedAt=23:24
+    #         → 15:00/18:00/20:10/20:40 四档全被判「跑过了」→ 永远不补跑
+    #       · 今天真实结果：五档只完成 12:00 一档，其余四档数据永久缺失
+    #
+    #   修法：manifest 里新增 `completedSlots`（当天已完成的档位列表），
+    #         格式 {"date": "2026-11-24", "slots": ["12:00", ...]}
+    #         门控据此做**精确**的「该档跑过没」判断，而不是靠时间推导。
+    #   `slot` 参数由 publish job 从 gate.outputs.slot 传进来。
+    _prev_slots: dict = {}
+    try:
+        _prev_path = store / "manifest.json"
+        if _prev_path.exists():
+            _prev = json.loads(_prev_path.read_text(encoding="utf-8"))
+            if isinstance(_prev.get("completedSlots"), dict):
+                _prev_slots = dict(_prev["completedSlots"])
+    except Exception:  # noqa: BLE001 - 旧 manifest 读不出来就当空的
+        _prev_slots = {}
+
+    _today = time.strftime("%Y-%m-%d")
+    _slot_name = str(slot or "").strip()
+    # 只保留当天；跨天自动清零
+    if _prev_slots.get("date") != _today:
+        _prev_slots = {"date": _today, "slots": []}
+    _slot_list = list(_prev_slots.get("slots") or [])
+    if _slot_name and _slot_name not in ("manual", "busy", "none"):
+        # 去掉「(补跑)」后缀，统一成纯档位名
+        _clean = _slot_name.split("(")[0].strip()
+        if _clean and _clean not in _slot_list:
+            _slot_list.append(_clean)
+            _slot_list.sort()
+    _prev_slots["slots"] = _slot_list
+
     (store / "manifest.json").write_text(
         json.dumps(
             {
@@ -106,6 +145,8 @@ def publish(incoming: Path, store: Path, log=print) -> dict:
                 "layout": "one-tar-gz-per-period",
                 "note": "每期一个 .tar.gz；解包后为 21/22 个产物（不含 images/.cache）。"
                         "用 cloud/pack_period.py unpack 解包并校验 sha256。",
+                # ⚠ 当天已完成的档位（门控自愈补跑据此判断，不再用时间推导）
+                "completedSlots": _prev_slots,
                 "sources": manifest,
             },
             ensure_ascii=False,
@@ -113,7 +154,10 @@ def publish(incoming: Path, store: Path, log=print) -> dict:
         ),
         encoding="utf-8",
     )
-    log(f"manifest 已更新：{ {k: v['count'] for k, v in manifest.items()} }")
+    log(
+        f"manifest 已更新：{ {k: v['count'] for k, v in manifest.items()} }"
+        f"；今日已完成档位={_slot_list}"
+    )
     return {"published": published, "manifest": manifest, "ok": True}
 
 
@@ -199,13 +243,16 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--incoming", help="下载下来的 products-* 目录")
     ap.add_argument("--store", help="私有数据仓检出目录")
+    # ⚠ 2026-11-24：档位名（12:00/15:00/...），写进 manifest.completedSlots
+    #   门控的自愈补跑靠它精确判断「该档跑过没」，不再用时间推导。
+    ap.add_argument("--slot", default="", help="本次完成的档位名（如 12:00）")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
     if args.selftest:
         return selftest()
     if not args.incoming or not args.store:
         ap.error("需要 --incoming 与 --store")
-    res = publish(Path(args.incoming), Path(args.store))
+    res = publish(Path(args.incoming), Path(args.store), slot=args.slot)
     return 0 if res["ok"] else 1
 
 

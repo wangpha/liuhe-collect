@@ -165,7 +165,11 @@ jobs:
   gate:
     name: "JobG 定时闸门"
     runs-on: ubuntu-24.04
-    timeout-minutes: 3
+    # ⚠ 2026-11-24：自我续命需要 workflow_dispatch 权限
+    timeout-minutes: 12
+    permissions:
+      actions: write
+      contents: read
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
       slot: ${{ steps.gate.outputs.slot }}
@@ -287,6 +291,28 @@ jobs:
           fi
           echo "数据仓 manifest.generatedAt = ${LAST_TS:-（取不到）}"
 
+          # ------------------------------------------------------------------
+          # ⚠ 2026-11-24 根因修复（实测：今天五档只完成 1 档，其余 4 档永不补跑）
+          #   原来的判据是「manifest.generatedAt >= 该档时间 → 该档跑过了」，
+          #   但 generatedAt 只是「最后一次 publish 的时间」，不记录跑过哪几档：
+          #     23:24 发布后 generatedAt=23:24
+          #     → 15:00/18:00/20:10/20:40 四档全被判「跑过了」→ 永远不补跑
+          #   现在读 manifest.completedSlots（publish 写入的当天已完成档位列表），
+          #   做**精确**判断；旧 manifest 没有该字段时退回时间推导（向后兼容）。
+          # ------------------------------------------------------------------
+          DONE_SLOTS=""
+          DONE_DATE=""
+          if [ -n "${DATA_TOKEN:-}" ]; then
+            DONE_SLOTS=$(echo "$BODY" | python3 -c "import sys,json;d=json.load(sys.stdin) if sys.stdin else {};cs=(d.get('completedSlots') or {});print((cs.get('date') or ''),' ',' '.join(cs.get('slots') or [])) if isinstance(cs,dict) else '')" 2>/dev/null || true)
+          fi
+          if [ -n "$DONE_SLOTS" ]; then
+            DONE_DATE=$(echo "$DONE_SLOTS" | cut -d' ' -f1)
+            DONE_SLOTS=$(echo "$DONE_SLOTS" | cut -d' ' -f2-)
+            echo "manifest.completedSlots = date=${DONE_DATE:-（空）} slots=${DONE_SLOTS:-（空）}"
+          else
+            echo "manifest 无 completedSlots（旧格式）→ 退回时间推导"
+          fi
+
           # generatedAt 形如 2026-11-21T22:30:59+0000（UTC）→ 转北京时间
           LAST_MIN_OF_DAY=""
           LAST_YMD=""
@@ -311,11 +337,19 @@ jobs:
             if [ "$NOW_MIN" -le $((sm + WIN)) ]; then
               continue
             fi
-            # 该档是否已跑：manifest 是今天的 且 时间 >= 该档
-            _same_day=0
-            if [ -n "$LAST_YMD" ] && [ "$LAST_YMD" = "$NOW_YMD" ]; then _same_day=1; fi
+            # 该档是否已跑：
+            #   ① 优先用 completedSlots（精确）
+            #   ② 没有则退回「manifest 是今天的 且 时间 >= 该档」（旧格式兼容）
             _ran_this=0
-            if [ "$_same_day" = "1" ] && [ -n "$LAST_MIN_OF_DAY" ] && [ "$LAST_MIN_OF_DAY" -ge "$sm" ]; then _ran_this=1; fi
+            if [ -n "$DONE_DATE" ] && [ "$DONE_DATE" = "$NOW_YMD" ]; then
+              case " $DONE_SLOTS " in
+                *" $nm "*) _ran_this=1 ;;
+              esac
+            else
+              _same_day=0
+              if [ -n "$LAST_YMD" ] && [ "$LAST_YMD" = "$NOW_YMD" ]; then _same_day=1; fi
+              if [ "$_same_day" = "1" ] && [ -n "$LAST_MIN_OF_DAY" ] && [ "$LAST_MIN_OF_DAY" -ge "$sm" ]; then _ran_this=1; fi
+            fi
             if [ "$_ran_this" = "1" ]; then
               continue
             fi
@@ -332,6 +366,96 @@ jobs:
             echo "should_run=0" >> "$GITHUB_OUTPUT"
             echo "slot=none" >> "$GITHUB_OUTPUT"
           fi
+
+          # ==================================================================
+          # ⚠ 2026-11-24 根因修复（实测：今天 schedule 理论 288 次只触发 2 次，
+          #   alarm.yml 理论 8 次只触发 2 次 → 五档只完成 1 档）
+          #
+          #   GitHub 的 schedule 是 best-effort，高负载时延迟甚至丢弃。
+          #   原来三层保障（高频 cron / 自愈补跑 / 外部 cron）中，
+          #   前两层**都依赖 schedule 触发**，schedule 失效则全失效。
+          #
+          #   现在加第 4 层：**自我续命**。
+          #   本次 gate 跑完 → 算出「下一次该被触发的时刻」→
+          #   sleep 到那个时刻 → workflow_dispatch 一次自己。
+          #   这样只要**任意一次**触发成功，链条就能自我延续，
+          #   完全不依赖 schedule 的可信度，也不需要外部 cron 服务。
+          # ==================================================================
+          echo "---- 自我续命规划 ----"
+          # 目标时刻 = 下一个「档位 - 5 分钟」（留 5 分钟给 gate 自身耗时）
+          NEXT_TARGET=""
+          NEXT_NAME=""
+          i=0
+          for sm in $SLOTS_MIN; do
+            i=$((i+1))
+            nm=$(echo "$SLOTS_NAME" | cut -d' ' -f$i)
+            tgt=$((sm - 5))
+            if [ "$tgt" -gt "$NOW_MIN" ]; then
+              NEXT_TARGET=$tgt
+              NEXT_NAME=$nm
+              break
+            fi
+          done
+          # 今天的档都过了 → 目标 = 明天 12:00 前 5 分钟（即 715 分）
+          TOMORROW=0
+          if [ -z "$NEXT_TARGET" ]; then
+            NEXT_TARGET=715
+            NEXT_NAME="明天12:00"
+            TOMORROW=1
+          fi
+          SLEEP_MIN=$((NEXT_TARGET - NOW_MIN))
+          if [ "$TOMORROW" = "1" ]; then
+            SLEEP_MIN=$((1440 - NOW_MIN + NEXT_TARGET))
+          fi
+          # 上限保护：单 job 6 小时，留余量 → 最多睡 300 分钟
+          if [ "$SLEEP_MIN" -gt 300 ]; then
+            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟（>300）→ 不续命，等 schedule"
+            SLEEP_MIN=0
+          fi
+          if [ "$SLEEP_MIN" -gt 0 ]; then
+            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟 → 睡到点后 dispatch 自己"
+            echo "next_wake=$NEXT_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "  本次不续命"
+            echo "next_wake=none" >> "$GITHUB_OUTPUT"
+          fi
+          echo "sleep_min=$SLEEP_MIN" >> "$GITHUB_OUTPUT"
+
+      - name: 自我续命（睡到下一次档位后 dispatch 自己）
+        if: always() && steps.gate.outputs.sleep_min != '' && steps.gate.outputs.sleep_min != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          SLEEP_MIN="${{ steps.gate.outputs.sleep_min }}"
+          NEXT_WAKE="${{ steps.gate.outputs.next_wake }}"
+          echo "续命：睡 ${SLEEP_MIN} 分钟（目标 $NEXT_WAKE）"
+          SECS=$((SLEEP_MIN * 60))
+          # 分片睡，便于日志看到进度（每 5 分钟一行）
+          LEFT=$SECS
+          while [ "$LEFT" -gt 0 ]; do
+            CHUNK=300
+            if [ "$LEFT" -lt "$CHUNK" ]; then CHUNK=$LEFT; fi
+            sleep "$CHUNK"
+            LEFT=$((LEFT - CHUNK))
+            echo "  续命倒计时：还剩 $((LEFT / 60)) 分钟"
+          done
+          echo "→ 到点，dispatch crawl.yml"
+          for i in 1 2 3; do
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 \
+              -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/crawl.yml/dispatches" \
+              -d '{"ref":"main","inputs":{"source":"all"}}' || echo 000)
+            echo "  dispatch 返回 $CODE"
+            if [ "$CODE" = "204" ] || [ "$CODE" = "200" ]; then
+              echo "  ✅ 续命成功（下一次 gate 已排队）"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "  ⚠ 续命失败 3 次（不阻断本轮，schedule 仍是兜底）"
 
   # ---------------- JobP：决定跑哪些源 + 每源分片数 ----------------
   plan:
@@ -1876,7 +2000,12 @@ jobs:
         working-directory: repo
         run: |
           set -o pipefail
-          python cloud/publish_store.py --incoming work/incoming --store work/store 2>&1 | tee work/publish_store.log
+          # ⚠ 2026-11-24 根因修复：把本次完成的档位名传给 publish，
+          #   写进 manifest.completedSlots，门控的自愈补跑据此精确判断。
+          SLOT="${{ needs.gate.outputs.slot }}"
+          echo "本次档位 = ${SLOT:-（空）}"
+          python cloud/publish_store.py --incoming work/incoming --store work/store \
+            --slot "$SLOT" 2>&1 | tee work/publish_store.log
 
       - name: 保存日志到数据仓（保留最近 30 份）
         working-directory: repo
