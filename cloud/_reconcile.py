@@ -243,23 +243,47 @@ def independent_scan_tuku(
     当期仍在发布，采集结束后再扫必然多出新帖（实测 2026-11-16：云端产物 984 帖，
     2 小时后重扫 996 帖，差 12 帖全部是采集之后新发的）—— 这不是漏帖。
     不传 0 以外的值时退化为"全部统计"，但会在返回里标 `timeAligned=False`。
+
+    ⚠ 2026-11-25 性能修复（run 45497958888 实测：计划 tuku 的「独立扫描」占 137 秒）：
+      原来 `for sort_value in sorts:` **串行**跑 10 个排序，每个约 14 秒 → 140 秒。
+      实测各排序贡献：sort=1 拿到 973 帖、sort=0 补到 975、其余 8 个排序全部 +0
+      （但仍然必须跑 —— 某些期某个排序可能含其他排序没有的帖，这是防漏帖兜底）。
+      优化：**并发跑 10 个排序**（每个排序内部仍串行翻页，保持 empty_streak 语义），
+      每个排序维护局部 dict，最后统一合并 → 137 秒降到约 20-25 秒。
+      并发度由环境变量 `QODE_SCAN_SORTS_WORKERS` 控制，默认 8。
     """
+    import concurrent.futures
+    import os
+    import threading
+
     from core import scraper
 
     say = log or (lambda message: None)
     want = normalize_period(period)
     sorts = scraper.period_sorts("full")
-    say(f"[独立扫描/tuku] 期号 {want}，排序窗口 {sorts}")
+    try:
+        _workers = int(os.environ.get("QODE_SCAN_SORTS_WORKERS", "8") or 8)
+    except (TypeError, ValueError):
+        _workers = 8
+    _workers = max(1, min(_workers, len(sorts)))
+    say(f"[独立扫描/tuku] 期号 {want}，排序窗口 {sorts}（并发 {_workers}）")
 
+    _lock = threading.Lock()
     ids: dict[int, dict] = {}
     per_sort: dict[str, dict] = {}
-    pinned_skipped = 0
+    pinned_skipped_total = [0]
     late_ids: dict[int, float] = {}
     page_errors: list[dict] = []
-    for sort_value in sorts:
+
+    def _scan_one_sort(sort_value: int) -> None:
+        """扫一个排序的全部页；局部累加，末尾在锁内合并。"""
         t0 = time.time()
         streak = 0
         pages = 0
+        local_ids: dict[int, dict] = {}
+        local_late: dict[int, float] = {}
+        local_pinned = 0
+        local_errors: list[dict] = []
         for page in range(1, max_pages + 1):
             rows = _fetch_page_retry(
                 lambda p=page, s=sort_value: scraper.search_page(
@@ -272,7 +296,7 @@ def independent_scan_tuku(
                 ),
                 "tuku",
                 say,
-                page_errors,
+                local_errors,
                 {"sort": sort_value, "page": page},
             )
             if rows is None:
@@ -292,17 +316,17 @@ def independent_scan_tuku(
                 ts = _ts_tuku(raw)
                 if created_before and ts and ts > created_before:
                     if aid:
-                        late_ids[aid] = ts
+                        local_late[aid] = ts
                     continue
                 # 采集链路默认排除置顶帖（scraper.fetch_period_posts: top and not include_pinned）
                 # 对账必须用同一口径，否则会把置顶帖误判成"漏帖"
                 if raw.get("top") and not include_pinned:
-                    pinned_skipped += 1
+                    local_pinned += 1
                     continue
                 if not aid:
                     continue
                 pics = raw.get("pictureList") or []
-                ids.setdefault(
+                local_ids.setdefault(
                     aid,
                     {
                         "imgTotal": len(pics) if isinstance(pics, list) else 0,
@@ -314,12 +338,27 @@ def independent_scan_tuku(
             streak = 0 if hit else streak + 1
             if streak >= empty_streak_stop:
                 break
-        per_sort[f"sort{sort_value}"] = {
-            "pages": pages,
-            "elapsed": round(time.time() - t0, 2),
-        }
-        say(f"[独立扫描/tuku] sort={sort_value}: {pages} 页，累计本期 {len(ids)} 帖")
+        with _lock:
+            for k, v in local_ids.items():
+                ids.setdefault(k, v)
+            for k, v in local_late.items():
+                late_ids[k] = v
+            pinned_skipped_total[0] += local_pinned
+            page_errors.extend(local_errors)
+            per_sort[f"sort{sort_value}"] = {
+                "pages": pages,
+                "elapsed": round(time.time() - t0, 2),
+            }
+            say(f"[独立扫描/tuku] sort={sort_value}: {pages} 页，累计本期 {len(ids)} 帖")
 
+    if _workers <= 1:
+        for sv in sorts:
+            _scan_one_sort(sv)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_workers) as pool:
+            list(pool.map(_scan_one_sort, sorts))
+
+    pinned_skipped = pinned_skipped_total[0]
     if pinned_skipped:
         say(f"[独立扫描/tuku] 按采集口径排除置顶帖 {pinned_skipped} 次命中")
     if late_ids:
@@ -340,11 +379,6 @@ def independent_scan_tuku(
         "perSort": per_sort,
         "agree": True,          # 图库只有一套列表口径，无第二条判据
     }
-
-
-# ---------------------------------------------------------------------------
-# 防线 1：澳彩交流（aocai）独立扫描
-# ---------------------------------------------------------------------------
 def independent_scan_aocai(
     period: int,
     max_pages: int = 200,
