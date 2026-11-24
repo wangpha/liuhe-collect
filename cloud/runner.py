@@ -3374,9 +3374,19 @@ def do_merge_summary(args) -> int:
                     #   这样 797 - (786-4) = 15 全部落进 extra（合法新帖）。
                     planned_set -= _gone
                     target = len(planned_set) if planned_set else target
+                    # ⚠ 2026-11-24 第三次根因修复（run 45390849469 实测：
+                    #   「✅ 缺失的 11 帖中有 11 帖源站已删」之后仍报
+                    #   「❌ 汇总后 903 帖 != 可达上限 887 帖」）：
+                    #   `extra` 是在 L183 用**旧的** planned_set 算出来的，
+                    #   planned_set 变了之后没有重算 → extra 里缺了「本该新增的」那部分
+                    #   → 走不到「✅ 上限 + 新帖」分支 → 直接判失败。
+                    #   修法：基线变了就**重算** missing / extra，让三分类拿到一致的数据。
+                    missing = sorted(planned_set - got_ids)
+                    extra = sorted(got_ids - planned_set)
                     log(
                         f"[merge-summary]    已删帖从基线移除后：可达上限 {target} 帖"
-                        f"（原 {target + len(_gone)}）"
+                        f"（原 {target + len(_gone)}），"
+                        f"重算后 missing={len(missing)} / extra={len(extra)}"
                     )
                 else:
                     log(
