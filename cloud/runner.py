@@ -946,9 +946,20 @@ def do_plan(args) -> int:
                 _per_shard_s = float(_shard_to) * 0.75
                 _need = int(-(-_total_secs // max(1.0, _per_shard_s)))
                 _need = max(1, _need)
-                # 上限：GitHub Free 单次 20 并发。
-                # ⚠ 2026-11-24 修正：原来写死 dahkg 上限 14，但实测 aocai 0 图、
-                #   tuku 340 图，它们不需要那么多片。上限应 = 20 - 其他源占位。
+                # 上限：GitHub Free 单次 **20 个并发 job**，但三个源的分片 job
+                # 是**并行**跑的，所以每个源真正能用的上限 ≈ 20 - 其他源分片数。
+                #
+                # ⚠ 2026-11-24 根因修复（run 45401699704 实测：
+                #   「[plan] 片数够用：全片预估 42.0 分钟 ÷ 2 片 = 每片 21.0 分钟
+                #     （预算 18.8 分钟）」——21.0 > 18.8 却判「够用」）：
+                #   因为 `_cap = max(1, 20 - _others)`，而 `_others` 把
+                #   dahkg:18 + aocai:1 = 19 全算进来 → `_cap = 1`
+                #   → `_need = min(3, 1) = 1` → 1 < 2 → 走「够用」分支 → 每片 21 分钟必超时。
+                #
+                #   修正：**当且仅当**其他源的分片数与本源同时占用并发时才扣减；
+                #   并且至少给本源留 `_MIN_SELF_SLOTS`（默认 6）个名额，
+                #   否则小源永远拿不到足够片数（tuku 2 片 vs 实际需要 3-4 片）。
+                _MIN_SELF_SLOTS = 6
                 _others = 0
                 _raw_map = os.environ.get("SHARD_MAP", "").strip()
                 for _part in _raw_map.split(","):
@@ -959,7 +970,7 @@ def do_plan(args) -> int:
                                 _others += max(1, int(_v.strip()))
                             except ValueError:
                                 pass
-                _cap = max(1, 20 - _others)
+                _cap = max(_MIN_SELF_SLOTS, 20 - min(_others, 20 - _MIN_SELF_SLOTS))
                 _need = min(_need, _cap)
                 if _need > shard_n:
                     log(
