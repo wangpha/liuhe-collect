@@ -3272,6 +3272,22 @@ def do_merge_summary(args) -> int:
                     if not _post:
                         _fail_unf.append(int(_aid))
                         continue
+                    # ⚠ 2026-11-24 根因修复（run 45401699704 实测：merge 报
+                    #   「unfinished 补抓完成：成功 2/2 帖」但防线1 仍「缺 2 帖
+                    #   [1544888, 1544962]」）：
+                    #   实测 `_fetch_missing_row("dahkg", aid)` 返回的列表行只有
+                    #     {'tid': 1544888, 'title':..., 'userid':..., '_raw':...}
+                    #   **没有 articleId**；而 `scraper.build_post(row, None)` 只读
+                    #     `as_int(item.get("articleId"))` → 得到 0
+                    #   → 补抓的 post.articleId = 0 → `merged` 里多了个 id=0 的空壳
+                    #   → `got_ids` 虽有 _aid（L169 手动 add），但防线1 是用
+                    #     `merged` 重新算 got_ids 的 → 那 2 帖仍判「缺」。
+                    #   修法：补抓出来的 post 必须回填真实 articleId。
+                    try:
+                        if not _post.get("articleId"):
+                            _post["articleId"] = int(_aid)
+                    except Exception:  # noqa: BLE001 - 回填失败就走原来的失败分支
+                        pass
                     merged.append(_post)
                     got_ids.add(int(_aid))
                     _fixed_unf += 1
