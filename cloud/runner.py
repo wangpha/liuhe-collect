@@ -1121,11 +1121,17 @@ def do_plan(args) -> int:
                 groups.append([])
             while len(user_groups) < _matrix_shards:
                 user_groups.append([])
-        empty = [i for i, g in enumerate(user_groups) if not g]
+        # ⚠ 2026-11-25 三次修正（run 45643235540 实测：
+        #   补齐到 matrix 片数后，断言④又把「补齐出来的空片」判成失败：
+        #   「分片 [1..9] 是空片（0 个作者）。作者数 1 / 片数 1」）
+        #
+        #   补齐的空片是**设计如此**（它们会在 do_shard 里秒退），
+        #   断言④只应检查「收缩后实际使用的那些片」（前 shard_n 片）。
+        empty = [i for i, g in enumerate(user_groups[:shard_n]) if not g]
         if empty:
             raise SystemExit(
                 f"[plan] ❌ 断言④失败：分片 {empty} 是空片（0 个作者）。"
-                f"作者数 {len(user_weights)} / 片数 {shard_n}"
+                f"作者数 {len(user_weights)} / 实际使用片数 {shard_n}"
                 f"（自动收缩后仍为空 → 分组算法异常）。"
             )
         # 断言⑤：各片权重极差（>2 倍只告警，不失败 —— 墙钟还受 CPU 型号影响）
