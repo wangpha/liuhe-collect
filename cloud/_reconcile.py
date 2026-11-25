@@ -229,6 +229,70 @@ def _ts_dahkg(raw: dict) -> float:
 # ---------------------------------------------------------------------------
 # 防线 1：49图库（tuku）独立扫描
 # ---------------------------------------------------------------------------
+def _full_image_count(raw: dict) -> int:
+    """按**采集链路的完整口径**数一张列表行对应的正文图数。
+
+    `core/scraper.py::process_detail` 的图片来自三处（见其 add_image 调用）：
+      ① raw.pictureList / item.pictureList   → source="list.pictureList"
+      ② detail 的 pictureList                → source="detail.picture"
+      ③ description HTML 内嵌 <img>          → source="description.html"  ← 常被漏算
+    这里把它们合并去重后计数，与采集侧产出 `post["images"]` 的条数对齐。
+
+    为什么必须同口径：对账是「声明 vs 实际」，两边口径不同就永远对不上
+    （run 45609945403 实测 tuku：「声明 383 / 实际 406 / 不符 1」→ 合并失败）。
+
+    ⚠ 去重必须走采集侧的 `add_image`：
+      · 它会 `urljoin(BASE + "/", url)` 把相对路径补成绝对 URL
+      · 它跳过 `data:` 开头的内联图
+      自己拼一个 `set(url)` 会漏掉这些规范化 → 『u1』与『https://49208.com/u1』
+      被当成两张不同的图 → 计数偏大 → 又对不上。
+    """
+    try:
+        from core import scraper as _sc
+
+        images: list[dict] = []
+        seen: set[str] = set()
+
+        def _add(url, source: str) -> None:
+            _sc.add_image(images, seen, url, source=source)
+
+        # ① 列表行的 pictureList（与 images_from_picture_list 同逻辑，但走 add_image 统一去重）
+        pics = raw.get("pictureList")
+        if isinstance(pics, list):
+            for picture in pics:
+                if not isinstance(picture, dict):
+                    continue
+                _add(
+                    picture.get("pictureUrl")
+                    or picture.get("imageUrl")
+                    or picture.get("smallPictureUrl"),
+                    "pictureList",
+                )
+        # ② detail 里可能还有一层 pictureList
+        dpics = raw.get("detailPictureList")
+        if isinstance(dpics, list):
+            for picture in dpics:
+                if not isinstance(picture, dict):
+                    continue
+                _add(
+                    picture.get("pictureUrl")
+                    or picture.get("imageUrl")
+                    or picture.get("smallPictureUrl"),
+                    "detail.picture",
+                )
+        # ③ description HTML 内嵌图（html_to_text 的第二个返回值是 **str 列表**）
+        desc = raw.get("description") or raw.get("content") or ""
+        if desc:
+            _text, html_imgs = _sc.html_to_text(str(desc))
+            for image_url in html_imgs or []:
+                _add(image_url if isinstance(image_url, str) else "", "description.html")
+
+        return len(images)
+    except Exception:  # noqa: BLE001 - 对账口径兜底失败就退回列表行口径
+        pics = raw.get("pictureList") or []
+        return len(pics) if isinstance(pics, list) else 0
+
+
 def independent_scan_tuku(
     period: int,
     max_pages: int = 60,
@@ -329,7 +393,17 @@ def independent_scan_tuku(
                 local_ids.setdefault(
                     aid,
                     {
-                        "imgTotal": len(pics) if isinstance(pics, list) else 0,
+                        # ⚠ 2026-11-25 根因修复（run 45609945403 实测：
+                        #   tuku 防线2「声明 383 张 / 实际 406 张 / 不符帖子 1」→ 合并失败）：
+                        #   这里原来只数**列表行**的 `pictureList`，
+                        #   而采集链路 `core/scraper.py::process_detail` 的图片来自**三个来源**：
+                        #     ① raw.pictureList / item.pictureList （source="list.pictureList"）
+                        #     ② detail raw 的 pictureList        （source="detail.picture"）
+                        #     ③ description HTML 内嵌 <img>      （source="description.html"）← 最多！
+                        #   正文带 HTML 图的帖子 → 采集侧比列表侧多 N 张 →
+                        #   对账必然「实际 > 声明」→ 判漏图 → 整轮失败。
+                        #   修法：与采集完全同口径（三来源合并去重）。
+                        "imgTotal": _full_image_count(raw),
                         "senderId": _sender_of(raw, "tuku"),
                         "commentCount": int(raw.get("commentCount") or 0),
                         "thumbUpCount": int(raw.get("thumbUpCount") or 0),
