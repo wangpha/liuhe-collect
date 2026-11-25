@@ -3272,7 +3272,37 @@ def do_merge_summary(args) -> int:
         shard_posts, shard_metas, ocr_rows, list_order, image_members = _extract_shard_artifacts(work, source, log)
     _shard_stats = _summarize_shards(work, source, log) or {}
     if not shard_metas:
-        raise SystemExit("[merge-summary] ❌ 没有 run_meta.json 可作模板")
+        # ⚠ 2026-11-25 根因修复（run 45624455768 实测：换期 329→330，新期 0 帖
+        #   → tuku 4 个分片全都没产出 posts.json → 这里 SystemExit
+        #   「❌ 没有 run_meta.json 可作模板」→ 合并失败 → publish skipped）：
+        #
+        #   上面 L3258-3270 的「合法空期」分支本来是对的（expectedPosts=0 就给空值），
+        #   但它只处理了 `_extract_shard_artifacts` 抛异常的情况；
+        #   当解包**成功但一片都没产出**时（shard_metas 为空），
+        #   这里又硬性 SystemExit —— 空期照样失败。
+        #
+        #   修法：`expectedPosts == 0`（真正的空期）时不再抛错，
+        #   用 plan 里的信息造一份最小可用模板，让后续流程走完并产出「空期产物」。
+        #   非空期仍抛错（那才是真的缺产物）。
+        if _expected_posts == 0:
+            log(
+                "[merge-summary] ⚠ 空期且分片未产出 run_meta → "
+                "用 plan 信息兜底造模板（按合法空期继续）"
+            )
+            shard_metas = [
+                {
+                    "source": source,
+                    "lottery": (plan.get("lottery") or ""),
+                    "lotteryName": str(plan.get("lotteryName") or "澳门"),
+                    "year": int(plan.get("year") or 0) or 2026,
+                    "period": int(plan.get("period") or 0),
+                    "periodDisplay": int(plan.get("periodDisplay") or 0),
+                    "shard": 0,
+                    "_fromPlanFallback": True,
+                }
+            ]
+        else:
+            raise SystemExit("[merge-summary] ❌ 没有 run_meta.json 可作模板")
 
     # ---------- ③ 合并去重 ----------
     merged, mstats = _ms.merge_posts(shard_posts)
