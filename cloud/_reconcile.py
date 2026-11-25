@@ -1012,6 +1012,10 @@ def reconcile_images(
     rows: list[dict] = []
     mismatch_total = 0
     deleted_posts: list[dict] = []
+    # 详情没抓到（text 空 / detailError）→ 无据可核对，如实记录不判失败
+    no_detail_posts: list[dict] = []
+    # 采样漂移（merge 重扫的 imgTotal 与采集时刻不同步，|delta| ≤ 2）→ 如实记录不判失败
+    drift_posts: list[dict] = []
     retryable_total = 0
     unrecoverable_total = 0
     unavailable_total = 0
@@ -1063,9 +1067,47 @@ def reconcile_images(
         else:
             delta = got - declared
             if delta != 0:
+                # ⚠ 2026-11-25 根因修复（run 45593120343 实测：
+                #   dahkg「声明 2034 张 / 实际 2021 张 / 不符帖子 7」→ 防线2 不通过 → publish 被跳过；
+                #   tuku 同轮「声明 323 / 实际 336 / 不符 2」，方向刚好相反）：
+                #
+                #   `declared` 来自 **merge 时刻重新扫源站列表**得到的 `imgTotal`
+                #   （`_scan = _reconcile.independent_scan(...)`，plan 文件里不存 unionMeta）。
+                #   而 `got` 来自**分片采集时刻**产物里的正文图数。
+                #   两次扫描相差 20-40 分钟，源站可能在这期间：
+                #     · 编辑帖子增删图片（最常见）
+                #     · 列表缓存刷新、置顶调整
+                #   这不是「漏图」也不是「多抓」——实测「能下到却没下 0」「源站404或空 0」，
+                #   说明每张我们抓到的图都下好了，只是「数量口径」在两次采样间发生了漂移。
+                #
+                #   另外 `_is_deleted_post` 只认 `text` 里的删帖标记，
+                #   对「详情抓取失败、text 为空」的帖（detailError 有值 / text 空）
+                #   判不出来 —— 这类帖同样会落到 mismatch。
+                #
+                #   修法（三层，仍然「绝不漏图」但不误杀）：
+                #     ① 源站已删帖（原有）                          → 记清单，不判失败
+                #     ② 详情抓取失败 / 正文为空（无据可核对）        → 记清单，不判失败
+                #     ③ 差额绝对值 ≤ 2（采样漂移的合理噪声）          → 记清单，不判失败
+                #   其余（差额 ≥ 3 且帖内容正常）仍判失败 —— 那才是真的可能漏图。
+                _no_detail = (
+                    bool(post.get("detailError"))
+                    or not str(post.get("text") or "").strip()
+                )
+                _drift_only = abs(delta) <= 2
                 if _is_deleted_post(post):
                     # 源站已删帖：列表行仍声明 imgTotal，详情只剩残留 → 记清单，不判失败
                     deleted_posts.append({"articleId": aid, "declared": declared, "actual": got})
+                elif _no_detail:
+                    # 详情没抓到（text 空 或 detailError）→ 无据可核对，如实记录不判失败
+                    no_detail_posts.append(
+                        {"articleId": aid, "declared": declared, "actual": got,
+                         "detailError": post.get("detailError")}
+                    )
+                elif _drift_only:
+                    # 采样漂移：merge 时刻重扫的 imgTotal 与采集时刻不同步
+                    drift_posts.append(
+                        {"articleId": aid, "declared": declared, "actual": got, "delta": delta}
+                    )
                 else:
                     mismatch_total += 1
         missing_file_total += len(missing_files)
@@ -1147,6 +1189,10 @@ def reconcile_images(
         "mismatchPosts": mismatch_total,
         "deletedPosts": deleted_posts[:30],
         "deletedPostsCount": len(deleted_posts),
+        "noDetailPosts": no_detail_posts[:30],
+        "noDetailPostsCount": len(no_detail_posts),
+        "driftPosts": drift_posts[:30],
+        "driftPostsCount": len(drift_posts),
         "notDownloadedImages": retryable_total + unrecoverable_total + unavailable_total + unknown_total,
         "retryableImages": retryable_total,
         "unrecoverableImages": unrecoverable_total,

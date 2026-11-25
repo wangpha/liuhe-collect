@@ -4059,6 +4059,22 @@ def do_merge_summary(args) -> int:
             f"{_image_check.get('unrecoverableImages', 0)}  ← "
             f"{'通过' if _image_check.get('passed') else '不通过'}"
         )
+        # ⚠ 2026-11-25：把「不判失败」的三类也如实打出来，避免看起来像静默放过
+        _np = int(_image_check.get("noDetailPostsCount") or 0)
+        _dp = int(_image_check.get("deletedPostsCount") or 0)
+        _fp = int(_image_check.get("driftPostsCount") or 0)
+        if _np or _dp or _fp:
+            log(
+                f"[防线2] 不判失败的差额来源：源站已删帖 {_dp} 个 / "
+                f"详情未抓到（无据核对）{_np} 个 / 采样漂移（|差额|≤2）{_fp} 个"
+            )
+            for _lst, _label in (
+                (_image_check.get("deletedPosts") or [], "已删帖"),
+                (_image_check.get("noDetailPosts") or [], "无详情"),
+                (_image_check.get("driftPosts") or [], "采样漂移"),
+            ):
+                if _lst:
+                    log(f"[防线2]   {_label}样本（前5）：{_lst[:5]}")
         if _image_check.get("passed") is False:
             passed = False
     except Exception as _exc:  # noqa: BLE001
