@@ -154,8 +154,20 @@ env:
   PYTHONIOENCODING: "utf-8"
   # 每源分片数（唯一事实源）：plan 用它算「按累计图片数」的均衡分组，
   # shard job 的 matrix 用它取下标 —— 两处必须同源，否则分组与下标对不上。
-  SHARD_MAP: "dahkg:18,aocai:1,tuku:2"   # 2026-11-24：dahkg 15687 图 / aocai 0 图 / tuku 340 图 → 并发位让给 dahkg
-
+  SHARD_MAP: "dahkg:12,aocai:6,tuku:2"   # ⚠ 2026-11-25 根因修复（run 45574195277 实测：aocai 规划 6 片但只跑 1 片）：
+#   plan 内部能算出「aocai 需要 6 片」（全片预估 114.7 分钟 ÷ 每片 18.8 分钟），
+#   但 job matrix 用的是 SHARD_MAP 解析出来的 `aocai:1` → 只启动 1 个分片 job
+#   → 那 1 片收全量 603 帖 → 时间预算到点 → 2215 张图 not_processed
+#   → merge 防线2「能下到却没下 535 张」→ 整轮失败、publish skipped。
+#
+#   GitHub Actions 的 matrix 在 job 启动时固定，无法按 plan 运行时的重算结果动态展开，
+#   所以这里**给足上限**，让 plan 内部的重算结果能真正生效。
+#
+#   配比依据（GitHub Free 并发上限 20）：
+#     dahkg 18→12：实测每片只要 2-7 分钟（预算 16 分钟），降片数不影响完整性
+#     aocai  1→ 6：全片 114.7 分钟 ÷ 18.8 = 6.1 片
+#     tuku   2→ 2：实测每片 2-5 分钟，够
+#   合计 12+6+2 = 20 片 = 并发上限；plan 若判定用不到那么多，多余分片会「本片 0 帖 → 秒退」。
 jobs:
   # ---------------- JobG：定时闸门（高频 cron + 北京时间判断五档）----------------
   # ⚠ 2026-11-22 根因修复：GitHub 的 schedule 是 best effort，

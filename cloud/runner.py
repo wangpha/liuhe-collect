@@ -2797,6 +2797,27 @@ def do_shard(args) -> int:
         f"（{'plan 均衡分组' if planned_ids is not None else f'id % {shard_total} == {shard_index}'}）"
     )
 
+    # ⚠ 2026-11-25 根因修复（配合 SHARD_MAP 扩容）：
+    #
+    #   把 SHARD_MAP 调大（aocai 1→6、dahkg 18→12 等）后，plan 内部可能判定
+    #   「本轮用不到这么多片」（例如 aocai 图很少时只需要 2 片），
+    #   此时多出来的那些分片会拿到 `planned_ids = 空集` 且 `mine_users = 空集`
+    #   → `_slice_items` 取到 `picked = []` → 模块会报
+    #     「列表里没有 X 期的帖子」并让整个分片 job 失败 → 连累 merge。
+    #
+    #   正确行为：**空片应当立即成功退出**（它本来就没活干），
+    #   而不是失败。判据：plan 明确给出了本片分组、且该分组确实是空的。
+    #
+    #   注意：`planned_ids is None` 时不能退出（那是「plan 没给分组」的退化路径，
+    #   此时应按 id 取模照常处理）。
+    if planned_ids is not None and not planned_ids and not mine_users:
+        log(
+            f"[shard] ✅ 本片 {shard_index}/{shard_total} 无帖可处理"
+            f"（plan 判定的均衡分组里本片为空）→ 立即成功退出，不产出 posts.json"
+        )
+        log("=" * 70)
+        return 0
+
     # ---- A'' 预算：命中率 → 有效秒/次 → 转移决策（2026-11-19 用户裁决）----
     # 容量用「job timeout × 0.9」而不是软预算：分片能吃满 22.5 分钟（旧逻辑只有 18 分钟），
     # 且 22.5 < 25 的硬超时 → 永不被 kill（被 kill 时 unfinished 就写不出来了）。
