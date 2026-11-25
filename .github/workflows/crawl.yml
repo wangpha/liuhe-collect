@@ -672,23 +672,6 @@ jobs:
           repository: wangpha/liuhe-data
           token: ${{ secrets.LIUHE_DATA_TOKEN }}
           path: repo/work/store
-      # ⚠ 2026-11-24 根因修复（数据完整性专项）：`work/state` 从来没有跨轮持久化。
-      #   实测：merge 落盘的 imagecost_<源>.json / user_shard_<源>.json /
-      #   snapshot_<期>.json / hashsnapshot_<源>_<期>.json 只作为 `run-<源>-<run_id>`
-      #   artifact 上传（保留 90 天后过期），**下一轮 plan 从不下载它** →
-      #   ① imagecost 永远缺失 → plan 的 `use_hist` 分支永远不生效
-      #      → 每轮都退回 prefetch 估算 → 估算偏差（tuku 实测 957 vs 实际 1126 图）
-      #   ② user_shard 缺失 → 用户分片归属每轮漂移 → 缓存命中率不稳定
-      #   ③ snapshot 缺失 → 防线3「新增内容不漏」没有基线，每轮都是「首次」
-      #   修法：用 actions/cache 持久化 work/state（key 带 run_id，restore-keys 复用上一轮）。
-      - name: 恢复跨轮状态（imagecost / user_shard / snapshot）
-        uses: actions/cache@v4
-        with:
-          path: repo/work/state
-          key: state-${{ matrix.source }}-${{ github.run_id }}
-          restore-keys: |
-            state-${{ matrix.source }}-
-            state-
       - name: 安装依赖
         working-directory: repo
         run: |
@@ -700,6 +683,37 @@ jobs:
           set -o pipefail
           python -m cloud.runner --plan --source "${{ matrix.source }}" \
             --work work --state work/store/state --period "${{ github.event.inputs.period || '0' }}" --slot "${{ needs.gate.outputs.slot || github.event.inputs.slot || '' }}" 2>&1 | tee "work/plan_${{ matrix.source }}.log"
+      # ⚠ 2026-11-25 根因修复（state 跨轮断层的最后一环）：
+      #
+      #   `do_plan` 在 L1070 调 `_save_user_shard(state_dir, ...)` 写
+      #   `work/store/state/user_shard_<源>.json`（用户→分片台账）。
+      #   但 **prepare job 里从来没有保存它** —— 只有 merge 有「保存跨轮状态」。
+      #   → prepare 结束目录销毁 → 下一轮 plan 的 `_load_user_shard` 读到空 →
+      #     `prev_map` 为空 → `_group_by_user(..., prev={})` 每轮**重新分组** →
+      #     同一作者换片 → 各分片 OCR 缓存池（key 带片号）对不上 →
+      #     命中率参差（实测 run 45515121184：分片#0 93.7% vs 分片#5 13.6%）。
+      #
+      #   同一轮内 prepare 有 3 个源并行（matrix），所以 key 要带源名。
+      - name: 保存跨轮状态（用户→分片台账，供下一轮 plan 稳定分组）
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: repo/work/store/state
+          key: state-${{ matrix.source }}-${{ github.run_id }}
+          restore-keys: |
+            state-${{ matrix.source }}-
+            state-
+      # 同时上传 artifact，供 publish 提交进数据仓（长期保存）
+      - name: 上传跨轮状态（供 publish 提交进数据仓）
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-plan-${{ matrix.source }}-${{ github.run_id }}
+          path: repo/work/store/state
+          if-no-files-found: warn
+          retention-days: 1
+
       - name: 失败/超时诊断（写 Step Summary）
         if: failure()
         run: |
@@ -1564,11 +1578,25 @@ jobs:
         if: always()
         uses: actions/cache@v4
         with:
-          path: repo/work/state
-          key: state-dahkg-${{ github.run_id }}
+          path: repo/work/store/state
+          key: state-merge-dahkg-${{ github.run_id }}
           restore-keys: |
+            state-merge-dahkg-
+            state-merge-
             state-dahkg-
             state-
+      # ⚠ 2026-11-25：把 state 也上传成 artifact，供 publish 合并提交进数据仓。
+      #   （actions/cache 只服务于「下一轮的 plan」，不跨 job 传递；
+      #     publish 是独立 job，必须靠 artifact 拿到这些文件。）
+      - name: 上传跨轮状态（供 publish 提交进数据仓）
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-dahkg-${{ github.run_id }}
+          path: repo/work/store/state
+          if-no-files-found: warn
+          retention-days: 1
       - name: 上传产物（数据类，不含图片）
         if: always()
         uses: actions/upload-artifact@v4
@@ -1733,11 +1761,25 @@ jobs:
         if: always()
         uses: actions/cache@v4
         with:
-          path: repo/work/state
-          key: state-aocai-${{ github.run_id }}
+          path: repo/work/store/state
+          key: state-merge-aocai-${{ github.run_id }}
           restore-keys: |
+            state-merge-aocai-
+            state-merge-
             state-aocai-
             state-
+      # ⚠ 2026-11-25：把 state 也上传成 artifact，供 publish 合并提交进数据仓。
+      #   （actions/cache 只服务于「下一轮的 plan」，不跨 job 传递；
+      #     publish 是独立 job，必须靠 artifact 拿到这些文件。）
+      - name: 上传跨轮状态（供 publish 提交进数据仓）
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-aocai-${{ github.run_id }}
+          path: repo/work/store/state
+          if-no-files-found: warn
+          retention-days: 1
       - name: 上传产物（数据类，不含图片）
         if: always()
         uses: actions/upload-artifact@v4
@@ -1902,11 +1944,25 @@ jobs:
         if: always()
         uses: actions/cache@v4
         with:
-          path: repo/work/state
-          key: state-tuku-${{ github.run_id }}
+          path: repo/work/store/state
+          key: state-merge-tuku-${{ github.run_id }}
           restore-keys: |
+            state-merge-tuku-
+            state-merge-
             state-tuku-
             state-
+      # ⚠ 2026-11-25：把 state 也上传成 artifact，供 publish 合并提交进数据仓。
+      #   （actions/cache 只服务于「下一轮的 plan」，不跨 job 传递；
+      #     publish 是独立 job，必须靠 artifact 拿到这些文件。）
+      - name: 上传跨轮状态（供 publish 提交进数据仓）
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-tuku-${{ github.run_id }}
+          path: repo/work/store/state
+          if-no-files-found: warn
+          retention-days: 1
       - name: 上传产物（数据类，不含图片）
         if: always()
         uses: actions/upload-artifact@v4
@@ -2091,6 +2147,38 @@ jobs:
           repository: wangpha/liuhe-data
           token: ${{ secrets.LIUHE_DATA_TOKEN }}
           path: repo/work/store
+      # ⚠ 2026-11-25 根因修复（state 跨 job 断层）：
+      #
+      #   `--state work/store/state` 的写入发生在 **prepare / merge 各自的 job 里**，
+      #   job 结束目录就销毁了。publish 是**另一个 job**，它重新检出的数据仓里
+      #   没有这些文件 → `git add -A` 提交不上去 →
+      #   数据仓 state/ 里至今只有一个 2026-11-17 手工 bootstrap 的
+      #   imagecost_dahkg.json（_period=321，8 天未更新）。
+      #
+      #   后果（实测 run 45515121184 的 18 个分片）：
+      #     · user_shard_<源>.json 永远空 → plan 的 prev_map 为空 →
+      #       每轮重新分组 → 作者换片 → 各片 OCR 缓存池对不上 →
+      #       命中率参差：分片#0 93.7%，分片#5 只有 13.6%（新识别 408/472）
+      #     · imagecost_<源>.json 永远停在 321 期 → 分片成本估算失真
+      #
+      #   修法：publish 里把各源 merge 上传的 state 下载回来，覆盖到 work/store/state，
+      #        这样后面的 `git add -A` 就能把它们提交进数据仓。
+      - name: 下载各源跨轮状态（imagecost / user_shard / snapshot）
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          # ⚠ 2026-11-25：只取 merge 上传的 state-<源>-<run_id> 三个。
+          #   显式列举，不用通配 —— 因为 `state-[a-z]*-` 也会匹配到
+          #   `state-plan-<源>-`（prepare 上传的），两者都含 user_shard_<源>.json
+          #   但内容不同，merge-multiple 会互相覆盖。
+          #   merge 在 prepare 之后跑，且它的 --state 会读到 prepare 写的台账再回写，
+          #   所以 merge 那份是最新的。
+          pattern: state-{dahkg,aocai,tuku}-${{ github.run_id }}
+          path: repo/work/store/state
+          merge-multiple: true
+        # 没有 artifact 时不算失败（首轮或 merge 未产出）
+
       - name: 下载各源产物
         uses: actions/download-artifact@v4
         with:
