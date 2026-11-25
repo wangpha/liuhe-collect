@@ -732,7 +732,20 @@ def do_plan(args) -> int:
     state_dir = _resolve_state_dir(args, work)
 
     prefetched: dict = {}
-    if shard_n > 1 and union_ids and not getattr(args, "no_prefetch", False):
+    # ⚠ 2026-11-25 根因修复（run 45564254644 实测：aocai 单分片跑不完）：
+    #   原条件 `shard_n > 1` 把**单分片源**排除在预抓之外 →
+    #   aocai 的 SHARD_MAP 是 `aocai:1` → 永远不预抓 → 只能走 `det-area-estimated`
+    #   （按 det 像素面积估）→ 实测估算严重偏低：
+    #       plan 算「每片预计 OCR 9.2 分钟」
+    #       分片实跑 854 秒 = 14.2 分钟（偏低 52%）
+    #   → 时间预算到点 → 13 批 2215 张图标 not_processed →
+    #   merge 防线2 判「能下到却没下 535 张」→ 整轮失败、publish skipped。
+    #
+    #   这是死循环：1 片 → 不预抓 → 估算偏低 → 判 1 片 → 还是跑不完。
+    #
+    #   修法：**单分片也要预抓**（预抓本来就抓完整详情+回复，是零额外请求），
+    #   拿到真实权重后才能正确判断「是否需要扩容」。
+    if union_ids and not getattr(args, "no_prefetch", False):
         try:
             prefetched = _prefetch_post_costs(
                 source, union_ids, log, workers=max(8, int(getattr(args, "workers", 0) or 4) * 4)
@@ -935,7 +948,19 @@ def do_plan(args) -> int:
         #     正确的做法：直接用它 —— 它本身就是「全片总耗时估算（秒 × 10）」，
         #     这比「图数 × 单图秒」更准（已含回复分页、下载、面积分档）。
         _total_weight = sum(max(1, weights.get(aid, 1)) for aid in union_ids)
-        if _total_weight > 0 and shard_n > 1:
+        # ⚠ 2026-11-25 根因修复（run 45564254644 实测：aocai 分片时间预算不足）：
+        #   原条件 `shard_n > 1` 把**单分片源**排除在「按耗时重算片数」之外 ——
+        #   aocai 的 SHARD_MAP 是 `aocai:1`，永远只有 1 片 → 永远不扩容 →
+        #   本轮它 552 帖 / 5513 张图全压在一片里，分片日志实测：
+        #       [媒体] ⏱ 时间预算不足（已用 854s / 预算 1000s，本批均值 213s）
+        #              → 停止处理剩余 13 批，交 unfinished 下一轮补
+        #       [媒体] ⚠ 13 批因时间预算不足未处理，已把 2215 张图标为 not_processed
+        #   → merge 的防线2 判「能下到却没下 535 张」→ 整轮失败、publish 被 skip。
+        #
+        #   修法：**单分片也要能扩容**。条件是 `shard_n >= 1`。
+        #   （`_MIN_SELF_SLOTS=6` 仍保证本源最少能拿到 6 个并发位，
+        #     `_cap = max(6, 20 - min(其他源, 14))` → aocai 最多可扩到 6 片。）
+        if _total_weight > 0 and shard_n >= 1:
             try:
                 from . import budget as _budget
 
