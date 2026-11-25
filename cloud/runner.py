@@ -3301,8 +3301,13 @@ def do_merge_summary(args) -> int:
         #   这时应走与 expectedPosts==0 相同的「合法空期」路径，
         #   而不是硬失败（硬失败会让 publish 被跳过，一条数据都进不了库）。
         #
-        #   判据：plan 的 expectedPosts < 分片数（每片平均不到 1 帖）视为「极小期」。
-        if _expected_posts < max(1, int(plan.get("shards") and len(plan.get("shards") or []) or 1)):
+        #   判据：plan 的 expectedPosts 很小（≤ 分片数，即每片平均不到 1 帖）视为「极小期」。
+        #   ⚠ 2026-11-25 二次修正：原写 `< max(1, 分片数)`，
+        #     实测 run 45637190168：作者数 1 → 自动收缩到 1 片 → expectedPosts=1
+        #     → `1 < max(1,1)` = `1 < 1` = False → 走 else 硬失败。
+        #     改成 `<=`：`1 <= 1` = True → 正确进入极小期分支。
+        _shard_cnt_now = len(plan.get("shards") or []) or 1
+        if _expected_posts <= max(1, _shard_cnt_now):
             log(
                 f"[merge-summary] ⚠ 本期 plan 预期仅 {_expected_posts} 帖"
                 f"（< 分片数）→ 按**极小期**处理，缺产物包时不硬失败"
