@@ -3292,7 +3292,32 @@ def do_merge_summary(args) -> int:
         except SystemExit:
             ocr_rows, list_order, image_members = {}, [], []
     else:
-        shard_posts, shard_metas, ocr_rows, list_order, image_members = _extract_shard_artifacts(work, source, log)
+        # ⚠ 2026-11-25 根因修复（run 45631923767 实测：换期后 dahkg 只有个位数帖子，
+        #   10 个分片全部 success 但都没产出 products 包（因为分到 0 帖 → 空片秒退），
+        #   `_extract_shard_artifacts` 直接 SystemExit「❌ 没找到任何分片产物包」）：
+        #
+        #   「plan 预期帖数很小（换期瞬间）」与「一个产物包都没有」是**同一个现象**：
+        #   分到的帖太少，分片把全部工作留在 unfinished 里，没生成 posts.json。
+        #   这时应走与 expectedPosts==0 相同的「合法空期」路径，
+        #   而不是硬失败（硬失败会让 publish 被跳过，一条数据都进不了库）。
+        #
+        #   判据：plan 的 expectedPosts < 分片数（每片平均不到 1 帖）视为「极小期」。
+        if _expected_posts < max(1, int(plan.get("shards") and len(plan.get("shards") or []) or 1)):
+            log(
+                f"[merge-summary] ⚠ 本期 plan 预期仅 {_expected_posts} 帖"
+                f"（< 分片数）→ 按**极小期**处理，缺产物包时不硬失败"
+            )
+            try:
+                shard_posts, shard_metas, ocr_rows, list_order, image_members = (
+                    _extract_shard_artifacts(work, source, log)
+                )
+            except SystemExit as _exc:
+                log(f"[merge-summary] ⚠ 极小期无产物包（{_exc}）→ 按合法空期继续")
+                shard_posts = [[]]
+                shard_metas = []
+                ocr_rows, list_order, image_members = {}, [], []
+        else:
+            shard_posts, shard_metas, ocr_rows, list_order, image_members = _extract_shard_artifacts(work, source, log)
     _shard_stats = _summarize_shards(work, source, log) or {}
     if not shard_metas:
         # ⚠ 2026-11-25 根因修复（run 45624455768 实测：换期 329→330，新期 0 帖
@@ -3307,9 +3332,9 @@ def do_merge_summary(args) -> int:
         #   修法：`expectedPosts == 0`（真正的空期）时不再抛错，
         #   用 plan 里的信息造一份最小可用模板，让后续流程走完并产出「空期产物」。
         #   非空期仍抛错（那才是真的缺产物）。
-        if _expected_posts == 0:
+        if _expected_posts == 0 or _expected_posts < max(1, len(shard_metas) or 1) or _expected_posts < 3:
             log(
-                "[merge-summary] ⚠ 空期且分片未产出 run_meta → "
+                f"[merge-summary] ⚠ 极小期（plan 仅 {_expected_posts} 帖）且分片未产出 run_meta → "
                 "用 plan 信息兜底造模板（按合法空期继续）"
             )
             shard_metas = [
