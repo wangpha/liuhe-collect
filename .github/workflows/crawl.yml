@@ -154,20 +154,19 @@ env:
   PYTHONIOENCODING: "utf-8"
   # 每源分片数（唯一事实源）：plan 用它算「按累计图片数」的均衡分组，
   # shard job 的 matrix 用它取下标 —— 两处必须同源，否则分组与下标对不上。
-  SHARD_MAP: "dahkg:12,aocai:6,tuku:2"   # ⚠ 2026-11-25 根因修复（run 45574195277 实测：aocai 规划 6 片但只跑 1 片）：
-#   plan 内部能算出「aocai 需要 6 片」（全片预估 114.7 分钟 ÷ 每片 18.8 分钟），
-#   但 job matrix 用的是 SHARD_MAP 解析出来的 `aocai:1` → 只启动 1 个分片 job
-#   → 那 1 片收全量 603 帖 → 时间预算到点 → 2215 张图 not_processed
-#   → merge 防线2「能下到却没下 535 张」→ 整轮失败、publish skipped。
+  SHARD_MAP: "dahkg:10,aocai:6,tuku:4"   # ⚠ 2026-11-25 配比历经三轮实测调整（GitHub Free 并发上限 20）：
+#   ① aocai 1→6：plan 算出需 6 片（全片 114.7 分钟 ÷ 18.8），但 matrix 只给 1 片
+#      → 那 1 片收全量 → 时间预算到点 → 2215 张图 not_processed → 防线2 失败。
+#   ② dahkg 18→12→10：实测每片只要 2-7 分钟（预算 16 分钟），降片数不影响完整性。
+#   ③ tuku 2→4（run 45599292786 实测：tuku#1 负责 890 帖 / 8900 图，
+#      详情 30 秒抓完，但 OCR 1091 张就要 ~982 秒，1200 秒预算到点时还在 OCR
+#      → SIGTERM → 没走到 write_outputs → products 包里只有 latest.json
+#      → merge「读 1 片，共 863 帖」→ 863 != 1753 → 失败 → publish skipped）
 #
-#   GitHub Actions 的 matrix 在 job 启动时固定，无法按 plan 运行时的重算结果动态展开，
-#   所以这里**给足上限**，让 plan 内部的重算结果能真正生效。
+#   GitHub Actions 的 matrix 在 job 启动时固定，无法按 plan 重算结果动态展开，
+#   所以这里给足上限；plan 若判定用不到那么多片，多余分片会「本片 0 帖 → 秒退」。
 #
-#   配比依据（GitHub Free 并发上限 20）：
-#     dahkg 18→12：实测每片只要 2-7 分钟（预算 16 分钟），降片数不影响完整性
-#     aocai  1→ 6：全片 114.7 分钟 ÷ 18.8 = 6.1 片
-#     tuku   2→ 2：实测每片 2-5 分钟，够
-#   合计 12+6+2 = 20 片 = 并发上限；plan 若判定用不到那么多，多余分片会「本片 0 帖 → 秒退」。
+#   当前：dahkg:10 + aocai:6 + tuku:4 = 20 片 = 并发上限
 jobs:
   # ---------------- JobG：定时闸门（高频 cron + 北京时间判断五档）----------------
   # ⚠ 2026-11-22 根因修复：GitHub 的 schedule 是 best effort，
@@ -914,12 +913,12 @@ jobs:
           #   有时 job timeout 先 SIGKILL → handler 没机会跑（日志里连「收到 SIGTERM」都没有）。
           #   改成 1200s(20 分) → 1+20 = 21 分 < 25 分，稳。分片容量 15 分钟（USABLE_RATIO=0.6）也够。
           # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
-          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1200"
+          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1380"
           # ⚠ 2026-11-24 根因修复（run 45316538853 实测：分片预估 7.3 分钟实际 21.5 分钟
           #   → 7 个分片 SIGTERM）：media 阶段（下载+重试+OCR）必须有时间预算，
           #   否则 522 把某批下载拖到 8 分钟，循环仍会继续跑后续批次直到 SIGTERM。
           #   1000 秒 = SHARD_TO(1200) - 200（留打包/上传/收尾）
-          export LIUHE_MEDIA_BUDGET_SEC=1000
+          export LIUHE_MEDIA_BUDGET_SEC=1150
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
@@ -1145,12 +1144,12 @@ jobs:
           #   有时 job timeout 先 SIGKILL → handler 没机会跑（日志里连「收到 SIGTERM」都没有）。
           #   改成 1200s(20 分) → 1+20 = 21 分 < 25 分，稳。分片容量 15 分钟（USABLE_RATIO=0.6）也够。
           # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
-          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1200"
+          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1380"
           # ⚠ 2026-11-24 根因修复（run 45316538853 实测：分片预估 7.3 分钟实际 21.5 分钟
           #   → 7 个分片 SIGTERM）：media 阶段（下载+重试+OCR）必须有时间预算，
           #   否则 522 把某批下载拖到 8 分钟，循环仍会继续跑后续批次直到 SIGTERM。
           #   1000 秒 = SHARD_TO(1200) - 200（留打包/上传/收尾）
-          export LIUHE_MEDIA_BUDGET_SEC=1000
+          export LIUHE_MEDIA_BUDGET_SEC=1150
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
@@ -1376,12 +1375,12 @@ jobs:
           #   有时 job timeout 先 SIGKILL → handler 没机会跑（日志里连「收到 SIGTERM」都没有）。
           #   改成 1200s(20 分) → 1+20 = 21 分 < 25 分，稳。分片容量 15 分钟（USABLE_RATIO=0.6）也够。
           # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
-          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1200"
+          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 1380"
           # ⚠ 2026-11-24 根因修复（run 45316538853 实测：分片预估 7.3 分钟实际 21.5 分钟
           #   → 7 个分片 SIGTERM）：media 阶段（下载+重试+OCR）必须有时间预算，
           #   否则 522 把某批下载拖到 8 分钟，循环仍会继续跑后续批次直到 SIGTERM。
           #   1000 秒 = SHARD_TO(1200) - 200（留打包/上传/收尾）
-          export LIUHE_MEDIA_BUDGET_SEC=1000
+          export LIUHE_MEDIA_BUDGET_SEC=1150
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
