@@ -700,9 +700,15 @@ jobs:
         with:
           path: repo/work/store/state
           key: state-${{ matrix.source }}-${{ github.run_id }}
+          # ⚠ 2026-11-25 根因修复（缓存串源）：
+          #   restore-keys 最后一行的兜底 `state-` 会匹配**任意源**的缓存 ——
+          #   实测 dahkg 的 prepare 恢复到了 tuku 的缓存：
+          #       Cache hit for restore-key: state-tuku-45525441201
+          #       Cache restored from key: state-tuku-45525441201
+          #   → 三个源互相污染 user_shard / imagecost / current_period。
+          #   修法：只保留本源的 restore-key，去掉跨源兜底。
           restore-keys: |
             state-${{ matrix.source }}-
-            state-
       # 同时上传 artifact，供 publish 提交进数据仓（长期保存）
       - name: 上传跨轮状态（供 publish 提交进数据仓）
         if: always()
@@ -1580,11 +1586,10 @@ jobs:
         with:
           path: repo/work/store/state
           key: state-merge-dahkg-${{ github.run_id }}
+          # 只按本源的链回退：先本轮 merge，再本源 prepare，绝不跨源
           restore-keys: |
             state-merge-dahkg-
-            state-merge-
             state-dahkg-
-            state-
       # ⚠ 2026-11-25：把 state 也上传成 artifact，供 publish 合并提交进数据仓。
       #   （actions/cache 只服务于「下一轮的 plan」，不跨 job 传递；
       #     publish 是独立 job，必须靠 artifact 拿到这些文件。）
@@ -1763,11 +1768,10 @@ jobs:
         with:
           path: repo/work/store/state
           key: state-merge-aocai-${{ github.run_id }}
+          # 只按本源的链回退：先本轮 merge，再本源 prepare，绝不跨源
           restore-keys: |
             state-merge-aocai-
-            state-merge-
             state-aocai-
-            state-
       # ⚠ 2026-11-25：把 state 也上传成 artifact，供 publish 合并提交进数据仓。
       #   （actions/cache 只服务于「下一轮的 plan」，不跨 job 传递；
       #     publish 是独立 job，必须靠 artifact 拿到这些文件。）
@@ -1946,11 +1950,10 @@ jobs:
         with:
           path: repo/work/store/state
           key: state-merge-tuku-${{ github.run_id }}
+          # 只按本源的链回退：先本轮 merge，再本源 prepare，绝不跨源
           restore-keys: |
             state-merge-tuku-
-            state-merge-
             state-tuku-
-            state-
       # ⚠ 2026-11-25：把 state 也上传成 artifact，供 publish 合并提交进数据仓。
       #   （actions/cache 只服务于「下一轮的 plan」，不跨 job 传递；
       #     publish 是独立 job，必须靠 artifact 拿到这些文件。）
