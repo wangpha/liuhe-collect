@@ -3540,15 +3540,48 @@ def do_merge_summary(args) -> int:
                 n_not_downloaded += 1
                 continue
             rows = ocr_rows.get(key)
-            if rows is None:
+            # ⚠ 2026-11-25 根因修复（run 45505217582 实测：dahkg fullText 缺失率 32.2%
+            #   > 30% → 拒绝交付；但产物里这些图的 ocr.fullText **是有值的**）：
+            #
+            #   实测数据（帖 1546014 的 13 张评论图）：
+            #     downloadStatus = 'downloaded'
+            #     ocr.cacheHit   = True
+            #     ocr.status     = 'explicit' 或 'decorative'
+            #     ocr.rows       = 0            ← 结构化行为空
+            #     ocr.fullText   = '328期：...' ← 但文字是有的
+            #   而 cache 包里根本没有这些图的文件（因为 rows 为空时未写缓存）。
+            #
+            #   原判据 `if rows is None: n_nocache += 1` 把「缓存文件不存在」
+            #   一律算作「OCR 缺结果」→ 装饰图/纯标题图（天然无结构化行）
+            #   全部被算成缺失 → 缺失率虚高到 32.2% → 整轮判失败。
+            #
+            #   正确判据（三层，等价于「这张图有没有被 OCR 处理过」）：
+            #     ① 有缓存 rows（非空 list）         → 有结果，按 rows 还原
+            #     ② 缓存 rows 是空 list              → 有结果（图里确实无文字行）
+            #     ③ 无缓存条目，但产物 ocr 里已有
+            #        fullText 或 status 且非 not_processed → 有结果（分片已识别）
+            #     ④ 其余（真无缓存 + 产物也无结果）  → 才算 nocache
+            if rows is not None:
+                rc = ocr.get("rowCount")
+                if isinstance(rc, int) and 0 < rc < len(rows):
+                    n_trunc += 1
+                    rc_mismatch += 1
+                ocr["fullText"] = _ms.build_fulltext_from_rows(rows, rc, ocr.get("rowIndexes"))
+                n_ft += 1
+                continue
+            # 无缓存条目 → 看产物自己有没有识别结果
+            _st = str(ocr.get("status") or "").strip()
+            _has_ft = bool(str(ocr.get("fullText") or "").strip())
+            _has_rows = bool(ocr.get("rows"))
+            if _st in ("not_processed", "budget_skipped"):
                 n_nocache += 1
                 continue
-            rc = ocr.get("rowCount")
-            if isinstance(rc, int) and 0 < rc < len(rows):
-                n_trunc += 1
-                rc_mismatch += 1
-            ocr["fullText"] = _ms.build_fulltext_from_rows(rows, rc, ocr.get("rowIndexes"))
-            n_ft += 1
+            if _has_ft or _has_rows or _st:
+                # 分片已经识别过（可能纯粹无结构化行）→ 算有结果，不重复还原
+                n_ft += 1
+                continue
+            n_nocache += 1
+            continue
     # ⚠ 2026-11-23 根因修复（审查发现 L2：这段原来零断言，静默失败）
     #   历史 run 实录「fullText 还原 0 张（无缓存 413 张）」仍然继续跑 →
     #   图内文字（OCR 结果）全丢，产物照样交付，属于内容缺失。
