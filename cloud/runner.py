@@ -1091,15 +1091,36 @@ def do_plan(args) -> int:
         #        matrix 仍按 SHARD_MAP 启动 N 个分片 job，
         #        多出来的那些分片会拿到 `planned_ids=空集` →
         #        do_shard 里「本片 0 帖 → 立即成功退出」（2026-11-25 已加）。
+        # ⚠ 2026-11-25 二次修正（run 45640139038 实测：收缩到 1 片后
+        #   `shardPlan.n=1`，而 matrix 仍按 SHARD_MAP 传 `--shards 10`
+        #   → 分片发现「plan 的分片数 1 与本次 --shards 10 不一致」→ 退回 id 取模
+        #   → 又因为没有分组依据而被模块拒绝执行
+        #   →「[shard] ❌ 没有分片依据…拒绝用『按 ID 取模』兜底」
+        #   → 10 个分片全部空转 → merge 0 帖 → 判漏帖 [1545946]）。
+        #
+        #   关键：`shardPlan.n` **必须等于 matrix 的 --shards（= SHARD_MAP 的值）**，
+        #   否则 do_shard 的 `int(shard_plan.get("n")) == shard_total` 判据不成立，
+        #   直接退化成 id 取模并拒绝执行。
+        #
+        #   正确做法：收缩只影响「用户分组」，**不改 shardPlan.n**；
+        #   多余分片的 groups 为空列表 → 分片拿到 planned_ids=空集 →
+        #   do_shard 的「本片 0 帖 → 立即成功退出」生效。
+        _matrix_shards = shard_n          # matrix 实际会启动的分片数（= SHARD_MAP）
         if len(user_weights) < shard_n:
-            _old_n = shard_n
             shard_n = max(1, len(user_weights))
             user_groups, user_to_shard = _group_by_user(user_weights, shard_n, prev=prev_map)
             groups = [[aid for uid in g for aid in aid_by_user.get(uid, [])] for g in user_groups]
             log(
-                f"[plan] ⚠ 作者数 {len(user_weights)} < 片数 {_old_n} → "
-                f"自动收缩到 {shard_n} 片（换期瞬间帖子极少属正常现象）"
+                f"[plan] ⚠ 作者数 {len(user_weights)} < 片数 {_matrix_shards} → "
+                f"用户分组收缩到 {shard_n} 片（换期瞬间帖子极少属正常现象）；"
+                f"shardPlan.n 仍按 {_matrix_shards}（与 matrix 的 --shards 对齐，"
+                f"多余分片会是空片并秒退）"
             )
+            # 把 groups 补齐到 _matrix_shards 个（多出来的为空列表）
+            while len(groups) < _matrix_shards:
+                groups.append([])
+            while len(user_groups) < _matrix_shards:
+                user_groups.append([])
         empty = [i for i, g in enumerate(user_groups) if not g]
         if empty:
             raise SystemExit(
@@ -1136,7 +1157,10 @@ def do_plan(args) -> int:
         sizes = [len(g) for g in groups]
         imgs = [sum(max(1, weights.get(a, 0)) for a in g) for g in groups]
         plan["shardPlan"] = {
-            "n": shard_n,
+            # ⚠ 必须是 matrix 的 --shards（SHARD_MAP），不能用收缩后的 shard_n：
+            #   do_shard 判据是 `int(shard_plan.get("n")) == shard_total`，
+            #   不等就会退化成 id 取模并拒绝执行。
+            "n": _matrix_shards,
             "mode": mode,
             "weightSource": weight_src,
             "groups": {str(i): g for i, g in enumerate(groups)},
