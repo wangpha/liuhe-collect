@@ -1586,10 +1586,18 @@ jobs:
         with:
           path: repo/work/store/state
           key: state-merge-dahkg-${{ github.run_id }}
-          # 只按本源的链回退：先本轮 merge，再本源 prepare，绝不跨源
+          # ⚠ 2026-11-25 根因修复（顺序错导致 merge 读不到本轮 prepare 的台账）：
+          #   restore-keys 是**按顺序前缀匹配、取最新**。原来的顺序是
+          #       state-merge-<源>-   ← 上轮 merge 保存的（上一轮就已污染）
+          #       state-<源>-         ← 本轮 prepare 保存的（含 user_shard_<源>.json）
+          #   结果 merge 优先命中了上轮的 state-merge- 缓存 →
+          #   实测 merge dahkg 的 artifact 里没有 user_shard_dahkg.json，
+          #   只有上一轮遗留的 aocai/tuku 文件。
+          #   修法：**本轮 prepare 的 state 优先**。
           restore-keys: |
-            state-merge-dahkg-
+            state-dahkg-${{ github.run_id }}
             state-dahkg-
+            state-merge-dahkg-
       # ⚠ 2026-11-25：把 state 也上传成 artifact，供 publish 合并提交进数据仓。
       #   （actions/cache 只服务于「下一轮的 plan」，不跨 job 传递；
       #     publish 是独立 job，必须靠 artifact 拿到这些文件。）
@@ -1768,10 +1776,18 @@ jobs:
         with:
           path: repo/work/store/state
           key: state-merge-aocai-${{ github.run_id }}
-          # 只按本源的链回退：先本轮 merge，再本源 prepare，绝不跨源
+          # ⚠ 2026-11-25 根因修复（顺序错导致 merge 读不到本轮 prepare 的台账）：
+          #   restore-keys 是**按顺序前缀匹配、取最新**。原来的顺序是
+          #       state-merge-<源>-   ← 上轮 merge 保存的（上一轮就已污染）
+          #       state-<源>-         ← 本轮 prepare 保存的（含 user_shard_<源>.json）
+          #   结果 merge 优先命中了上轮的 state-merge- 缓存 →
+          #   实测 merge dahkg 的 artifact 里没有 user_shard_dahkg.json，
+          #   只有上一轮遗留的 aocai/tuku 文件。
+          #   修法：**本轮 prepare 的 state 优先**。
           restore-keys: |
-            state-merge-aocai-
+            state-aocai-${{ github.run_id }}
             state-aocai-
+            state-merge-aocai-
       # ⚠ 2026-11-25：把 state 也上传成 artifact，供 publish 合并提交进数据仓。
       #   （actions/cache 只服务于「下一轮的 plan」，不跨 job 传递；
       #     publish 是独立 job，必须靠 artifact 拿到这些文件。）
@@ -1950,10 +1966,18 @@ jobs:
         with:
           path: repo/work/store/state
           key: state-merge-tuku-${{ github.run_id }}
-          # 只按本源的链回退：先本轮 merge，再本源 prepare，绝不跨源
+          # ⚠ 2026-11-25 根因修复（顺序错导致 merge 读不到本轮 prepare 的台账）：
+          #   restore-keys 是**按顺序前缀匹配、取最新**。原来的顺序是
+          #       state-merge-<源>-   ← 上轮 merge 保存的（上一轮就已污染）
+          #       state-<源>-         ← 本轮 prepare 保存的（含 user_shard_<源>.json）
+          #   结果 merge 优先命中了上轮的 state-merge- 缓存 →
+          #   实测 merge dahkg 的 artifact 里没有 user_shard_dahkg.json，
+          #   只有上一轮遗留的 aocai/tuku 文件。
+          #   修法：**本轮 prepare 的 state 优先**。
           restore-keys: |
-            state-merge-tuku-
+            state-tuku-${{ github.run_id }}
             state-tuku-
+            state-merge-tuku-
       # ⚠ 2026-11-25：把 state 也上传成 artifact，供 publish 合并提交进数据仓。
       #   （actions/cache 只服务于「下一轮的 plan」，不跨 job 传递；
       #     publish 是独立 job，必须靠 artifact 拿到这些文件。）
