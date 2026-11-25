@@ -28,6 +28,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pack_period import pack, unpack  # noqa: E402
 
+# 档位判定统一用北京时间（与 workflow 里 `TZ=Asia/Shanghai date` 完全一致）。
+# 不能依赖 runner 的本地时区：GitHub Actions 是 UTC，
+# 而 `TZ=Asia/Shanghai` 在 gate 里被显式指定。
+_BEIJING_TZ = None
+try:
+    from datetime import timedelta, timezone as _timezone
+
+    _BEIJING_TZ = _timezone(timedelta(hours=8), name="Asia/Shanghai")
+except Exception:  # noqa: BLE001 - 极端情况下退回 time
+    _BEIJING_TZ = None
+
+
+def _beijing_ymd() -> str:
+    """今天（北京时区）的 YYYY-MM-DD，与 gate 的 `TZ=Asia/Shanghai date '+%Y-%m-%d'` 对齐。"""
+    if _BEIJING_TZ is not None:
+        from datetime import datetime
+
+        return datetime.now(_BEIJING_TZ).strftime("%Y-%m-%d")
+    # 兜底：老版本 Python 无 tzinfo 支持时用 UTC+8 手工换算
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
+
 NAME_MAP = {"大港澳": "dahkg", "澳彩交流": "aocai", "tuku": "tuku", "澳门": "tuku"}
 ARCHIVE_SUFFIX = ".tar.gz"
 
@@ -124,7 +145,14 @@ def publish(incoming: Path, store: Path, log=print, slot: str = "") -> dict:
     except Exception:  # noqa: BLE001 - 旧 manifest 读不出来就当空的
         _prev_slots = {}
 
-    _today = time.strftime("%Y-%m-%d")
+    # ⚠ 2026-11-25 根因修复（时区错配）：gate 用 `TZ=Asia/Shanghai date` 取「北京日期」，
+    #   而这里原来用 `time.strftime("%Y-%m-%d")` 取的是 **runner 的本地时区（UTC）**。
+    #   → 北京时间 00:00-08:00 期间发布时，UTC 还在前一天，
+    #     `completedSlots.date` 会比 gate 的 NOW_YMD 早一天 → 自愈补跑判据永不匹配。
+    #   实测：`completedSlots = {"date":"2026-11-24","slots":["20:40"]}`
+    #        那次是 UTC 17:30 发布 = 北京 25 日 01:30 → 日期确实错了。
+    #   修法：统一用北京时区取日期（与 gate 完全一致）。
+    _today = _beijing_ymd()
     _slot_name = str(slot or "").strip()
     # 只保留当天；跨天自动清零
     if _prev_slots.get("date") != _today:
