@@ -387,7 +387,36 @@ jobs:
           REPO_SLUG="${GITHUB_REPOSITORY:-}"
           SELF_RUN="${GITHUB_RUN_ID:-0}"
           if [ -n "$GH_TOKEN" ] && [ -n "$REPO_SLUG" ]; then
-            RUNNING=$(curl -sS --max-time 30               -H "Authorization: Bearer $GH_TOKEN"               -H "Accept: application/vnd.github+json"               "https://api.github.com/repos/$REPO_SLUG/actions/workflows/crawl.yml/runs?status=in_progress&per_page=20"               2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);s=[r for r in (d.get('workflow_runs') or []) if str(r.get('id'))!='$SELF_RUN'];print(len(s))" 2>/dev/null || echo "-1")
+            # ⚠ 2026-11-25 根因修复（JobC 的 dispatch 会被自己父 run 拦下）：
+            #   原判据「有任何 in_progress 的 crawl.yml run 就跳过」——
+            #   但 JobC 续命链的设计是：在**父 run** 里 sleep 到点 → dispatch 新 run。
+            #   父 run 在 JobC 睡着期间一直是 in_progress（最长 355 分钟），
+            #   于是新 run 的 gate 永远看到「有 1 个 run 在跑」→ 永远跳过 →
+            #   续命链等于自杀。实测：run 45532525276 的 gate 就是这样被
+            #   父 run 45530679714 拦掉，全部 job skipped。
+            #
+            #   修法：判定「在跑」时**排除只挂着 JobC 的 run** ——
+            #   只有 JobC 在跑 = 业务已结束、只是在等下一个档位，不该算并发。
+            #   判据：该 run 里存在非 JobC 的 job 且 status != completed。
+            RUNNING=0
+            for _rid in $(curl -sS --max-time 30 \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/$REPO_SLUG/actions/workflows/crawl.yml/runs?status=in_progress&per_page=20" \
+                  2>/dev/null \
+                | python3 -c "import sys,json;d=json.load(sys.stdin);print(chr(10).join(str(r.get('id')) for r in (d.get('workflow_runs') or []) if str(r.get('id'))!='$SELF_RUN'))" 2>/dev/null || true); do
+              # 这个 run 里有没有「非 JobC 且未完成」的 job？
+              _ACT=$(curl -sS --max-time 30 \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/$REPO_SLUG/actions/runs/$_rid/jobs?per_page=100" \
+                  2>/dev/null \
+                | python3 -c "import sys,json;d=json.load(sys.stdin);js=d.get('jobs') or [];print(sum(1 for j in js if j.get('name')!='JobC 续命链' and j.get('status')!='completed'))" 2>/dev/null || echo "0")
+              echo "  run $_rid: 非 JobC 的未完成 job 数 = ${_ACT:-0}"
+              if [ "${_ACT:-0}" -gt 0 ] 2>/dev/null; then
+                RUNNING=$((RUNNING + 1))
+              fi
+            done
             echo "在跑的 run 数（除自己）= ${RUNNING}"
             if [ "$RUNNING" = "-1" ]; then
               echo "⚠ 查不到在跑 run（API 失败），按无并发继续"
