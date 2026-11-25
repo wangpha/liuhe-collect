@@ -1440,6 +1440,19 @@ def _rebalance_groups(
 
     # 找超大用户
     huge_users = {u for u, w in user_weights.items() if int(w) > threshold}
+    # ⚠ 2026-11-25 诊断：把判定过程写进日志（用户要求「每个流程都要能查」）
+    try:
+        _lw = [int(w) for w in (loads or [])]
+        _sum_lw = sum(_lw)
+        print(
+            f"[plan] 再平衡判定：{len(groups)} 片，负载 {_lw}"
+            f"（合计 {_sum_lw}），平均 {avg_shard:.0f}，阈值 {threshold:.0f}，"
+            f"超大用户 {len(huge_users)} 个"
+            + (f"：{[{u: user_weights[u]} for u in list(huge_users)[:3]]}" if huge_users else ""),
+            flush=True,
+        )
+    except Exception:  # noqa: BLE001 - 诊断不能影响主流程
+        pass
     if not huge_users:
         return groups
 
@@ -1472,6 +1485,19 @@ def _rebalance_groups(
     return groups
 
 
+def _stable_hash_index(uid: str, n: int) -> int:
+    """把用户 ID 稳定地映射到 [0, n) —— 同一 uid + 同一 n 永远得到同一个片号。
+
+    用 sha1 而不是 Python 内置 hash（后者对 str 加了随机盐，跨进程不稳定）。
+    """
+    if n <= 1:
+        return 0
+    import hashlib
+
+    digest = hashlib.sha1(str(uid).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % n
+
+
 def _group_by_user(
     user_weights: dict[str, int], n: int, prev: dict[str, int] | None = None,
     split_ratio: float = 2.0,
@@ -1497,10 +1523,48 @@ def _group_by_user(
     loads = [0] * n
     mapping: dict[str, int] = {}
 
-    # 1) 老用户先就位（**永不搬动** —— 这是缓存能不能命中的关键）
+    # ⚠ 2026-11-25 根因修复（run 45571519993 实测：aocai 扩到 6 片后严重失衡 19.78 倍）：
+    #
+    #   台账里的分片号是**上一轮**的。上一轮 aocai 只有 1 片（SHARD_MAP=aocai:1），
+    #   所以 `prev` 里所有用户的 idx 都是 0。
+    #   这一轮扩容到 6 片后，老用户**全部**沿用 idx=0 →
+    #       片0 = 53375 权重（89 分钟）
+    #       片1-5 = 2715（4.5 分钟）各
+    #   → 极差 19.78 倍 → 片0 必然超时 → 数据缺失。
+    #
+    #   同理「缩容」也有问题：prev 里的 idx 可能 >= n，那些用户会被当成新用户重新分配
+    #   （这个行为本身可以接受，但会让缓存全落空）。
+    #
+    #   修法：**当上一轮的分片数与本轮不同时，老用户的台账号不可直接沿用** ——
+    #     ① 缩容（prev_max >= n）：超界的按新用户处理（保持原行为）
+    #     ② 扩容（prev_max + 1 < n）：旧号只覆盖了前 prev_max+1 片，
+    #        把它**线性映射**到新片号空间，让老用户分散到全部片，
+    #        而不是全部堆在片 0。
+    #   （只有「片数不变」时才真正「永不搬动」，缓存命中率不受影响。）
+    _prev_max = -1
+    for _uid, _idx in prev.items():
+        if isinstance(_idx, int) and _idx > _prev_max:
+            _prev_max = _idx
+    _scale = None
+    if _prev_max >= 0 and (_prev_max + 1) < n:
+        # 扩容：把 [0, _prev_max] 线性映射到 [0, n-1]
+        _old_n = _prev_max + 1
+        _scale = n / _old_n
+        if _old_n > 1 or n > 1:
+            # 单分片 → 多分片时，全部 idx=0，需要按用户哈希打散
+            pass
+
+    # 1) 老用户先就位（**片数不变时永不搬动** —— 这是缓存能不能命中的关键）
     for uid, w in user_weights.items():
         idx = prev.get(uid)
         if isinstance(idx, int) and 0 <= idx < n:
+            if _scale is not None:
+                # 扩容：单分片时 idx 全是 0，用「用户稳定哈希」打散到各片；
+                # 多分片扩容时按线性映射。
+                if _prev_max == 0:
+                    idx = _stable_hash_index(uid, n)
+                else:
+                    idx = min(n - 1, int(idx * _scale))
             groups[idx].append(uid)
             loads[idx] += max(1, int(w))
             mapping[uid] = idx
