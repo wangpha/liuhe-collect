@@ -1077,12 +1077,35 @@ def do_plan(args) -> int:
             f"[plan] ✅ 用户分组三条断言通过：{len(user_weights)} 个作者 → {shard_n} 片，"
             f"{len(union_ids)} 帖全部覆盖、无重复"
         )
-        # 断言④：不允许空片（空片会让模块报「没有该期帖子」→ 分片失败）
+        # 断言④：不允许「跨轮稳定分组」产生空片（空片会让模块报「没有该期帖子」→ 分片失败）
+        # ⚠ 2026-11-25 根因修复（run 45628896987 实测：换期 329→330 后只有 1 帖 1 作者，
+        #   但 SHARD_MAP 固定 10 片 → 断言④直接 SystemExit → 三个源全部 merge 失败 →
+        #   publish skipped）：
+        #
+        #   换期瞬间（新期刚开）源站可能只有 0-2 帖，作者数远小于分片数。
+        #   这时「有片是空的」是**物理必然**，不是分组算法出错，
+        #   更不该让整轮失败（否则每天换期的第一档都拿不到数据）。
+        #
+        #   修法：作者数 < 片数时**自动收缩到 作者数 片**（至少 1 片），
+        #        并在日志里明说收缩原因。
+        #        matrix 仍按 SHARD_MAP 启动 N 个分片 job，
+        #        多出来的那些分片会拿到 `planned_ids=空集` →
+        #        do_shard 里「本片 0 帖 → 立即成功退出」（2026-11-25 已加）。
+        if len(user_weights) < shard_n:
+            _old_n = shard_n
+            shard_n = max(1, len(user_weights))
+            user_groups, user_to_shard = _group_by_user(user_weights, shard_n, prev=prev_map)
+            groups = [[aid for uid in g for aid in aid_by_user.get(uid, [])] for g in user_groups]
+            log(
+                f"[plan] ⚠ 作者数 {len(user_weights)} < 片数 {_old_n} → "
+                f"自动收缩到 {shard_n} 片（换期瞬间帖子极少属正常现象）"
+            )
         empty = [i for i, g in enumerate(user_groups) if not g]
         if empty:
             raise SystemExit(
                 f"[plan] ❌ 断言④失败：分片 {empty} 是空片（0 个作者）。"
-                f"作者数 {len(user_weights)} < 片数 {shard_n}，请减少分片数或检查作者字段。"
+                f"作者数 {len(user_weights)} / 片数 {shard_n}"
+                f"（自动收缩后仍为空 → 分组算法异常）。"
             )
         # 断言⑤：各片权重极差（>2 倍只告警，不失败 —— 墙钟还受 CPU 型号影响）
         shard_w = [sum(max(1, weights.get(a, 1)) for a in g) for g in groups]
