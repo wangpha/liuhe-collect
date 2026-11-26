@@ -731,6 +731,51 @@ def do_plan(args) -> int:
     union_meta = scan.get("unionMeta") or {}
     state_dir = _resolve_state_dir(args, work)
 
+    # ⚠ 2026-11-26 根因修复（跨档闭环断开）：
+    #
+    #   分片因时间预算截断时，会把剩余帖子 id 写进
+    #   `work/unfinished/unfinished_<源>_<片>.json`。这个文件只随当前 run 的
+    #   artifact 到 merge，**run 一结束就没了**。
+    #
+    #   后果：merge 只能补抓「列表行」（无正文/无图片/无 OCR → 空壳帖），
+    #        下一档 plan 完全不知道这些帖没做完 → 帖子永久残缺。
+    #        用户要求的「依次类推到第 5 档、识别过的不重来、数据不遗漏」
+    #        在这条链上是断的。
+    #
+    #   修法：引入跨档待办台账 `state/pending_<源>.json`（cloud/_pending.py）：
+    #     · merge 结束时把「本档未完成」写进台账
+    #     · 本档 plan 开跑前读回来，**强制并入 union_ids** 一起处理
+    #     · 处理完由 merge 从台账里删掉；连续 3 档做不完 → 标 stuck 并如实上报
+    #
+    #   注意：并入的是「本期」的待办。换期后台账自动作废（新期是新帖）。
+    _pending_ids: list[int] = []
+    _pending_stuck: list[int] = []
+    try:
+        from . import _pending as _pend
+
+        _cur_period = int(plan.get("period") or 0)
+        _pending_ids = _pend.pending_ids(state_dir, source, _cur_period)
+        _pending_stuck = _pend.stuck_ids(state_dir, source, _cur_period)
+    except Exception as exc:  # noqa: BLE001 - 台账坏了不能拖垮 plan
+        log(f"[plan] ⚠ 读待补台账失败（忽略）：{type(exc).__name__}: {exc}")
+
+    if _pending_ids:
+        _before = len(union_ids)
+        _extra = [a for a in _pending_ids if a not in set(union_ids)]
+        if _extra:
+            union_ids = list(union_ids) + list(_extra)
+            log(
+                f"[plan] ⚠ 上档遗留 {len(_pending_ids)} 帖待补"
+                f"（其中 {len(_extra)} 帖不在本轮扫描清单里）→ 已并入本档强制处理"
+            )
+        else:
+            log(f"[plan] ⚠ 上档遗留 {len(_pending_ids)} 帖待补 → 已在本轮扫描清单里，本轮处理")
+    if _pending_stuck:
+        log(
+            f"[plan] ⚠ {len(_pending_stuck)} 帖已连续 3 档未完成 → "
+            f"标记 stuck（不再无限重试，但保留在台账里如实上报）：{_pending_stuck[:8]}"
+        )
+
     prefetched: dict = {}
     # ⚠ 2026-11-25 根因修复（run 45564254644 实测：aocai 单分片跑不完）：
     #   原条件 `shard_n > 1` 把**单分片源**排除在预抓之外 →
@@ -996,6 +1041,25 @@ def do_plan(args) -> int:
                             except ValueError:
                                 pass
                 _cap = max(_MIN_SELF_SLOTS, 20 - min(_others, 20 - _MIN_SELF_SLOTS))
+                # ⚠ 2026-11-26 根因修复（同类坑第二次：e6604a5 修过一次「收缩后
+                #   shardPlan.n 与 matrix 不一致」，这次是「扩容后同样不一致」）：
+                #
+                #   matrix 会启动几个分片 job，**只由 SHARD_MAP 决定**（JobP 解析后
+                #   传给 --shards）。plan 内部把 shard_n 改大/改小，都改变不了 job 数量。
+                #
+                #   但这里 `_cap` 只按「20 - 其他源」算，没考虑本源 SHARD_MAP 给多少：
+                #     当前 SHARD_MAP = dahkg:8, aocai:5, tuku:4
+                #     aocai 的 _cap = max(6, 20 - min(12, 14)) = 8 > 5
+                #     → 若 plan 算出需要 8 片，shard_n 变 8 → shardPlan.n = 8
+                #     → do_shard 判据 `shardPlan.n == --shards` 不成立（8 ≠ 5）
+                #     → 「plan 的分片数 8 与本次 --shards 5 不一致，退回 id 取模」
+                #     → 又因没有分组依据被模块拒绝 → **全部分片空转 → merge 0 帖**
+                #       （这正是 run 45640139038 踩过的同一个坑）
+                #
+                #   根治：`_cap` 必须再与 SHARD_MAP 给本源的片数取 min ——
+                #   plan 只能在「矩阵实际会启动的片数」以内做均衡，不能超出去。
+                _matrix_shard_cap = _shard_count_for(source)
+                _cap = min(_cap, _matrix_shard_cap)
                 _need = min(_need, _cap)
                 if _need > shard_n:
                     log(
@@ -1105,7 +1169,15 @@ def do_plan(args) -> int:
         #   正确做法：收缩只影响「用户分组」，**不改 shardPlan.n**；
         #   多余分片的 groups 为空列表 → 分片拿到 planned_ids=空集 →
         #   do_shard 的「本片 0 帖 → 立即成功退出」生效。
-        _matrix_shards = shard_n          # matrix 实际会启动的分片数（= SHARD_MAP）
+        # ⚠ 2026-11-26 三次修正：`_matrix_shards` 必须**直接**从 SHARD_MAP 取真值，
+        #   不能写 `= shard_n` —— 因为走到这里 shard_n 可能已经被「扩容」逻辑改名
+        #   （L1026 `shard_n = _need`）。虽然 L1017 加了 `_cap = min(_cap, SHARD_MAP)`
+        #   保证 _need ≤ SHARD_MAP，但 shard_n 仍是「plan 内部想用几片」，
+        #   而 _matrix_shards 要的是「matrix 实际会启动几个分片 job」。
+        #   两者语义不同，必须分别取源：
+        #     · _matrix_shards ← SHARD_MAP（决定 job 数量，也决定 shardPlan.n）
+        #     · shard_n        ← plan 内部均衡用的片数（≤ _matrix_shards）
+        _matrix_shards = _shard_count_for(source)
         if len(user_weights) < shard_n:
             shard_n = max(1, len(user_weights))
             user_groups, user_to_shard = _group_by_user(user_weights, shard_n, prev=prev_map)
@@ -4059,6 +4131,46 @@ def do_merge_summary(args) -> int:
             )
         else:
             log(f"[merge] 分片遗留 {len(_unfinished_ids)} 帖，产物已全部包含 → 无缺口")
+
+    # ⚠ 2026-11-26 根因修复（跨档闭环断开 —— 与 do_plan 里「读待补台账」成对）：
+    #
+    #   上面只是「如实报告」，但 unfinished 文件本身**随 run 一起销毁**，
+    #   下一档 plan 无从知道哪些帖还没做完 → 永久残缺。
+    #
+    #   现在把本档结果并进跨档台账 state/pending_<源>.json：
+    #     · 已完整处理完的（在 merged 里）→ 从台账删除
+    #     · 仍缺的（在 unfinished 里但不在 merged）→ tries += 1，连续 3 次标 stuck
+    #   下一档 plan 会 load 这个台账并强制并入 union_ids。
+    try:
+        from . import _pending as _pend2
+
+        _done_ids = {int(p_.get("articleId") or 0) for p_ in merged if p_.get("articleId")}
+        _fail_map = {int(x): "unfinished" for x in (_unfinished_ids or [])}
+        # 台账里已有、且本档既没在产物里、也不在 unfinished 里的（异常消失）也要保留
+        _led = _pend2.load_pending(_resolve_state_dir(args, work), source,
+                                   int(plan.get("period") or 0))
+        for _k in (_led.get("items") or {}):
+            try:
+                _aid = int(_k)
+            except (TypeError, ValueError):
+                continue
+            if _aid not in _done_ids and _aid not in _fail_map:
+                _fail_map[_aid] = (str((_led["items"].get(_k) or {}).get("reason") or "carried"))
+        _led_out = _pend2.merge_pending(
+            _resolve_state_dir(args, work), source, int(plan.get("period") or 0),
+            newly_failed=_fail_map, done_ids=_done_ids,
+        )
+        if _led_out.get("count"):
+            log(
+                f"[merge] 📌 跨档待补台账已更新：{_led_out['count']} 帖待下档继续"
+                f"（其中 {_led_out.get('stuckCount', 0)} 帖已连续 3 档未完成）"
+            )
+            if _led_out.get("stuckCount"):
+                log(f"[merge] ⚠ stuck 帖（不再无限重试，如实上报）：{_pend2.stuck_ids(_resolve_state_dir(args, work), source, int(plan.get('period') or 0))[:8]}")
+        else:
+            log("[merge] 📌 跨档待补台账已清空（本档全部处理完毕）")
+    except Exception as _exc:  # noqa: BLE001 - 台账写失败不能拖垮 merge
+        log(f"[merge] ⚠ 更新跨档待补台账失败（不影响本轮产物）：{type(_exc).__name__}: {_exc}")
 
     # ==========================================================================
     # ⑨c 防线 1/2/3 完整实现（2026-11-23 根因修复）
