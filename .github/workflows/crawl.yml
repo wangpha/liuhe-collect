@@ -171,210 +171,26 @@ env:
   #
   #   当前：dahkg:10 + aocai:6 + tuku:4 = 20 片 = 并发上限
 jobs:
-  # ---------------- JobG：定时闸门（高频 cron + 北京时间判断五档）----------------
-  # ⚠ 2026-11-22 根因修复：GitHub 的 schedule 是 best effort，
-  #   低频 cron（每天 5 条）实测命中率 0/9（分钟数完全错位，偏差最远 453 分钟）。
-  #   改成每 10 分钟跑一次 + 在这里用**北京时间**判断是否命中五档窗口。
-  #   这是**纯云端**方案，与本地电脑开关机无关（用户铁律）。
   # ========================================================================
-  # JobC：续命链（独立 job，不与 gate 抢并发、不阻塞下游、可随时取消）
+  # ⚠ 2026-11-26 架构修正：**长睡 job 必须放在独立 workflow**
   #
-  # ⚠ 2026-11-24 根因修复（第 4 次修这个点，前面三次都被推翻）：
-  #   实测 run 45433951724：把续命放进 gate 后 →
-  #     · gate 睡 340 分钟 → plan 依赖 gate → **整条链路被阻塞**（只有 1 个 job 在跑）
-  #     · 占用 1 个并发位（Free 只有 20）
-  #     · `gh run cancel` 取消不掉（bash sleep 不响应 SIGTERM）
-  #   结论：续命必须独立成 job，且**不被任何 job 依赖**。
+  #   原来这里有一个 `chain:`（JobC 续命链）job：睡到下一档（最长 320 分钟）
+  #   然后 dispatch crawl.yml。问题实测：
   #
-  # 设计：
-  #   · 与 gate 并行启动，互不依赖
-  #   · 算「距下一次该醒还有多少分钟」→ 最多睡 340 分钟 → dispatch 一次自己
-  #   · 分段接力：睡醒后再 dispatch，新的 chain 再算「还差多少」，直到目标档位
-  #   · 效果：只要任意一次触发成功（schedule / alarm / 手动），
-  #     链条就能跨越整夜空档，不再依赖 schedule 可信度
+  #     · 它让整个 run 长时间保持 in_progress
+  #     · crawl.yml 的**新模式 run 因此排队**：
+  #       16:42 触发 → 16:51 仍 pending（旧 run 只剩 JobC 在睡）
+  #       取消旧 run 的 JobC 后，新 run **立刻** in_progress
+  #     · 近 50 个 run 里 45 个都有 JobC，每个睡 13-180 分钟
+  #
+  #   验证过的事实：**独立 workflow 的长睡不阻塞 crawl.yml**
+  #     11-25 19:10→22:00 alarm.yml 连跑 170 分钟，
+  #     同期 crawl.yml 的 run 45696352550 在 20:35 正常启动并 success。
+  #
+  #   现在：五档自动触发完全交给 alarm.yml（独立 workflow，
+  #   cron `7 * * * *` 每小时一次 + 每次轮询 170 分钟 + 内部防重复），
+  #   crawl.yml 的所有 job 都是短生命周期（15-25 分钟），run 能正常 completed。
   # ========================================================================
-  chain:
-    name: "JobC 续命链"
-    runs-on: ubuntu-24.04
-    # GitHub 单 job 上限 360 分钟；留 5 分钟余量
-    timeout-minutes: 355
-    # ⚠ 2026-11-25 实测：job 级 concurrency **不跨 run 生效**
-    #   （实测 run 45445693213 与 45457216315 的 JobC 同时 in_progress，
-    #    group="liuhe-chain" 完全没起作用）。
-    #   跨 run 互斥只能靠「在 dispatch 前主动查 + 让位」，见下面 step 里的实现。
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: 规划并睡到下一次档位，然后 dispatch 自己
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -u
-          NOW_H=$(TZ=Asia/Shanghai date +%-H)
-          NOW_M=$(TZ=Asia/Shanghai date +%-M)
-          NOW_MIN=$(( NOW_H * 60 + NOW_M ))
-          SLOTS_MIN="720 900 1080 1210 1240"
-          SLOTS_NAME="12:00 15:00 18:00 20:10 20:40"
-          echo "当前北京时间 $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')（当日第 $NOW_MIN 分）"
-
-          # 目标 = 下一个「档位 - 5 分钟」
-          NEXT_TARGET=""
-          NEXT_NAME=""
-          i=0
-          for sm in $SLOTS_MIN; do
-            i=$((i+1))
-            nm=$(echo "$SLOTS_NAME" | cut -d' ' -f$i)
-            tgt=$((sm - 5))
-            if [ "$tgt" -gt "$NOW_MIN" ]; then
-              NEXT_TARGET=$tgt
-              NEXT_NAME=$nm
-              break
-            fi
-          done
-          TOMORROW=0
-          if [ -z "$NEXT_TARGET" ]; then
-            NEXT_TARGET=715
-            NEXT_NAME="明天12:00"
-            TOMORROW=1
-          fi
-
-          # ⚠ 2026-11-26 根因修复（实测：45 个 run 各有一个 JobC 在 sleep，
-          #   每个 13-180 分钟，合计长期占 1-3 个并发位）：
-          #
-          #   原来的让位检查只在**睡醒后**执行。但「睡」本身也是占用：
-          #   15:29 我触发一个 tuku 验证 run，一直 pending；
-          #   检查发现旧 run 只剩 `JobC 续命链` 在跑；
-          #   取消它之后，新 run **立刻** in_progress。
-          #
-          #   → 谁都先睡下去、醒来再让位 = 睡的那段时间白占并发位。
-          #
-          #   修法：**睡之前先查**有没有「比我更新的 JobC 正在跑」。
-          #        有 → 我是旧的，直接退出（由最新的那个负责接力）。
-          #        这样任何时刻最多只有 1 个 JobC 处于 sleep 状态。
-          echo "→ 睡之前先检查：是否有更新的 JobC 已经在跑（避免多个实例同时占并发位）"
-          PRE_NEWER=0
-          PRE_RUNS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?status=in_progress&per_page=30" \
-                       --jq '.workflow_runs[].id' 2>/dev/null || true)
-          for prid in $PRE_RUNS; do
-            [ "$prid" = "$GITHUB_RUN_ID" ] && continue
-            if [ "$prid" -lt "$GITHUB_RUN_ID" ] 2>/dev/null; then
-              continue
-            fi
-            PHAS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/$prid/jobs" \
-                    --jq '[.jobs[] | select(.name == "JobC 续命链")] | length' 2>/dev/null || echo 0)
-            if [ "${PHAS:-0}" -gt 0 ] 2>/dev/null; then
-              PRE_NEWER=$((PRE_NEWER + 1))
-              echo "    run $prid 已有 JobC 在跑"
-            fi
-          done
-          if [ "${PRE_NEWER:-0}" -gt 0 ]; then
-            echo "  ⏭ 已有 ${PRE_NEWER} 个更新的 JobC 在跑 → **本次不入睡**，直接退出"
-            echo "  （省下 1 个并发位给业务 run；接力由最新那个 JobC 负责）"
-            exit 0
-          fi
-          echo "  ✅ 没有更新的 JobC → 由本实例负责接力"
-          SLEEP_MIN=$((NEXT_TARGET - NOW_MIN))
-          if [ "$TOMORROW" = "1" ]; then
-            SLEEP_MIN=$((1440 - NOW_MIN + NEXT_TARGET))
-          fi
-          # ⚠ 2026-11-25：340 → 320。
-          #   job timeout=355，340 只留 15 分钟余量；
-          #   checkout/装 gh/让位检查/dispatch 重试要 1-2 分钟，
-          #   但若 GitHub 排队或启动慢会吃掉余量 → 睡到一半被强杀 → 接力断链。
-          #   320 留 35 分钟余量，代价只是多一轮接力（无害）。
-          MAX_SLEEP=320
-          RELAY=0
-          if [ "$SLEEP_MIN" -gt "$MAX_SLEEP" ]; then
-            echo "  距 $NEXT_NAME 还有 $SLEEP_MIN 分钟（>${MAX_SLEEP}）→ 分段接力：先睡 ${MAX_SLEEP} 分钟"
-            SLEEP_MIN=$MAX_SLEEP
-            RELAY=1
-          fi
-          if [ "$SLEEP_MIN" -le 0 ]; then
-            echo "  无需续命（已到目标时刻）→ 直接 dispatch"
-            SLEEP_MIN=0
-          fi
-          echo "  本次睡 $SLEEP_MIN 分钟（目标 $NEXT_NAME，接力=$RELAY）"
-
-          LEFT=$((SLEEP_MIN * 60))
-          while [ "$LEFT" -gt 0 ]; do
-            CHUNK=300
-            if [ "$LEFT" -lt "$CHUNK" ]; then CHUNK=$LEFT; fi
-            sleep "$CHUNK"
-            LEFT=$((LEFT - CHUNK))
-            echo "  倒计时：还剩 $((LEFT / 60)) 分钟"
-          done
-
-          # ⚠ 2026-11-25 根因修复（实测 job 级 concurrency 不跨 run 生效，
-          #   run 45445693213 与 45457216315 的 JobC 同时 in_progress）：
-          #   每次 crawl.yml 触发都会起一个 JobC。短时间内多次触发
-          #   （schedule + alarm + 手动叠加）→ 多个 JobC 各自 sleep 到同一时刻
-          #   → 同时 dispatch → 同档重复跑多次 → 并发爆掉 + 重复 publish。
-          #
-          #   修法：醒来后查「除自己外有没有别的 JobC 还在跑」。
-          #   有 → 我是旧的，让位退出（由最新那个负责 dispatch）。
-          #   用纯 bash（不依赖 python3，云端与本地都能跑）。
-          # ⚠ 2026-11-25 根因修复（实测 job 级 concurrency 不跨 run 生效，
-          #   run 45445693213 与 45457216315 的 JobC 同时 in_progress）：
-          #   每次 crawl.yml 触发都会起一个 JobC。短时间内多次触发
-          #   （schedule + alarm + 手动叠加）→ 多个 JobC 各自 sleep 到同一时刻
-          #   → 同时 dispatch → 同档重复跑多次 → 并发爆掉 + 重复 publish。
-          #
-          #   修法：醒来后查「有没有比我更新的 JobC 还在跑」，有就让位退出。
-          #   用 `gh api --jq`（runner 预装 gh CLI，比手工 grep JSON 可靠）。
-          echo "→ 检查是否已有更新的 JobC 在跑（防重复接力）"
-          NEWER_JC=0
-          RUN_IDS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?status=in_progress&per_page=30" \
-                       --jq '.workflow_runs[].id' 2>/dev/null || true)
-          echo "  在跑 run: $(echo $RUN_IDS | tr '"'"'\n'"'"' '"'"' '"'"')"
-          for rid in $RUN_IDS; do
-            [ "$rid" = "$GITHUB_RUN_ID" ] && continue
-            # 比我旧（id 更小）的不算
-            if [ "$rid" -lt "$GITHUB_RUN_ID" ] 2>/dev/null; then
-              continue
-            fi
-            HAS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/$rid/jobs" \
-                    --jq '[.jobs[] | select(.name == "JobC 续命链")] | length' 2>/dev/null || echo 0)
-            echo "    run $rid: JobC 数 = ${HAS:-0}"
-            if [ "${HAS:-0}" -gt 0 ] 2>/dev/null; then
-              NEWER_JC=$((NEWER_JC + 1))
-            fi
-          done
-          echo "  比我新的在跑 JobC 数 = ${NEWER_JC}"
-          if [ "${NEWER_JC:-0}" -gt 0 ]; then
-            echo "  ⏭ 已有 ${NEWER_JC} 个更新的 JobC → 本实例让位退出（由最新那个接力）"
-            exit 0
-          fi
-
-          echo "→ 到点，dispatch crawl.yml（source=all）"
-          # ⚠ 2026-11-25 根因修复：dispatch 时必须显式传 slot。
-          #   原代码只传 source=all → gate 收到 inputs.slot="" →
-          #   11:55 时 NOW_MIN=715 < 720，窗口判断不命中 →
-          #   走「手动触发」分支 → slot_out="manual"（因为 11:55 没有已过档位）
-          #   → completedSlots 记不到 "12:00"
-          #   → 下一轮 gate 判「12:00 还没跑」→ 重复补跑。
-          #   现在把本次的目标档位名（NEXT_NAME）一起传进去。
-          SLOT_TARGET="${NEXT_NAME:-}"
-          # 「明天12:00」要转成 "12:00"
-          case "$SLOT_TARGET" in
-            明天*) SLOT_TARGET="${SLOT_TARGET#明天}" ;;
-          esac
-          echo "  传入 slot = ${SLOT_TARGET:-（空）}"
-          for k in 1 2 3; do
-            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 \
-              -X POST \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/crawl.yml/dispatches" \
-              -d "{\"ref\":\"main\",\"inputs\":{\"source\":\"all\",\"slot\":\"${SLOT_TARGET}\"}}" || echo 000)
-            echo "  dispatch 返回 $CODE"
-            if [ "$CODE" = "204" ] || [ "$CODE" = "200" ]; then
-              echo "  ✅ 续命成功（下一次已排队）"
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "  ⚠ 续命失败 3 次（不阻断，schedule 仍是兜底）"
 
   gate:
     name: "JobG 定时闸门"
@@ -455,14 +271,14 @@ jobs:
                   "https://api.github.com/repos/$REPO_SLUG/actions/workflows/crawl.yml/runs?status=in_progress&per_page=20" \
                   2>/dev/null \
                 | python3 -c "import sys,json;d=json.load(sys.stdin);print(chr(10).join(str(r.get('id')) for r in (d.get('workflow_runs') or []) if str(r.get('id'))!='$SELF_RUN'))" 2>/dev/null || true); do
-              # 这个 run 里有没有「非 JobC 且未完成」的 job？
+              # 这个 run 里有没有未完成的 job？（JobC 已于 2026-11-26 移除，无需排除）
               _ACT=$(curl -sS --max-time 30 \
                   -H "Authorization: Bearer $GH_TOKEN" \
                   -H "Accept: application/vnd.github+json" \
                   "https://api.github.com/repos/$REPO_SLUG/actions/runs/$_rid/jobs?per_page=100" \
                   2>/dev/null \
-                | python3 -c "import sys,json;d=json.load(sys.stdin);js=d.get('jobs') or [];print(sum(1 for j in js if j.get('name')!='JobC 续命链' and j.get('status')!='completed'))" 2>/dev/null || echo "0")
-              echo "  run $_rid: 非 JobC 的未完成 job 数 = ${_ACT:-0}"
+                | python3 -c "import sys,json;d=json.load(sys.stdin);js=d.get('jobs') or [];print(sum(1 for j in js if j.get('status')!='completed'))" 2>/dev/null || echo "0")
+              echo "  run $_rid: 未完成 job 数 = ${_ACT:-0}"
               if [ "${_ACT:-0}" -gt 0 ] 2>/dev/null; then
                 RUNNING=$((RUNNING + 1))
               fi
@@ -2169,7 +1985,7 @@ jobs:
               #    merge dahkg 跑到 14.3 分」时 watchdog 在 40.4 分 cancel → publish 被 skip → 数据没入库。
               #    watchdog 的意图是防「卡死」不是防「慢」；数据安全 > 效率。
             PENDING=$(gh api "repos/$REPO/actions/runs/$RUN/jobs" \
-              --jq '[.jobs[] | select(.name != "Watchdog 整轮 70 分钟上限") | select(.name | test("publish") | not) | select(.name | test("JobC 续命链") | not) | select(.status != "completed")] | length' \
+              --jq '[.jobs[] | select(.name != "Watchdog 整轮 70 分钟上限") | select(.name | test("publish") | not) | select(.status != "completed")] | length' \
               2>/dev/null || echo 99)
             echo "=== 已跑 ${ELAPSED} 分（兜底 ${MAX_MIN}）；未完成 job 数 ${PENDING} ==="
             if [ "$PENDING" = "0" ]; then
@@ -2180,7 +1996,7 @@ jobs:
             # ② 步骤级软超时
             OVER=""
             gh api "repos/$REPO/actions/runs/$RUN/jobs" \
-              --jq '.jobs[] | select(.name != "Watchdog 整轮 70 分钟上限") | select(.name | test("JobC 续命链") | not) | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "\($j)\t\(.name)\t\(.started_at)"' \
+              --jq '.jobs[] | select(.name != "Watchdog 整轮 70 分钟上限") | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "\($j)\t\(.name)\t\(.started_at)"' \
               2>/dev/null > "$TMP.steps" || true
             while IFS="$(printf '\t')" read -r JN SN ST; do
               [ -n "${ST:-}" ] || continue
@@ -2221,7 +2037,7 @@ jobs:
                 echo "| job | 当前步骤 | 状态 |"
                 echo "|---|---|---|"
                 gh api "repos/$REPO/actions/runs/$RUN/jobs" \
-                  --jq '.jobs[] | select(.name != "Watchdog 整轮 70 分钟上限") | select(.name | test("JobC 续命链") | not) | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "| \($j) | \(.name) | \(.status) |"' \
+                  --jq '.jobs[] | select(.name != "Watchdog 整轮 70 分钟上限") | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "| \($j) | \(.name) | \(.status) |"' \
                   2>/dev/null || true
               } >> "$GITHUB_STEP_SUMMARY"
               # 不 cancel、不 exit —— 继续下一轮监控
