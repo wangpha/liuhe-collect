@@ -1347,10 +1347,28 @@ jobs:
           #   → 采集时全部重新 OCR → 2030 图 × 1 秒 = 34 分钟 → SIGTERM
           #   修法：先按「源+期号」预建期目录和 .cache/ocr，再铺回。
           SRC="tuku"
+          # ⚠ 2026-11-26 根因修复（实测 tuku 缓存命中率只有 3.5%，aocai 41%）：
+          #
+          #   这里原来写 SUB="49图库"，于是预建并铺回的是
+          #       work/out/49图库/澳门_2026_330期/.cache/ocr   ← 铺了 7468 个
+          #   但 tuku 模块**实际**把产物写到
+          #       work/out/澳门_2026_330期/                    ← 没有 49图库 这一层
+          #   （分片日志原文：[开始] … | …/repo/work/out/澳门_2026_330期）
+          #
+          #   → OCR 在 `work/out/澳门_2026_330期/.cache/ocr/` 找缓存，那里是空的
+          #   → 每张图都重新识别 → 实测命中率 3.5%（32/924），而同轮 aocai 是 41%
+          #   → 用户反复问的「上次完整运行留下的缓存为什么命中率那么低」就是这个
+          #
+          #   tuku 的产物根目录**不带源名前缀**（dahkg/aocai 带：大港澳/澳彩交流）。
+          #   修法：铺回时**同时**覆盖两种可能的位置 —— 带前缀与不带前缀，
+          #        这样无论模块写到哪里都能命中；多余的目录无害（find 会一起铺）。
           SUB="49图库"
           # 期号可能是 2026325 或 325，两种目录名都建（同一个位置，取短的）
           P3=$(echo "$PERIOD" | sed 's/^2026//')
           [ -z "$P3" ] && P3="$PERIOD"
+          # ① tuku 真实产物根（无源名前缀）—— 这是**必须**命中的那个
+          mkdir -p "work/out/澳门_2026_${P3}期/.cache/ocr"
+          # ② 历史回采目录（带 49图库 前缀）—— 保留，兼容回采产物
           mkdir -p "work/out/$SUB/澳门_2026_${P3}期/.cache/ocr"
           n=0
           for d in $(find work/out -type d -name .cache 2>/dev/null); do
@@ -1361,7 +1379,8 @@ jobs:
             n=$((n+1))
           done
           echo "铺回 $n 个 .cache（meta 期号=$PERIOD / OCR $(ls work/ocr-cache/ocr 2>/dev/null | wc -l) 个文件）"
-          echo "预建目录：work/out/$SUB/澳门_2026_${P3}期/.cache/ocr ($(ls work/out/$SUB/澳门_2026_${P3}期/.cache/ocr 2>/dev/null | wc -l) 个)"
+          echo "预建目录A（tuku 真实产物根）：work/out/澳门_2026_${P3}期/.cache/ocr ($(ls work/out/澳门_2026_${P3}期/.cache/ocr 2>/dev/null | wc -l) 个)"
+          echo "预建目录B（历史回采）：work/out/$SUB/澳门_2026_${P3}期/.cache/ocr ($(ls work/out/$SUB/澳门_2026_${P3}期/.cache/ocr 2>/dev/null | wc -l) 个)"
       - name: 分片预热（只处理本片：详情+回复+图片+OCR）
         id: shard
         working-directory: repo
