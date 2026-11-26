@@ -3749,6 +3749,39 @@ def do_merge_summary(args) -> int:
                         f"（原 {target + len(_gone)}），"
                         f"重算后 missing={len(missing)} / extra={len(extra)}"
                     )
+                    # ⚠ 2026-11-26 根因修复（run 45826251463 实测：aocai
+                    #   「已删帖从基线移除后：可达上限 1074 帖，重算后 missing=0 / extra=2」
+                    #   之后仍报「❌ 汇总后 1076 帖 != 可达上限 1074 帖」→ 整轮失败）：
+                    #
+                    #   `_extra_ok` 是在 L3632 的 `if planned_set and not missing and extra:`
+                    #   里算出来的。而**那一刻 missing 还非空**（含 1 个源站已删帖）
+                    #   → 整个块被跳过 → `_extra_ok` 保持初始值 False。
+                    #
+                    #   之后才在 L3730 把已删帖从基线移除、重算 missing/extra，
+                    #   此时 missing=0 / extra=2 本来是**完全合法**的实时增量，
+                    #   但 `_extra_ok` 仍是 False → 三分类落到 else 分支 → SystemExit(41)。
+                    #
+                    #   修法：基线重算之后，**重新判定** `_extra_ok`
+                    #   （判据不变：merged 里不能有重复 articleId）。
+                    try:
+                        from collections import Counter as _Counter2
+
+                        _idc2 = _Counter2()
+                        for _p2 in merged:
+                            try:
+                                _a2 = int(_p2.get("articleId") or 0)
+                            except (TypeError, ValueError):
+                                _a2 = 0
+                            if _a2 > 0:
+                                _idc2[_a2] += 1
+                        _dup2 = sum(1 for _n2 in _idc2.values() if _n2 > 1)
+                        _extra_ok = (_dup2 == 0)
+                        log(
+                            f"[merge-summary]    重算 extra 校验：重复 id {_dup2} 个 → "
+                            f"{'通过（多出的是合法实时增量）' if _extra_ok else '不通过'}"
+                        )
+                    except Exception:  # noqa: BLE001 - 校验失败不改变原判定
+                        pass
                 else:
                     log(
                         f"[merge-summary] ⚠ 缺失的 {len(missing)} 帖在源站**仍存在**"
