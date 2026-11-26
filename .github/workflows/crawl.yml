@@ -238,6 +238,42 @@ jobs:
             NEXT_NAME="明天12:00"
             TOMORROW=1
           fi
+
+          # ⚠ 2026-11-26 根因修复（实测：45 个 run 各有一个 JobC 在 sleep，
+          #   每个 13-180 分钟，合计长期占 1-3 个并发位）：
+          #
+          #   原来的让位检查只在**睡醒后**执行。但「睡」本身也是占用：
+          #   15:29 我触发一个 tuku 验证 run，一直 pending；
+          #   检查发现旧 run 只剩 `JobC 续命链` 在跑；
+          #   取消它之后，新 run **立刻** in_progress。
+          #
+          #   → 谁都先睡下去、醒来再让位 = 睡的那段时间白占并发位。
+          #
+          #   修法：**睡之前先查**有没有「比我更新的 JobC 正在跑」。
+          #        有 → 我是旧的，直接退出（由最新的那个负责接力）。
+          #        这样任何时刻最多只有 1 个 JobC 处于 sleep 状态。
+          echo "→ 睡之前先检查：是否有更新的 JobC 已经在跑（避免多个实例同时占并发位）"
+          PRE_NEWER=0
+          PRE_RUNS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?status=in_progress&per_page=30" \
+                       --jq '.workflow_runs[].id' 2>/dev/null || true)
+          for prid in $PRE_RUNS; do
+            [ "$prid" = "$GITHUB_RUN_ID" ] && continue
+            if [ "$prid" -lt "$GITHUB_RUN_ID" ] 2>/dev/null; then
+              continue
+            fi
+            PHAS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/$prid/jobs" \
+                    --jq '[.jobs[] | select(.name == "JobC 续命链")] | length' 2>/dev/null || echo 0)
+            if [ "${PHAS:-0}" -gt 0 ] 2>/dev/null; then
+              PRE_NEWER=$((PRE_NEWER + 1))
+              echo "    run $prid 已有 JobC 在跑"
+            fi
+          done
+          if [ "${PRE_NEWER:-0}" -gt 0 ]; then
+            echo "  ⏭ 已有 ${PRE_NEWER} 个更新的 JobC 在跑 → **本次不入睡**，直接退出"
+            echo "  （省下 1 个并发位给业务 run；接力由最新那个 JobC 负责）"
+            exit 0
+          fi
+          echo "  ✅ 没有更新的 JobC → 由本实例负责接力"
           SLEEP_MIN=$((NEXT_TARGET - NOW_MIN))
           if [ "$TOMORROW" = "1" ]; then
             SLEEP_MIN=$((1440 - NOW_MIN + NEXT_TARGET))
