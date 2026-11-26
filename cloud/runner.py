@@ -3449,10 +3449,50 @@ def do_merge_summary(args) -> int:
                     "source": source,
                     "lottery": (plan.get("lottery") or ""),
                     "lotteryName": str(plan.get("lotteryName") or "澳门"),
+                    "lotteryType": int(plan.get("lotteryType") or 0),
                     "year": int(plan.get("year") or 0) or 2026,
                     "period": int(plan.get("period") or 0),
                     "periodDisplay": int(plan.get("periodDisplay") or 0),
                     "shard": 0,
+                    # ⚠ 2026-11-26 补充（run 45831669113 实测：
+                    #   「极小期且分片未产出 run_meta → 用 plan 信息兜底造模板」之后
+                    #   `File "cloud/runner.py", line 4021, in do_merge_summary
+                    #    KeyError: 'sourceUrl'` → 整轮失败）：
+                    #
+                    #   这份兜底模板会被 `merge_summary.build_merged_meta` 的
+                    #   `meta = dict(tpl)` 原样继承，而 `core/scraper.py::write_outputs`
+                    #   里有若干 **强制下标访问**：
+                    #       meta['year'] / meta['period'] / meta['sourceUrl']
+                    #       meta['generatedAt'] / meta['postCount'] / meta['userCount']
+                    #       meta['imageCount'] / meta['onlyLatestPeriod']
+                    #       meta['periodsIncluded'] / meta['durationSec']
+                    #   模板里缺任何一个就 KeyError。
+                    #
+                    #   所以这里把**写产物必用**的字段全部预置（后面 build_merged_meta
+                    #   会用真实值覆盖 postCount / userCount / imageCount 等）。
+                    "sourceUrl": str(
+                        plan.get("sourceUrl")
+                        or {
+                            "dahkg": "https://www.49208.com/",
+                            "aocai": "https://www.aocai.com/",
+                            "tuku": "https://jmz.jlidesign.com:4949/",
+                        }.get(source, "")
+                    ),
+                    "generatedAt": "",
+                    "postCount": 0,
+                    "userCount": 0,
+                    "imageCount": 0,
+                    "onlyLatestPeriod": True,
+                    "periodsIncluded": int(plan.get("periodDisplay") or plan.get("period") or 0),
+                    "durationSec": 0.0,
+                    "ocrStats": {},
+                    "replyStats": {},
+                    "imageStats": {},
+                    "claimStats": {},
+                    "claims": 0,
+                    "stageSeconds": {},
+                    "options": {},
+                    "latestDraw": int(plan.get("periodDisplay") or 0),
                     "_fromPlanFallback": True,
                 }
             ]
