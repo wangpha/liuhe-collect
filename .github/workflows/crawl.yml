@@ -173,7 +173,7 @@ env:
   SHARD_MAP: "dahkg:8,aocai:5,tuku:4"
   # 分片 job 的真实 timeout（秒）。budget.timeouts_from_env() 用它算每片容量，
   # 必须与下面 shard_* job 的 timeout-minutes: 40 一致（40×60=2400）。
-  LIUHE_SHARD_JOB_TIMEOUT: "2400"
+  LIUHE_SHARD_JOB_TIMEOUT: "3480"
   #   ① aocai 1→6：plan 算出需 6 片（全片 114.7 分钟 ÷ 18.8），但 matrix 只给 1 片
   #      → 那 1 片收全量 → 时间预算到点 → 2215 张图 not_processed → 防线2 失败。
   #   ② dahkg 18→12→10：实测每片只要 2-7 分钟（预算 16 分钟），降片数不影响完整性。
@@ -661,7 +661,7 @@ jobs:
     # 硬超时 25。分片容量由 runner 的 cloud/budget.py 按「本 job timeout × 0.6」算
     # （= 15 分钟）。为什么不是 0.9：整轮 = 固定 + 最慢分片 + merge，
     # 0.9 时 dahkg 实测 7+23.7+10 = 40.7 分撞 watchdog 40 分 → publish 被跳过。
-    timeout-minutes: 40
+    timeout-minutes: 58
     # 分片只是「预热缓存」，**正确性由 merge 的全量重采 + 五道防线保证**。
     # 2026-11-17 事故：跨期时若干分片报「没有 X 期的帖子」→ 整个 run 变 failure → publish 被跳过，
     # 当天数据没进数据仓。所以这里让分片失败**不连累整轮**：
@@ -784,12 +784,12 @@ jobs:
           #   有时 job timeout 先 SIGKILL → handler 没机会跑（日志里连「收到 SIGTERM」都没有）。
           #   改成 1200s(20 分) → 1+20 = 21 分 < 25 分，稳。分片容量 15 分钟（USABLE_RATIO=0.6）也够。
           # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
-          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 2280"
+          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 3300"
           # ⚠ 2026-11-24 根因修复（run 45316538853 实测：分片预估 7.3 分钟实际 21.5 分钟
           #   → 7 个分片 SIGTERM）：media 阶段（下载+重试+OCR）必须有时间预算，
           #   否则 522 把某批下载拖到 8 分钟，循环仍会继续跑后续批次直到 SIGTERM。
           #   1000 秒 = SHARD_TO(1200) - 200（留打包/上传/收尾）
-          export LIUHE_MEDIA_BUDGET_SEC=1900
+          export LIUHE_MEDIA_BUDGET_SEC=2700
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
@@ -892,7 +892,7 @@ jobs:
     # 硬超时 25。分片容量由 runner 的 cloud/budget.py 按「本 job timeout × 0.6」算
     # （= 15 分钟）。为什么不是 0.9：整轮 = 固定 + 最慢分片 + merge，
     # 0.9 时 dahkg 实测 7+23.7+10 = 40.7 分撞 watchdog 40 分 → publish 被跳过。
-    timeout-minutes: 40
+    timeout-minutes: 58
     # 分片只是「预热缓存」，**正确性由 merge 的全量重采 + 五道防线保证**。
     # 2026-11-17 事故：跨期时若干分片报「没有 X 期的帖子」→ 整个 run 变 failure → publish 被跳过，
     # 当天数据没进数据仓。所以这里让分片失败**不连累整轮**：
@@ -1015,12 +1015,12 @@ jobs:
           #   有时 job timeout 先 SIGKILL → handler 没机会跑（日志里连「收到 SIGTERM」都没有）。
           #   改成 1200s(20 分) → 1+20 = 21 分 < 25 分，稳。分片容量 15 分钟（USABLE_RATIO=0.6）也够。
           # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
-          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 2280"
+          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 3300"
           # ⚠ 2026-11-24 根因修复（run 45316538853 实测：分片预估 7.3 分钟实际 21.5 分钟
           #   → 7 个分片 SIGTERM）：media 阶段（下载+重试+OCR）必须有时间预算，
           #   否则 522 把某批下载拖到 8 分钟，循环仍会继续跑后续批次直到 SIGTERM。
           #   1000 秒 = SHARD_TO(1200) - 200（留打包/上传/收尾）
-          export LIUHE_MEDIA_BUDGET_SEC=1900
+          export LIUHE_MEDIA_BUDGET_SEC=2700
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
@@ -1123,7 +1123,7 @@ jobs:
     # 硬超时 25。分片容量由 runner 的 cloud/budget.py 按「本 job timeout × 0.6」算
     # （= 15 分钟）。为什么不是 0.9：整轮 = 固定 + 最慢分片 + merge，
     # 0.9 时 dahkg 实测 7+23.7+10 = 40.7 分撞 watchdog 40 分 → publish 被跳过。
-    timeout-minutes: 40
+    timeout-minutes: 58
     # 分片只是「预热缓存」，**正确性由 merge 的全量重采 + 五道防线保证**。
     # 2026-11-17 事故：跨期时若干分片报「没有 X 期的帖子」→ 整个 run 变 failure → publish 被跳过，
     # 当天数据没进数据仓。所以这里让分片失败**不连累整轮**：
@@ -1265,12 +1265,12 @@ jobs:
           #   有时 job timeout 先 SIGKILL → handler 没机会跑（日志里连「收到 SIGTERM」都没有）。
           #   改成 1200s(20 分) → 1+20 = 21 分 < 25 分，稳。分片容量 15 分钟（USABLE_RATIO=0.6）也够。
           # --kill-after=30：若 SIGTERM 30 秒内没退，再 SIGKILL 兜底。
-          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 2280"
+          SHARD_TO="timeout --signal=SIGTERM --kill-after=30 3300"
           # ⚠ 2026-11-24 根因修复（run 45316538853 实测：分片预估 7.3 分钟实际 21.5 分钟
           #   → 7 个分片 SIGTERM）：media 阶段（下载+重试+OCR）必须有时间预算，
           #   否则 522 把某批下载拖到 8 分钟，循环仍会继续跑后续批次直到 SIGTERM。
           #   1000 秒 = SHARD_TO(1200) - 200（留打包/上传/收尾）
-          export LIUHE_MEDIA_BUDGET_SEC=1900
+          export LIUHE_MEDIA_BUDGET_SEC=2700
           EXTRA=""
           [ "$NO_OCR" = "true" ] && EXTRA="$EXTRA --no-ocr"
           [ "$NO_IMAGES" = "true" ] && EXTRA="$EXTRA --no-images"
@@ -1930,9 +1930,9 @@ jobs:
             !repo/work/out/**/images/**
           if-no-files-found: warn
 
-  # ---------------- 整轮 watchdog：步骤级软超时（主）+ 70 分钟兜底（副） ----------------
+  # ---------------- 整轮 watchdog：步骤级软超时（主）+ 100 分钟兜底（副） ----------------
   watchdog:
-    name: "Watchdog 整轮 70 分钟上限"
+    name: "Watchdog 整轮 100 分钟上限"
     needs: [gate, plan]
     if: needs.gate.outputs.should_run == '1' && always()
     # 取消整轮需要 actions: write；默认 GITHUB_TOKEN 没有该权限（实测 403）
@@ -1940,12 +1940,12 @@ jobs:
       actions: write
       contents: read
     runs-on: ubuntu-latest
-    timeout-minutes: 80
+    timeout-minutes: 110
     steps:
-      - name: 整轮监控（步骤级软超时 + 70 分钟兜底）
+      - name: 整轮监控（步骤级软超时 + 100 分钟兜底）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MAX_MIN: "70"
+          MAX_MIN: "100"
         run: |
           START=$(date +%s)
           TMP=$(mktemp)
@@ -2001,7 +2001,7 @@ jobs:
               #    merge dahkg 跑到 14.3 分」时 watchdog 在 40.4 分 cancel → publish 被 skip → 数据没入库。
               #    watchdog 的意图是防「卡死」不是防「慢」；数据安全 > 效率。
             PENDING=$(gh api "repos/$REPO/actions/runs/$RUN/jobs" \
-              --jq '[.jobs[] | select(.name != "Watchdog 整轮 70 分钟上限") | select(.name | test("publish") | not) | select(.status != "completed")] | length' \
+              --jq '[.jobs[] | select(.name != "Watchdog 整轮 100 分钟上限") | select(.name | test("publish") | not) | select(.status != "completed")] | length' \
               2>/dev/null || echo 99)
             echo "=== 已跑 ${ELAPSED} 分（兜底 ${MAX_MIN}）；未完成 job 数 ${PENDING} ==="
             if [ "$PENDING" = "0" ]; then
@@ -2012,7 +2012,7 @@ jobs:
             # ② 步骤级软超时
             OVER=""
             gh api "repos/$REPO/actions/runs/$RUN/jobs" \
-              --jq '.jobs[] | select(.name != "Watchdog 整轮 70 分钟上限") | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "\($j)\t\(.name)\t\(.started_at)"' \
+              --jq '.jobs[] | select(.name != "Watchdog 整轮 100 分钟上限") | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "\($j)\t\(.name)\t\(.started_at)"' \
               2>/dev/null > "$TMP.steps" || true
             while IFS="$(printf '\t')" read -r JN SN ST; do
               [ -n "${ST:-}" ] || continue
@@ -2053,7 +2053,7 @@ jobs:
                 echo "| job | 当前步骤 | 状态 |"
                 echo "|---|---|---|"
                 gh api "repos/$REPO/actions/runs/$RUN/jobs" \
-                  --jq '.jobs[] | select(.name != "Watchdog 整轮 70 分钟上限") | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "| \($j) | \(.name) | \(.status) |"' \
+                  --jq '.jobs[] | select(.name != "Watchdog 整轮 100 分钟上限") | select(.status=="in_progress") | .name as $j | (.steps // [])[] | select(.status=="in_progress") | "| \($j) | \(.name) | \(.status) |"' \
                   2>/dev/null || true
               } >> "$GITHUB_STEP_SUMMARY"
               # 不 cancel、不 exit —— 继续下一轮监控
