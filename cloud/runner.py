@@ -3894,6 +3894,40 @@ def do_merge_summary(args) -> int:
                     f"{'…' if len(extra) > 20 else ''}")
             if not missing and not extra:
                 log("[merge-summary]    plan 里没有 id 列表 → 只能看各片上报数")
+            # ⚠ 2026-11-27 根因修复（数据完整性最后一处断链）：
+            #
+            #   本函数末尾（L4298 附近）有「跨档待补台账」写入，但它在 `raise SystemExit(41)`
+            #   **之后**才执行 —— 而 raise 会直接终止进程。
+            #   → 只要判定失败（真缺帖），台账就永远写不进去 → 缺的帖下一轮不会被补抓。
+            #   这是「补抓链在最需要它的场景（缺帖）下恰好断掉」的第二处同类缺陷
+            #   （第一处是 L3583 注释里记录的 unfinished 收集顺序问题）。
+            #
+            #   实测 run 45974935720：分片 dahkg#5 因 apt 源 403（微软源临时故障）
+            #   启动即失败 → 它负责的 112 帖没有任何 unfinished 记录 → merge 判「真漏帖」
+            #   → raise(41) → 台账没写 → 112 帖永久丢失。
+            #
+            #   修法：**在 raise 之前**把缺失帖写进 pending 台账（reason=missing），
+            #         下一轮 plan 会强制并入 union_ids 重新抓。
+            if missing:
+                try:
+                    from . import _pending as _pend_fail
+
+                    _sd_fail = _resolve_state_dir(args, work)
+                    _fail_now = {int(x): "missing" for x in missing if int(x) > 0}
+                    _led_now = _pend_fail.merge_pending(
+                        _sd_fail, source, int(plan.get("period") or 0),
+                        newly_failed=_fail_now,
+                        done_ids={int(p_.get("articleId") or 0) for p_ in merged if p_.get("articleId")},
+                    )
+                    log(
+                        f"[merge-summary] 📌 判失败前先把 {len(_fail_now)} 帖缺帖写入待补台账"
+                        f"（共 {_led_now.get('count', 0)} 帖待下档补）→ 不会永久丢失"
+                    )
+                except Exception as _exc:  # noqa: BLE001 - 台账写失败不改变原判定
+                    log(
+                        f"[merge-summary] ⚠ 缺帖写台账失败（缺帖仍会如实报失败）："
+                        f"{type(_exc).__name__}: {_exc}"
+                    )
             raise SystemExit(41)
 
     # ---------- ④ 排序（list.json 原始顺序）----------
