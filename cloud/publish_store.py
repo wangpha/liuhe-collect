@@ -158,12 +158,36 @@ def publish(incoming: Path, store: Path, log=print, slot: str = "") -> dict:
     if _prev_slots.get("date") != _today:
         _prev_slots = {"date": _today, "slots": []}
     _slot_list = list(_prev_slots.get("slots") or [])
-    if _slot_name and _slot_name not in ("manual", "busy", "none"):
-        # 去掉「(补跑)」后缀，统一成纯档位名
-        _clean = _slot_name.split("(")[0].strip()
-        if _clean and _clean not in _slot_list:
+    # ⚠ 2026-11-27 根因修复：completedSlots 被「非五档」的 slot 污染。
+    #
+    #   原判据只排除 manual/busy/none 三个字面值，其它任何字符串都会被当成合法档位写进去。
+    #   实测：闹钟自测（test_slot=09:32）触发 crawl 时带 slot=09:32，
+    #   gate 对「手动/外部触发」直接放行 → publish 把 "09:32" 写进了 completedSlots
+    #   → 数据仓台账出现一个根本不存在的档位，且永久留存（跨天才清）。
+    #
+    #   修法（两层）：
+    #     ① 只认五档白名单，不在名单里的 slot 一律不记录（源头堵住）
+    #     ② 顺手把台账里已有的非五档条目清掉（治理存量脏数据）
+    #   gate 的自愈补跑是「遍历五档、逐个查名字是否在列表里」，
+    #   假档位不会被误匹配，但会让「今天跑过哪些档」的记录失真，所以要治。
+    _SLOT_WHITELIST = ("12:00", "15:00", "18:00", "20:10", "20:40")
+    # ② 治理存量：清掉历史混入的非五档条目
+    _before_clean = len(_slot_list)
+    _slot_list = [s for s in _slot_list if str(s) in _SLOT_WHITELIST]
+    if len(_slot_list) != _before_clean:
+        log(f"[publish] 🧹 completedSlots 清掉 {_before_clean - len(_slot_list)} 个非五档条目")
+    # ① 源头：只有五档才记录
+    #    ⚠ 顺序不能反：先去掉「(补跑)」后缀，再比对白名单。
+    #    gate 的自愈补跑传进来的是「12:00(补跑)」，若先比白名单会被整个拒掉
+    #    → 补跑成功的档位记不进台账 → 下次又被判没跑 → 再补 → 无穷循环。
+    #    （单测 _test_slot_whitelist.py「带(补跑)后缀 归一化」当场抓到的回归）
+    _clean = _slot_name.split("(")[0].strip()
+    if _clean and _clean in _SLOT_WHITELIST:
+        if _clean not in _slot_list:
             _slot_list.append(_clean)
             _slot_list.sort()
+    elif _slot_name and _slot_name not in ("manual", "busy", "none"):
+        log(f"[publish] ⚠ slot={_slot_name!r} 不在五档白名单 → 不写入 completedSlots")
     _prev_slots["slots"] = _slot_list
 
     (store / "manifest.json").write_text(
