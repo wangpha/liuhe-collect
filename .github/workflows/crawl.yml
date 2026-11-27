@@ -605,21 +605,28 @@ jobs:
       #     命中率参差（实测 run 45515121184：分片#0 93.7% vs 分片#5 13.6%）。
       #
       #   同一轮内 prepare 有 3 个源并行（matrix），所以 key 要带源名。
+      # ⚠ 2026-11-27 根因修复（台账永远停在旧期/旧片数 —— 命中率低的最后一环）：
+      #
+      #   原来这里用 `actions/cache@v4`（restore + save 一体）。但本 job 的 prev 台账
+      #   是从**数据仓 git**（上面「检出私有数据仓」）读的，根本不需要 restore。
+      #   而 actions/cache 的 restore 在 save 之前执行，且 restore-keys 会命中**上一轮**的缓存：
+      #
+      #     步骤 6 生成 plan  → 写出 331 期 / 8 片 / 571 作者（plan 文件里是对的）
+      #     步骤 7 cache     → Cache restored from key: state-dahkg-45923122871
+      #                       ← 把上一轮 329 期 / 18 片 / 487 作者【恢复进同一目录，覆盖了刚写的】
+      #     步骤 8 上传      → 上传的是被覆盖后的旧台账 → 数据仓永远停在 329/18 片
+      #
+      #   实测 run 45926824689：plan 内 period=331 片数=8；上传的 state period=329 片数=18。
+      #   后果：下一轮 plan 读到旧映射，老作者的「原片」根本不是当前片号 → 缓存全部失效。
+      #
+      #   修法：改用 `actions/cache/save`（**只保存，不恢复**）。
+      #   本 job 不需要任何 restore；上一轮台账来自数据仓 checkout，已是最新的。
       - name: 保存跨轮状态（用户→分片台账，供下一轮 plan 稳定分组）
         if: always()
-        uses: actions/cache@v4
+        uses: actions/cache/save@v4
         with:
           path: repo/work/store/state
           key: state-${{ matrix.source }}-${{ github.run_id }}
-          # ⚠ 2026-11-25 根因修复（缓存串源）：
-          #   restore-keys 最后一行的兜底 `state-` 会匹配**任意源**的缓存 ——
-          #   实测 dahkg 的 prepare 恢复到了 tuku 的缓存：
-          #       Cache hit for restore-key: state-tuku-45525441201
-          #       Cache restored from key: state-tuku-45525441201
-          #   → 三个源互相污染 user_shard / imagecost / current_period。
-          #   修法：只保留本源的 restore-key，去掉跨源兜底。
-          restore-keys: |
-            state-${{ matrix.source }}-
       # 同时上传 artifact，供 publish 提交进数据仓（长期保存）
       - name: 上传跨轮状态（供 publish 提交进数据仓）
         if: always()
@@ -1398,6 +1405,19 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r cloud/requirements.txt
+      # ⚠ 2026-11-27 根因修复：state 的 restore **必须在「汇总产物」之前**。
+      #   merge 的 state 目录初始为空，靠这里拿到本轮 prepare 写的 user_shard 等台账；
+      #   之后「汇总产物」在其上叠加 snapshot / imagecost / hashsnapshot，最后再 save。
+      #   restore-keys 顺序不变：本轮 prepare 优先（state-<源>-<run_id>）。
+      - name: 恢复跨轮状态（只恢复；本轮 prepare 优先）
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: repo/work/store/state
+          restore-keys: |
+            state-dahkg-${{ github.run_id }}
+            state-dahkg-
+            state-merge-dahkg-
       - name: 下载本源 plan（含内容指纹 + 分片分配）
         uses: actions/download-artifact@v4
         with:
@@ -1510,24 +1530,16 @@ jobs:
       #   缓存改由各分片自己 save（key 带片号，无冲突）。
       # ⚠ 2026-11-24 根因修复：把 merge 落盘的跨轮状态存回 actions/cache，
       #   否则 imagecost / user_shard / snapshot 随 runner 销毁 → 下一轮 plan 拿不到。
+      # ⚠ 2026-11-27 根因修复：restore 已前移到「下载本源 plan」之前，这里**只保存**。
+      #   原来 restore+save 一体且是最后一步 → restore 整目录覆盖了「汇总产物」刚写的
+      #   snapshot_<源>_<期> / hashsnapshot / imagecost（实测 run 45926824689 的 artifact 里这些文件全没了）
+      #   → 每轮 merge 都打印「单调性：无上轮快照（首次）」→ 防线3 实际一直失效。
       - name: 保存跨轮状态（供下一轮 plan 用）
         if: always()
-        uses: actions/cache@v4
+        uses: actions/cache/save@v4
         with:
           path: repo/work/store/state
           key: state-merge-dahkg-${{ github.run_id }}
-          # ⚠ 2026-11-25 根因修复（顺序错导致 merge 读不到本轮 prepare 的台账）：
-          #   restore-keys 是**按顺序前缀匹配、取最新**。原来的顺序是
-          #       state-merge-<源>-   ← 上轮 merge 保存的（上一轮就已污染）
-          #       state-<源>-         ← 本轮 prepare 保存的（含 user_shard_<源>.json）
-          #   结果 merge 优先命中了上轮的 state-merge- 缓存 →
-          #   实测 merge dahkg 的 artifact 里没有 user_shard_dahkg.json，
-          #   只有上一轮遗留的 aocai/tuku 文件。
-          #   修法：**本轮 prepare 的 state 优先**。
-          restore-keys: |
-            state-dahkg-${{ github.run_id }}
-            state-dahkg-
-            state-merge-dahkg-
       # ⚠ 2026-11-25：把 state 也上传成 artifact，供 publish 合并提交进数据仓。
       #   （actions/cache 只服务于「下一轮的 plan」，不跨 job 传递；
       #     publish 是独立 job，必须靠 artifact 拿到这些文件。）
@@ -1588,6 +1600,19 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r cloud/requirements.txt
+      # ⚠ 2026-11-27 根因修复：state 的 restore **必须在「汇总产物」之前**。
+      #   merge 的 state 目录初始为空，靠这里拿到本轮 prepare 写的 user_shard 等台账；
+      #   之后「汇总产物」在其上叠加 snapshot / imagecost / hashsnapshot，最后再 save。
+      #   restore-keys 顺序不变：本轮 prepare 优先（state-<源>-<run_id>）。
+      - name: 恢复跨轮状态（只恢复；本轮 prepare 优先）
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: repo/work/store/state
+          restore-keys: |
+            state-aocai-${{ github.run_id }}
+            state-aocai-
+            state-merge-aocai-
       - name: 下载本源 plan（含内容指纹 + 分片分配）
         uses: actions/download-artifact@v4
         with:
@@ -1700,24 +1725,16 @@ jobs:
       #   缓存改由各分片自己 save（key 带片号，无冲突）。
       # ⚠ 2026-11-24 根因修复：把 merge 落盘的跨轮状态存回 actions/cache，
       #   否则 imagecost / user_shard / snapshot 随 runner 销毁 → 下一轮 plan 拿不到。
+      # ⚠ 2026-11-27 根因修复：restore 已前移到「下载本源 plan」之前，这里**只保存**。
+      #   原来 restore+save 一体且是最后一步 → restore 整目录覆盖了「汇总产物」刚写的
+      #   snapshot_<源>_<期> / hashsnapshot / imagecost（实测 run 45926824689 的 artifact 里这些文件全没了）
+      #   → 每轮 merge 都打印「单调性：无上轮快照（首次）」→ 防线3 实际一直失效。
       - name: 保存跨轮状态（供下一轮 plan 用）
         if: always()
-        uses: actions/cache@v4
+        uses: actions/cache/save@v4
         with:
           path: repo/work/store/state
           key: state-merge-aocai-${{ github.run_id }}
-          # ⚠ 2026-11-25 根因修复（顺序错导致 merge 读不到本轮 prepare 的台账）：
-          #   restore-keys 是**按顺序前缀匹配、取最新**。原来的顺序是
-          #       state-merge-<源>-   ← 上轮 merge 保存的（上一轮就已污染）
-          #       state-<源>-         ← 本轮 prepare 保存的（含 user_shard_<源>.json）
-          #   结果 merge 优先命中了上轮的 state-merge- 缓存 →
-          #   实测 merge dahkg 的 artifact 里没有 user_shard_dahkg.json，
-          #   只有上一轮遗留的 aocai/tuku 文件。
-          #   修法：**本轮 prepare 的 state 优先**。
-          restore-keys: |
-            state-aocai-${{ github.run_id }}
-            state-aocai-
-            state-merge-aocai-
       # ⚠ 2026-11-25：把 state 也上传成 artifact，供 publish 合并提交进数据仓。
       #   （actions/cache 只服务于「下一轮的 plan」，不跨 job 传递；
       #     publish 是独立 job，必须靠 artifact 拿到这些文件。）
@@ -1778,6 +1795,19 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r cloud/requirements.txt
+      # ⚠ 2026-11-27 根因修复：state 的 restore **必须在「汇总产物」之前**。
+      #   merge 的 state 目录初始为空，靠这里拿到本轮 prepare 写的 user_shard 等台账；
+      #   之后「汇总产物」在其上叠加 snapshot / imagecost / hashsnapshot，最后再 save。
+      #   restore-keys 顺序不变：本轮 prepare 优先（state-<源>-<run_id>）。
+      - name: 恢复跨轮状态（只恢复；本轮 prepare 优先）
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: repo/work/store/state
+          restore-keys: |
+            state-tuku-${{ github.run_id }}
+            state-tuku-
+            state-merge-tuku-
       - name: 下载本源 plan（含内容指纹 + 分片分配）
         uses: actions/download-artifact@v4
         with:
@@ -1890,24 +1920,16 @@ jobs:
       #   缓存改由各分片自己 save（key 带片号，无冲突）。
       # ⚠ 2026-11-24 根因修复：把 merge 落盘的跨轮状态存回 actions/cache，
       #   否则 imagecost / user_shard / snapshot 随 runner 销毁 → 下一轮 plan 拿不到。
+      # ⚠ 2026-11-27 根因修复：restore 已前移到「下载本源 plan」之前，这里**只保存**。
+      #   原来 restore+save 一体且是最后一步 → restore 整目录覆盖了「汇总产物」刚写的
+      #   snapshot_<源>_<期> / hashsnapshot / imagecost（实测 run 45926824689 的 artifact 里这些文件全没了）
+      #   → 每轮 merge 都打印「单调性：无上轮快照（首次）」→ 防线3 实际一直失效。
       - name: 保存跨轮状态（供下一轮 plan 用）
         if: always()
-        uses: actions/cache@v4
+        uses: actions/cache/save@v4
         with:
           path: repo/work/store/state
           key: state-merge-tuku-${{ github.run_id }}
-          # ⚠ 2026-11-25 根因修复（顺序错导致 merge 读不到本轮 prepare 的台账）：
-          #   restore-keys 是**按顺序前缀匹配、取最新**。原来的顺序是
-          #       state-merge-<源>-   ← 上轮 merge 保存的（上一轮就已污染）
-          #       state-<源>-         ← 本轮 prepare 保存的（含 user_shard_<源>.json）
-          #   结果 merge 优先命中了上轮的 state-merge- 缓存 →
-          #   实测 merge dahkg 的 artifact 里没有 user_shard_dahkg.json，
-          #   只有上一轮遗留的 aocai/tuku 文件。
-          #   修法：**本轮 prepare 的 state 优先**。
-          restore-keys: |
-            state-tuku-${{ github.run_id }}
-            state-tuku-
-            state-merge-tuku-
       # ⚠ 2026-11-25：把 state 也上传成 artifact，供 publish 合并提交进数据仓。
       #   （actions/cache 只服务于「下一轮的 plan」，不跨 job 传递；
       #     publish 是独立 job，必须靠 artifact 拿到这些文件。）
