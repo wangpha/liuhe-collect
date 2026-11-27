@@ -4501,10 +4501,75 @@ def do_merge_summary(args) -> int:
                 _prev_ids = set()
         _curr_ids = {int(p_.get("articleId") or 0) for p_ in merged if p_.get("articleId")}
         if _prev_ids:
-            _lost = sorted(_prev_ids - _curr_ids)
+            _lost_all = sorted(_prev_ids - _curr_ids)
+            # ⚠ 2026-11-27 根因修复（run 45981975062：防线1 与防线3 自相矛盾）：
+            #
+            #   tuku 实测：
+            #     [防线1] 帖子对账：采集前已存在 1784 / 产物 1775 / 缺 0 / 扫描盲区 13 / 源站已删 0 ← 通过
+            #     [防线3] 单调性：上轮 1598 → 本轮 1775，丢失 23 帖 ← 不通过
+            #   aocai 实测：防线1 缺 0，防线3 报「丢失 5 帖」。
+            #
+            #   两条防线对同一批帖给出相反结论。原因：防线3 只做 `上轮快照 - 本轮产物`，
+            #   把**防线1 已经归因清楚、明确不算漏帖**的类别也当成"丢失"：
+            #     · 扫描盲区（scanGap）      —— 源站列表索引延迟，本轮拿不到，下轮会补
+            #     · 索引延迟（indexLag）     —— 同上
+            #     · 源站已删（disappeared）  —— 帖子真的没了，不是我方问题
+            #     · 幽灵（phantom）          —— 列表里有、详情已不存在
+            #     · 待复核（unverified）     —— 无法确认
+            #   防线3 的本意是「新增内容不漏」，不该把已归因项重复算成丢失。
+            #
+            #   修法：从 _lost 中排除防线1 已归因的 id，只对「上轮有、本轮无、
+            #         且防线1 也没归因」的帖报警（那才是真正需要人看的不一致）。
+            _explained: set[int] = set()
+            if isinstance(_post_check, dict):
+                for _k in ("scanGap", "indexLag", "disappeared", "phantom", "unverified"):
+                    for _x in (_post_check.get(_k) or []):
+                        try:
+                            _explained.add(int(_x))
+                        except (TypeError, ValueError):
+                            continue
+            _lost = [x for x in _lost_all if x not in _explained]
+            _n_explained = len(_lost_all) - len(_lost)
+            # ⚠ 2026-11-27 根因修复之二（run 45981975062：防线3 与防线1 结论相反）：
+            #
+            #   上面排除了防线1 已归因的类别后，tuku 仍剩 10 个「丢失」，
+            #   但防线1 对同一批帖判「缺 0 / 盲区 13 / 已删 0 / 幽灵 0 / 待复核 0」。
+            #
+            #   根因：两条防线检查的是**不同集合**。
+            #     · 防线1 查 `want - got`（本轮采集前已存在、本轮该有，却没有）
+            #     · 防线3 查 `上轮快照 - 本轮产物`，**没校验这些帖本轮是否还该有**
+            #   上轮快照里天然会含「上一期的帖」「已被源站下架/删除的帖」，
+            #   它们本轮本就不该出现 → 被防线3 误算成"丢失"。
+            #
+            #   正确判据：只有「上轮有 **且本轮 plan 仍要求** 且本轮产物没有」才是真丢失。
+            #   plan 不要求的帖，本轮没有它是正常的。
+            _plan_required: set[int] = set()
+            for _key in ("plannedIds", "planned_ids", "unionIds", "union_ids"):
+                for _aid in (plan.get(_key) or []):
+                    try:
+                        _plan_required.add(int(_aid))
+                    except (TypeError, ValueError):
+                        continue
+            for _g in ((plan.get("shardPlan") or {}).get("groups") or {}).values():
+                for _aid in (_g or []):
+                    try:
+                        _plan_required.add(int(_aid))
+                    except (TypeError, ValueError):
+                        continue
+            if _plan_required:
+                _lost_strict = [x for x in _lost if x in _plan_required]
+                _n_not_required = len(_lost) - len(_lost_strict)
+                _lost = _lost_strict
+            else:
+                # 拿不到 plan 要求集合时保守处理：不缩减（宁可报警也不静默放过）
+                _n_not_required = 0
             log(
                 f"[防线3] 单调性：上轮 {len(_prev_ids)} 帖 → 本轮 {len(_curr_ids)} 帖"
                 f"，丢失 {len(_lost)} 帖"
+                + (f"（另有 {_n_explained} 帖已被防线1 归因：盲区/索引延迟/源站已删/幽灵/待复核）"
+                   if _n_explained else "")
+                + (f"（另有 {_n_not_required} 帖本轮 plan 不再要求，不计丢失）"
+                   if _n_not_required else "")
                 + (f"（样本 {_lost[:10]}）← 不通过" if _lost else "  ← 通过")
             )
             if _lost:
