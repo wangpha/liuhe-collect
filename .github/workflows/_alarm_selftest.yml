@@ -1,0 +1,127 @@
+name: 闹钟函数自测（在真实 runner 上验证 has_newer / spawn_relay）
+
+# 为什么需要这个 workflow：
+#   has_newer / spawn_relay 是 bash 函数，内部用 `python3 -c "多行"` + `$(...)`。
+#   本机（Windows + MSYS bash）与线上 runner（Ubuntu）在 PATH / 引号 / stdin 行为上差异很大，
+#   本地模拟三次都得到互相矛盾的结论（"python3 not found" 被当成逻辑错误，又反过来）。
+#   结论必须在**真实 runner** 上拿。
+#
+# 它做什么：
+#   从 .github/workflows/alarm.yml 原样抽出 has_newer 和 spawn_relay，
+#   把 curl 换成 stub（不真发请求），喂 6 种场景，断言输出。
+#   任何一项不符 → exit 1。
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  selftest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 抽取 alarm.yml 的 bash 函数并在 stub 下断言
+        shell: bash
+        run: |
+          set -uo pipefail
+          python3 - <<'PY'
+          import json, re, subprocess, sys, tempfile, yaml
+          from pathlib import Path
+
+          doc = yaml.safe_load(Path(".github/workflows/alarm.yml").read_text(encoding="utf-8"))
+          steps = doc["jobs"]["alarm"]["steps"]
+          main_ = next(s for s in steps if "闹钟主循环" in s["name"])["run"]
+
+          def fn(name):
+              lines = main_.splitlines()
+              i = next(k for k, ln in enumerate(lines) if ln.strip() == f"{name}() {{")
+              out, depth = [], 0
+              for ln in lines[i:]:
+                  out.append(ln)
+                  depth += ln.count("{") - ln.count("}")
+                  if depth == 0 and ln.strip().endswith("}"):
+                      break
+              return "\n".join(out)
+
+          has_newer = fn("has_newer")
+          spawn = fn("spawn_relay")
+
+          STUB = r'''
+          curl() {
+            local a prev="" has_d=0 url=""
+            for a in "$@"; do
+              [ "$prev" = "-d" ] && { printf '%s' "$a" > "$PAYLOAD_OUT"; has_d=1; }
+              case "$a" in https://*) url="$a" ;; esac
+              prev="$a"
+            done
+            if [ "$has_d" = "1" ]; then printf '204'; return 0; fi
+            cat "$FAKE_FILE"
+          }
+          '''
+
+          cases = [
+            ("无其他闹钟",            1,   [],                                                   False, ""),
+            ("只有比我旧的",          500, [{"id":100,"name":"闹钟"}],                          False, ""),
+            ("有比我新的生产闹钟",    500, [{"id":900,"name":"闹钟（每 20 秒轮询档位）"}],     True,  "900"),
+            ("有比我新的但它是自测",  500, [{"id":900,"name":"闹钟·自测"}],                    False, ""),
+            ("新旧都有",              500, [{"id":100,"name":"闹钟"},{"id":900,"name":"闹钟"}], True, "900"),
+            ("API 返回坏 JSON",       1,   "BAD",                                                False, ""),
+          ]
+          ok = True
+          with tempfile.TemporaryDirectory() as td:
+              for label, me, runs, exp_has, exp_id in cases:
+                  fake = runs if isinstance(runs, str) else json.dumps({"workflow_runs": runs}, ensure_ascii=False)
+                  ff = Path(td) / "runs.json"; ff.write_text(fake, encoding="utf-8")
+                  po = Path(td) / "payload.json"
+                  script = "\n".join([
+                      "set -u", STUB,
+                      "GH_TOKEN=x; GITHUB_REPOSITORY=wangpha/liuhe-collect",
+                      f"GITHUB_RUN_ID={me}", f'FAKE_FILE="{ff}"', f'PAYLOAD_OUT="{po}"',
+                      has_newer,
+                      'if has_newer; then echo "HAS=1"; else echo "HAS=0"; fi',
+                      'printf "ID=<%s>\\n" "$NEWER_ID"',
+                  ])
+                  sp = Path(td) / "t.sh"; sp.write_text(script, encoding="utf-8")
+                  r = subprocess.run(["bash", str(sp)], capture_output=True, text=True, timeout=30)
+                  got_has = "HAS=1" in r.stdout
+                  m = re.search(r"ID=<([^>]*)>", r.stdout); got_id = m.group(1) if m else None
+                  good = got_has == exp_has and got_id == exp_id and r.returncode == 0
+                  ok &= good
+                  print(f"  [{'✅' if good else '❌'}] has_newer · {label}: has={got_has} id={got_id!r}")
+                  if not good:
+                      print(f"        期望 has={exp_has} id={exp_id!r} rc={r.returncode}\n        stderr={r.stderr.strip()[:300]!r}")
+
+          # spawn_relay：验证 payload 合法 + 成功后 RELAYED=1
+          for label, is_test, slot, rmin, expect in [
+              ("生产派生生产", "0", "", "350", {"ref":"main","inputs":{"test_slot":"","test_minutes":"","relay":"1"}}),
+              ("自测派生自测", "1", "09:40", "3", {"ref":"main","inputs":{"test_slot":"09:40","test_minutes":"3","relay":"1"}}),
+          ]:
+              with tempfile.TemporaryDirectory() as td:
+                  po = Path(td) / "payload.json"
+                  script = "\n".join([
+                      "set -u", STUB,
+                      "GH_TOKEN=x; GITHUB_REPOSITORY=wangpha/liuhe-collect",
+                      f'PAYLOAD_OUT="{po}"',
+                      f'RELAYED=0; IS_TEST={is_test}; TEST_SLOT="{slot}"; RUN_MIN={rmin}; RELAY_LEAD=8',
+                      spawn, "spawn_relay", 'echo "RELAYED=$RELAYED"',
+                  ])
+                  sp = Path(td) / "t.sh"; sp.write_text(script, encoding="utf-8")
+                  r = subprocess.run(["bash", str(sp)], capture_output=True, text=True, timeout=30)
+                  try:
+                      got = json.loads(po.read_text(encoding="utf-8")) if po.exists() else None
+                  except Exception:
+                      got = None
+                  relayed = "RELAYED=1" in r.stdout
+                  good = got == expect and relayed and r.returncode == 0
+                  ok &= good
+                  print(f"  [{'✅' if good else '❌'}] spawn_relay · {label}: payload={json.dumps(got, ensure_ascii=False) if got else None} relayed={relayed}")
+                  if not good:
+                      print(f"        rc={r.returncode} stderr={r.stderr.strip()[:300]!r}")
+
+          print("\nRESULT: " + ("ALL PASS ✅" if ok else "FAIL ❌"))
+          sys.exit(0 if ok else 1)
+          PY

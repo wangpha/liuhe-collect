@@ -277,7 +277,11 @@ jobs:
               -H "Content-Type: application/json" \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/alarm.yml/dispatches" \
               -d "$RELAY_PAYLOAD" 2>/dev/null || echo "000")
-            echo "    dispatch alarm.yml HTTP $CODE $([ "$code" = "204" ] && echo '✅ 已派生' || echo '⚠ 派生失败')"
+            # ⚠ 2026-11-27 修复：原写成大写 $CODE，但声明/赋值是小写 code。
+            #   脚本是 `set -u` 运行的 → unbound variable → 派生后立刻中止 → 实例 failure。
+            #   实测：run 45922964422「CODE: unbound variable」，curl 其实已成功，
+            #   但结果没记录、RELAYED 没判定、没走正常退出路径。
+            echo "    dispatch alarm.yml HTTP $code $([ "$code" = "204" ] && echo '✅ 已派生' || echo '⚠ 派生失败')"
             [ "$code" = "204" ] || RELAYED=0      # 失败则下一轮重试
           }
 
