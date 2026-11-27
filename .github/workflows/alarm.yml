@@ -1,4 +1,9 @@
 name: 六合定时闹钟
+# ⚠ 2026-11-27 根因修复：防重复检查与 has_newer 读的是 **run** 的 name（不是 job 的 name）。
+#   原来只给 job 起了「闹钟·自测」名，run 的 name 始终是「六合定时闹钟」
+#   → 自测实例被当成生产闹钟参与让位竞争（实测 45922964422 / 45926815654）。
+#   run-name 决定 run 的 name；test_slot 非空时标「自测」，这样两处判定才真的生效。
+run-name: ${{ github.event.inputs.test_slot && '六合定时闹钟·自测' || '六合定时闹钟' }}
 
 # ============================================================================
 # 为什么需要这个 workflow
@@ -105,8 +110,9 @@ permissions:
 
 jobs:
   alarm:
-    # ⚠ 2026-11-27：自测实例在 run 名里标「自测」，供防重复检查识别（自测不算生产闹钟）
-    name: ${{ github.event.inputs.test_slot && '闹钟·自测（每 20 秒轮询档位）' || '闹钟（每 20 秒轮询档位）' }}
+    # job 级 name 不参与任何判定（判定读的是 run 的 name，见文件顶部 run-name）。
+    # 2026-11-27 之前这里写成按 test_slot 切换的表达式，从未生效，已改回固定值。
+    name: "闹钟（每 20 秒轮询档位）"
     runs-on: ubuntu-24.04
     # GitHub 单 job 上限 6 小时 = 360 分钟；留 10 分钟余量避免被强杀
     timeout-minutes: 360   # = GitHub 单 job 硬上限；略大于 RUN_MIN=350，留 10 分钟余量
