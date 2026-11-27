@@ -38,6 +38,12 @@ on:
         description: "自测运行分钟数（留空 = 349）"
         required: false
         default: ""
+      # ⚠ 2026-11-27 接力方案：闹钟快到期时自己 dispatch 下一个实例。
+      #   relay=1 表示「本实例是接力产生的」，跳过「已有闹钟在跑就退出」的检查。
+      relay:
+        description: "接力标记（1 = 由上一个闹钟派生，内部使用）"
+        required: false
+        default: ""
   # 每 6 小时兜底重启（万一上一条链被取消/超时）
   # ⚠ 注意：GitHub cron 一律是 UTC，不是北京时间！
   #   UTC 00/03/06/09/12/15/18/21 :07
@@ -75,7 +81,16 @@ on:
 #   现在：自测实例（test_slot 非空）用独立 group，互不阻塞。
 #   生产实例仍共用 'alarm'，保证同时只有一个（防重复触发）。
 concurrency:
-  group: alarm-${{ github.event.inputs.test_slot || 'prod' }}
+  # ⚠ 2026-11-27 根因修复（实测 run 45920734433）：生产实例共用 'alarm-prod' 时，
+  #   旧实例还在跑，新 dispatch 的实例会被置 **pending**（实测 status=pending）。
+  #   而接力方案要求「旧实例等新实例起来才退」→ 新实例等旧实例退才起 → **死锁**。
+  #
+  #   现在：每个实例用 run_id 独立 group，互不阻塞。
+  #   防重复不再靠 concurrency，改靠：
+  #     · schedule 启动的实例：发现已有生产闹钟在跑 → 立即退出（秒级，不占位）
+  #     · 每轮让位检查：发现比自己新的生产闹钟 → 立即退出（重叠窗口 ≤ 20 秒）
+  #   自测实例仍独立（test_slot 非空）。
+  group: alarm-${{ github.event.inputs.test_slot || github.run_id }}
   cancel-in-progress: false
 
 permissions:
@@ -84,7 +99,8 @@ permissions:
 
 jobs:
   alarm:
-    name: "闹钟（每 20 秒轮询档位）"
+    # ⚠ 2026-11-27：自测实例在 run 名里标「自测」，供防重复检查识别（自测不算生产闹钟）
+    name: ${{ github.event.inputs.test_slot && '闹钟·自测（每 20 秒轮询档位）' || '闹钟（每 20 秒轮询档位）' }}
     runs-on: ubuntu-24.04
     # GitHub 单 job 上限 6 小时 = 360 分钟；留 10 分钟余量避免被强杀
     timeout-minutes: 360   # = GitHub 单 job 硬上限；略大于 RUN_MIN=350，留 10 分钟余量
@@ -104,13 +120,40 @@ jobs:
             echo "should_start=1" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # 查有没有别的「六合定时闹钟」workflow 正在跑（排除自己）
+          # ⚠ 2026-11-27 接力方案：relay=1 的实例是上一个闹钟**主动派生**的，
+          #   它的职责就是接管，不能被「已有闹钟在跑」拦掉 → 跳过检查直接启动。
+          #   （旧实例会通过每轮让位检查在 ≤20 秒内退出）
+          RELAY="${{ github.event.inputs.relay }}"
+          if [ "$RELAY" = "1" ]; then
+            echo "🔁 接力实例（由上一个闹钟派生）→ 跳过防重复检查，直接接管"
+            echo "should_start=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 查有没有别的「生产闹钟」正在跑（排除自己，也排除自测实例）
+          # ⚠ 2026-11-27：自测实例（test_slot 非空）不算生产闹钟，否则：
+          #     ① 自测期间 schedule 触发的生产实例会误判「已有闹钟」而退出；
+          #     ② 自测实例去数「其他在跑」时会把生产闹钟算进去，行为与生产不一致。
+          #   判据：run 的 name 里带「自测」的不算。无法判别的（拿不到 inputs）按生产算。
           RUNNING=$(curl -sS --max-time 30 \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/alarm.yml/runs?status=in_progress&per_page=20" \
-            2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);s=[r for r in (d.get('workflow_runs') or []) if str(r.get('id'))!='$GITHUB_RUN_ID'];print(len(s))" 2>/dev/null || echo "-1")
-          echo "其他在跑的闹钟数 = ${RUNNING}"
+            2>/dev/null | python3 -c '
+              import sys, json
+              try:
+                  d = json.load(sys.stdin)
+              except Exception:
+                  print("-1"); raise SystemExit(0)
+              n = 0
+              for r in (d.get("workflow_runs") or []):
+                  if str(r.get("id")) == "$GITHUB_RUN_ID":
+                      continue
+                  if "自测" in str(r.get("name") or ""):
+                      continue
+                  n += 1
+              print(n)
+              ' 2>/dev/null || echo "-1")
+          echo "其他在跑的生产闹钟数 = ${RUNNING}"
           if [ "$RUNNING" = "-1" ]; then
             echo "⚠ 查不到（API 失败），继续启动"
             echo "should_start=1" >> "$GITHUB_OUTPUT"
@@ -172,6 +215,57 @@ jobs:
             echo $(( 10#$hh * 60 + 10#$mm ))
           }
 
+          # ===== 2026-11-27 接力方案：两个辅助函数 =====
+          # is_test：自测实例不参与接力和让位（自测只验证 dispatch 本身）
+          IS_TEST=0
+          [ -n "$TEST_SLOT" ] && IS_TEST=1
+          # 接力提前量（分钟）：到期前这么久就派生下一个实例
+          RELAY_LEAD=8
+          RELAYED=0
+          NEWER_ID=""
+          # 有没有「比我新的生产闹钟」在跑？（返回 0=有 1=没有）
+          #   判据：alarm.yml 的 in_progress run，id 比我大，名字不带「自测」
+          has_newer() {
+            NEWER_ID=$(curl -sS --max-time 30 \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/alarm.yml/runs?status=in_progress&per_page=30" \
+              2>/dev/null | python3 -c "
+              import sys, json
+              try:
+                  d = json.load(sys.stdin)
+              except Exception:
+                  print(''); raise SystemExit(0)
+              me = int('$GITHUB_RUN_ID' or 0)
+              ids = []
+              for r in (d.get('workflow_runs') or []):
+                  rid = int(r.get('id') or 0)
+                  if rid <= me:
+                      continue
+                  if '自测' in str(r.get('name') or ''):
+                      continue
+                  ids.append(rid)
+              print(ids[0] if ids else '')
+              " 2>/dev/null || echo "")
+            [ -n "$NEWER_ID" ]
+          }
+          # 派生下一个闹钟（relay=1）。只在还没派生过时派生一次。
+          spawn_relay() {
+            [ "$RELAYED" = "1" ] && return 0
+            RELAYED=1
+            echo "[接力 $(TZ=Asia/Shanghai date '+%H:%M:%S')] 距到期 ≤ ${RELAY_LEAD} 分钟 → 派生下一个闹钟"
+            local code
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 40 \
+              -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/alarm.yml/dispatches" \
+              -d '{"ref":"main","inputs":{"test_slot":"","test_minutes":"","relay":"1"}}' 2>/dev/null || echo "000")
+            echo "    dispatch alarm.yml HTTP $CODE $([ "$code" = "204" ] && echo '✅ 已派生' || echo '⚠ 派生失败')"
+            [ "$code" = "204" ] || RELAYED=0      # 失败则下一轮重试
+          }
+
           echo "闹钟启动：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
           echo "结束时间：$(TZ=Asia/Shanghai date -d "@$END" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '?')"
           echo "档位：$SLOTS  补偿窗口：${GRACE_MIN} 分钟"
@@ -179,6 +273,31 @@ jobs:
 
           while [ "$(date +%s)" -lt "$END" ]; do
             ROUND=$((ROUND + 1))
+
+            # ===== 让位检查（每轮，生产实例）=====
+            # 有比我新的生产闹钟在跑 → 我是旧的，立即退出。
+            # 这是 concurrency 改成「每实例独立 group」之后唯一的防重叠手段：
+            #   重叠窗口 ≤ 一个轮询周期（20 秒）。
+            if [ "$IS_TEST" = "0" ] && has_newer; then
+              echo "[让位 $(TZ=Asia/Shanghai date '+%H:%M:%S')] 发现更新的生产闹钟 run $NEWER_ID → 本实例退出"
+              echo "    本轮准点触发：${FIRED:- 无}｜补偿：${LATE_FIRED:- 无}"
+              exit 0
+            fi
+
+            # ===== 到期前接力（每轮，生产实例）=====
+            if [ "$IS_TEST" = "0" ]; then
+              LEFT_MIN=$(( (END - $(date +%s)) / 60 ))
+              if [ "$LEFT_MIN" -le "$RELAY_LEAD" ]; then
+                spawn_relay
+                # 已成功派生 → 由新实例接管，本实例再守一轮就退
+                if [ "$RELAYED" = "1" ]; then
+                  echo "[接力 $(TZ=Asia/Shanghai date '+%H:%M:%S')] 新实例已派生 → 本实例退出（新实例将接管轮询）"
+                  echo "    本轮准点触发：${FIRED:- 无}｜补偿：${LATE_FIRED:- 无}"
+                  exit 0
+                fi
+                # 派生失败 → 不退，继续轮询到 timeout，下一轮再试
+              fi
+            fi
             BJ=$(TZ=Asia/Shanghai date '+%H:%M')
             BJS=$(TZ=Asia/Shanghai date '+%S')
             BJYMD=$(TZ=Asia/Shanghai date '+%Y-%m-%d')
