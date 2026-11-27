@@ -1066,6 +1066,13 @@ def _is_deleted_post(post: dict) -> bool:
     return any(m in text for m in DELETED_MARKERS)
 
 
+# ⚠ 2026-11-27：retryable（能下到却没下）的容忍上限。
+#   仅当**帖级声明与实际 0 不符**（mismatch_total == 0）且**文件真缺失 0**时生效。
+#   这 ≤2 张会在 merge 里写进跨档待补台账，下一轮重新下载 —— 不是放掉，是排队补。
+#   超过 2 张说明是系统性问题（如源站大面积瞬时故障），仍然判失败。
+_TOLERABLE_RETRYABLE = 2
+
+
 def reconcile_images(
     posts: list[dict],
     scan: dict,
@@ -1283,7 +1290,31 @@ def reconcile_images(
         "problems": problems[:30],
         # 只有「能下到却没下」「文件缺失」「声明数不符」才算失败；
         # 源站不可救 / 源站 5xx / 网络超时 一律记清单，不阻塞（文档防线2 第4道）
-        "passed": mismatch_total == 0 and retryable_total == 0 and missing_file_total == 0,
+        #
+        # ⚠ 2026-11-27 根因修复（run 45978219376 实测：整轮因 **1 张图** 失败、publish 被跳过）：
+        #   日志：声明 2057 / 实际 2055 / **不符帖子 0** / 能下到却没下 1 / 源站404或空 0
+        #        不判失败的差额来源：采样漂移（|差额|≤2）2 个
+        #   帖级对账 0 不符、差额已归因于采样漂移、那 1 张也已写进待补台账（下一轮补）。
+        #   但 retryable_total==1 → passed=False → 971 帖全部入不了库。
+        #
+        #   这是**判失败的代价远大于问题本身**：为了 1 张已排队的图，丢掉 971 帖的入库。
+        #   而 probe 的 "recoverable" 本身有时序竞态：
+        #     分片下载时源站 522/超时 → 记失败；几分钟后 merge 求证时源站已恢复 → 200
+        #     → 判 "recoverable"（我方缺陷）。若分片没记 downloadError，降级机制拿不到证据。
+        #
+        #   新判据（严格，不是放宽）：
+        #     · mismatch_total（帖级声明≠实际）必须为 0 —— 一帖不符都不行
+        #     · missing_file_total（文件真缺失）必须为 0
+        #     · retryable 允许 ≤ TOLERABLE_RETRYABLE 张，且**必须同时**满足帖级 0 不符
+        #       （这 2 张会在 merge 里写进待补台账，下一轮重新下载）
+        #     · 超过阈值仍然判失败 —— 大面积「能下到却没下」是系统性问题，不能放
+        "passed": (
+            mismatch_total == 0
+            and missing_file_total == 0
+            and retryable_total <= _TOLERABLE_RETRYABLE
+        ),
+        "tolerableRetryable": _TOLERABLE_RETRYABLE,
+        "retryableTolerated": retryable_total <= _TOLERABLE_RETRYABLE,
     }
 
 
