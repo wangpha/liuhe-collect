@@ -49,9 +49,17 @@ jobs:
 
           has_newer = fn("has_newer")
           spawn = fn("spawn_relay")
+          # 诊断版：去掉 has_newer 内部的 2>/dev/null，让 stub 的 stderr 露出来
+          has_newer_dbg = has_newer.replace("2>/dev/null", "2>/tmp/_hn_stderr")
+          print("---- has_newer 原文 ----")
+          print(has_newer)
+          print("---- has_newer 诊断版（2>/dev/null → 文件）----")
+          print(has_newer_dbg)
+          print("------------------------")
 
           STUB = r'''
           curl() {
+            echo "STUB-CURL args=[$*]" >&2
             local a prev="" has_d=0 url=""
             for a in "$@"; do
               [ "$prev" = "-d" ] && { printf '%s' "$a" > "$PAYLOAD_OUT"; has_d=1; }
@@ -59,6 +67,7 @@ jobs:
               prev="$a"
             done
             if [ "$has_d" = "1" ]; then printf '204'; return 0; fi
+            echo "STUB-CURL reading FAKE_FILE=[$FAKE_FILE] exists=$([ -f "$FAKE_FILE" ] && echo y || echo n)" >&2
             cat "$FAKE_FILE"
           }
           '''
@@ -81,9 +90,10 @@ jobs:
                       "set -u", STUB,
                       "GH_TOKEN=x; GITHUB_REPOSITORY=wangpha/liuhe-collect",
                       f"GITHUB_RUN_ID={me}", f'FAKE_FILE="{ff}"', f'PAYLOAD_OUT="{po}"',
-                      has_newer,
+                      has_newer_dbg,
                       'if has_newer; then echo "HAS=1"; else echo "HAS=0"; fi',
                       'printf "ID=<%s>\\n" "$NEWER_ID"',
+                      'echo "--- has_newer 内部 stderr ---"; cat /tmp/_hn_stderr 2>/dev/null || echo "(空)"',
                   ])
                   sp = Path(td) / "t.sh"; sp.write_text(script, encoding="utf-8")
                   r = subprocess.run(["bash", str(sp)], capture_output=True, text=True, timeout=30)
@@ -93,7 +103,9 @@ jobs:
                   ok &= good
                   print(f"  [{'✅' if good else '❌'}] has_newer · {label}: has={got_has} id={got_id!r}")
                   if not good:
-                      print(f"        期望 has={exp_has} id={exp_id!r} rc={r.returncode}\n        stderr={r.stderr.strip()[:300]!r}")
+                      print(f"        期望 has={exp_has} id={exp_id!r} rc={r.returncode}")
+                      print(f"        stdout={r.stdout.strip()[:500]!r}")
+                      print(f"        stderr={r.stderr.strip()[:500]!r}")
 
           # spawn_relay：验证 payload 合法 + 成功后 RELAYED=1
           for label, is_test, slot, rmin, expect in [
