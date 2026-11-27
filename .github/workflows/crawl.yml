@@ -172,7 +172,10 @@ env:
   # shard job 的 matrix 用它取下标 —— 两处必须同源，否则分组与下标对不上。
   SHARD_MAP: "dahkg:8,aocai:5,tuku:4"
   # 分片 job 的真实 timeout（秒）。budget.timeouts_from_env() 用它算每片容量，
-  # 必须与下面 shard_* job 的 timeout-minutes: 40 一致（40×60=2400）。
+  # **必须与下面 shard_* job 的 timeout-minutes 一致**（当前 58 分 → 58×60=3480）。
+  # ⚠ 2026-11-28 修正：原注释写「40 分 → 2400」，是早期值，后来调到 58 分但注释没跟着改，
+  #   会误导排查（按注释算容量会差 18 分钟）。容量还要乘 USABLE_RATIO=0.6 留开销余量，
+  #   所以 3480×0.6=2088 秒（34.8 分）才是真正可用的单片预算。
   LIUHE_SHARD_JOB_TIMEOUT: "3480"
   #   ① aocai 1→6：plan 算出需 6 片（全片 114.7 分钟 ÷ 18.8），但 matrix 只给 1 片
   #      → 那 1 片收全量 → 时间预算到点 → 2215 张图 not_processed → 防线2 失败。

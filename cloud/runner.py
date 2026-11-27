@@ -52,6 +52,27 @@ def _resolve_state_dir(args, work: Path) -> Path:
     return work / "state"
 
 
+def _beijing_now_iso() -> str:
+    """当前**北京时间**，格式与历史数据完全一致（`%Y-%m-%d %H:%M:%S`，无时区后缀）。
+
+    ⚠ 2026-11-28 根因修复：原来各处用 `time.strftime("%Y-%m-%d %H:%M:%S")`，
+    GitHub runner 是 UTC，生成的是 UTC 时间但字符串没有时区标记 →
+    看起来像本地时间，差 8 小时。
+    实测：03:38 写入的台账 updatedAt 显示 19:29（前一天的 19:29），
+    排查时被误判成「19 小时前的旧数据」，浪费大量时间。
+
+    ⚠ 为什么**不**加 `+08:00` 后缀：
+      数据仓里已有的历史台账是旧格式（naive），而 cloud_status.py 等处用
+      `datetime.fromisoformat` 解析后可能参与比较；aware 与 naive 比较会抛
+      `TypeError: can't compare offset-naive and offset-aware datetimes`。
+      加后缀会把「时区显示错误」换成「比较直接崩」，得不偿失。
+    所以：**保持格式不变（naive），只把值改成北京时间** —— 显示正确且不破坏解析。
+    """
+    from datetime import datetime, timedelta, timezone as _tz
+
+    return datetime.now(_tz(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _find_period_dir(work: Path, out_root: Path, source: str, period: int = 0) -> Path:
     """产物目录：out 下**真正含产物**的那一期目录。
 
@@ -234,7 +255,7 @@ def do_cleanup(args) -> int:
         )
 
     report = {
-        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts": _beijing_now_iso(),
         "images": img_stats,
         "periods": rot_stats,
     }
@@ -711,7 +732,7 @@ def do_plan(args) -> int:
         "period": period,               # 传给该源模块的值（dahkg=短期号，aocai/tuku=整期号）
         "periodDisplay": display,       # 目录/报告用的短期号
         "periodCaliber": caliber,
-        "createdAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "createdAt": _beijing_now_iso(),
         "periodEvidence": evidence,
         "scan": {k: v for k, v in scan.items() if k != "unionMeta"},
         "counts": {
@@ -834,7 +855,7 @@ def do_plan(args) -> int:
                 {
                     "source": source,
                     "period": period,
-                    "detectedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "detectedAt": _beijing_now_iso(),
                     "count": len(changed),
                     "newPosts": new_posts,
                     "comparedAgainst": f"hashsnapshot_{source}_{period}.json@prevPeriod={prev_period}",
@@ -1756,7 +1777,7 @@ def _save_user_shard(state_dir: Path, source: str, mapping: dict[str, int], peri
         {
             "period": period,
             "shards": n,
-            "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "updatedAt": _beijing_now_iso(),
             "_note": "按用户分片：同一作者固定落同一片，跨轮稳定；新用户进入当前最轻的片",
             "userToShard": mapping,
         },
@@ -2294,7 +2315,7 @@ def _install_sigterm_surrender(work: Path, source: str, shard_index: int,
                     "shard": shard_index,
                     "ids": sorted(int(x) for x in (planned_ids or [])),
                     "reason": "SIGTERM（分片预算用完，workflow 的 timeout 触发）",
-                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "ts": _beijing_now_iso(),
                 },
             )
             log(f"[shard] ✅ unfinished 已写（{len(planned_ids or [])} 帖），merge 会补抓")
@@ -2990,7 +3011,7 @@ def do_shard(args) -> int:
                     "shard": shard_index,
                     "ids": sorted(int(x) for x in planned_ids),
                     "reason": "开跑前预写（若被 SIGKILL 则据此判断缺口）",
-                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "ts": _beijing_now_iso(),
                 },
             )
             log(
@@ -3073,7 +3094,7 @@ def do_shard(args) -> int:
                         f"{budget_est['hit_rate'] * 100:.0f}%），超出分片容量 "
                         f"{budget_dec['shard_capacity']} 图"
                     ),
-                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "ts": _beijing_now_iso(),
                 },
             )
             planned_ids = set(taken)
@@ -3139,7 +3160,7 @@ def do_shard(args) -> int:
                 "source": source, "shard": shard_index,
                 "ids": sorted(int(x) for x in _miss),
                 "reason": f"扫列表漏帖且按 id 补详情失败 {len(_miss)} 帖（分页抖动）",
-                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "ts": _beijing_now_iso(),
             },
         )
         log(f"[shard] ⚠ {len(_miss)} 帖补不上，已写 unfinished 交 merge：{sorted(_miss)[:8]}")
@@ -3229,7 +3250,7 @@ def do_shard(args) -> int:
             "totalItems": sink.get("total", 0),
             "pickedItems": sink.get("picked", 0),
             "exitCode": code,
-            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ts": _beijing_now_iso(),
             # A'' 命中率上报（供 merge 写进 run_meta，校准 HIT_RATE_HISTORY）
             "ocrCacheHit": budget_est.get("cached", 0),
             "ocrCacheMiss": max(0, budget_est.get("total_images", 0) - budget_est.get("cached", 0)),
@@ -4602,7 +4623,7 @@ def do_merge_summary(args) -> int:
                 _snap_path,
                 {"source": source, "period": period,
                  "ids": sorted(_curr_ids),
-                 "ts": time.strftime("%Y-%m-%d %H:%M:%S")},
+                 "ts": _beijing_now_iso()},
             )
         except OSError as _exc:
             log(f"[防线3] ⚠ 快照写入失败（不影响本轮）：{_exc}")
@@ -4668,7 +4689,7 @@ def do_merge_summary(args) -> int:
                     {
                         "period": period,
                         "shards": _n_shards,
-                        "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "updatedAt": _beijing_now_iso(),
                         "_note": "按用户分片：同一作者固定落同一片，跨轮稳定；"
                                  "新用户进入当前最轻的片",
                         "_writtenBy": "do_merge_summary",
@@ -4692,7 +4713,7 @@ def do_merge_summary(args) -> int:
                     _state_dir / f"hashsnapshot_{source}_{period}.json",
                     {
                         "period": period,
-                        "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "updatedAt": _beijing_now_iso(),
                         "_note": "每帖 title/content/images/replies 四个 hash；供下一轮内容变更识别",
                         "_writtenBy": "do_merge_summary",
                         "hashes": _hashes,
@@ -4730,7 +4751,7 @@ def do_merge_summary(args) -> int:
                 _state_dir / f"imagecost_{source}.json",
                 {
                     "_period": period,
-                    "_updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "_updatedAt": _beijing_now_iso(),
                     "_note": "每帖 count=正文图+回复图张数；detArea=det 输入端像素和"
                              "（merge 阶段无 det 尺寸信息，记 0）；供下一轮分片均衡",
                     "_writtenBy": "do_merge_summary",
@@ -4753,7 +4774,7 @@ def do_merge_summary(args) -> int:
                 {
                     "source": source,
                     "period": period,
-                    "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "updatedAt": _beijing_now_iso(),
                     "_note": "本轮产物帖 id 列表；供下一轮防线3 单调性比对（丢帖即报警）",
                     "_writtenBy": "do_merge_summary",
                     "ids": _ids,
@@ -5173,7 +5194,7 @@ def do_run(args, mode: str = "run") -> int:
         "source": source,
         "mode": mode,
         "period": period,
-        "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "generatedAt": _beijing_now_iso(),
         "durationSec": round(time.time() - started, 1),
         "collectElapsedSec": round(elapsed, 1),
         "collectExitCode": rc,
@@ -5211,7 +5232,7 @@ def do_run(args, mode: str = "run") -> int:
             "learnedOffset": (period - int(evidence.get("check4_drawCrossCheck", {}).get("drawPeriods") or 0))
             if evidence.get("check4_drawCrossCheck", {}).get("drawPeriods")
             else learned_offset,
-            "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "updatedAt": _beijing_now_iso(),
         }
         _guard.save_json(state_file, new_state)
         _guard.save_json(snapshot_file, curr_snapshot)
@@ -5224,7 +5245,7 @@ def do_run(args, mode: str = "run") -> int:
 
         image_cost = {
             "_period": period,
-            "_updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "_updatedAt": _beijing_now_iso(),
             "_note": "每帖 count=正文图+回复图张数；detArea=det 输入端像素和（URL 无尺寸的源为 0）",
             "cost": {
                 str(int(p.get("articleId") or 0)): {
@@ -5267,7 +5288,7 @@ def do_run(args, mode: str = "run") -> int:
                     state_file.parent / f"hashsnapshot_{source}_{period}.json",
                     {
                         "period": period,
-                        "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "updatedAt": _beijing_now_iso(),
                         "_note": "每帖 title/content/images/replies 四个 hash；供下一轮内容变更识别",
                         "hashes": hashes,
                     },
