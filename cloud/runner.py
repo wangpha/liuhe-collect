@@ -4461,7 +4461,23 @@ def do_merge_summary(args) -> int:
     #   · snapshot_<源>_<期>.json 永远缺失 → 防线3 单调性永远走「首次」分支
     # ==========================================================================
     if passed:
-        _state_dir = work / "state"
+        # ⚠ 2026-11-27 根因修复（这才是「台账永远停在旧期/旧片数」的真正原因）：
+        #
+        #   原代码 `_state_dir = work / "state"` → 写到 <work>/state。
+        #   但本函数的 state 目录由 `--state` 指定，云端是 `work/store/state`
+        #   （数据仓 checkout 的位置），上传 artifact / 提交数据仓用的也是它。
+        #   → 这 4 个文件全部写到了**另一个目录**，随后随 runner 销毁：
+        #       user_shard_<源>.json    ← 台账永远读数据仓里的旧文件（实测停在 329 期/18 片，11-25）
+        #       snapshot_<源>_<期>.json ← 防线3 每轮都「无上轮快照（首次）」
+        #       hashsnapshot / imagecost ← 内容变更识别与成本基线永远缺失
+        #
+        #   实证（run 45937346257 的 merge artifact，同一目录内）：
+        #       pending_dahkg.json      period=331  updatedAt=2026-11-27T12:25:55  ← 新（用 _resolve_state_dir）
+        #       user_shard_dahkg.json   period=329  updatedAt=2026-11-25 01:26:54  ← 旧（用了 work/"state"）
+        #   日志却打印「已落盘 613 个作者 → 8 片」——写成功了，只是写到了没人读的目录。
+        #
+        #   修法：与 pending 台账同源，统一用 _resolve_state_dir(args, work)。
+        _state_dir = _resolve_state_dir(args, work)
         try:
             _state_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
