@@ -300,13 +300,39 @@ jobs:
               fi
             done
             echo "在跑的 run 数（除自己）= ${RUNNING}"
+            # ⚠ 2026-11-27 根因修复（run 45978393417 实测：18:00 档整轮被跳过、该档无数据）：
+            #
+            #   原逻辑：只要有别的 run 在跑就 `exit 0` 跳过整轮。
+            #   实测：17:59 有个手动 run 在跑 → 18:00 的闹钟触发看到 RUNNING=1
+            #        → 「⏭ 已有 1 个 run 在跑 → 跳过本轮」
+            #        → 全部 job skipped、publish skipped → **18:00 这一档没有数据**
+            #        （后来靠 18:52 那轮补上，晚到 52 分钟）
+            #
+            #   这是「防重复」与「档位必须跑」的设计冲突。
+            #   判据：如果**当前时间正好命中五档窗口**，档位是不可跳过的 ——
+            #         重复跑一轮的代价（几十个 job、几分钟）远小于丢一整档的数据。
+            #         所以窗口内即使有 run 在跑，也放行（两个 run 并行是安全的：
+            #         数据仓 push 有 retry，分片互不冲突）。
+            #   非窗口时间（如 schedule 抖动触发）才按原逻辑跳过。
+            _IN_SLOT_WINDOW=0
+            _NOW_M_TMP=$(( 10#$(TZ=Asia/Shanghai date +%H) * 60 + 10#$(TZ=Asia/Shanghai date +%M) ))
+            for _sm in 720 900 1080 1210 1240; do
+              if [ "$_NOW_M_TMP" -ge "$_sm" ] && [ "$_NOW_M_TMP" -le $((_sm + 29)) ]; then
+                _IN_SLOT_WINDOW=1
+                break
+              fi
+            done
             if [ "$RUNNING" = "-1" ]; then
               echo "⚠ 查不到在跑 run（API 失败），按无并发继续"
             elif [ "$RUNNING" -gt 0 ]; then
-              echo "⏭ 已有 $RUNNING 个 run 在跑 → 跳过本轮（避免重复跑 + push 冲突）"
-              echo "should_run=0" >> "$GITHUB_OUTPUT"
-              echo "slot=busy" >> "$GITHUB_OUTPUT"
-              exit 0
+              if [ "$_IN_SLOT_WINDOW" = "1" ]; then
+                echo "⚠ 有 $RUNNING 个 run 在跑，但当前正命中五档窗口 → **仍然放行**（档位不可跳过，重复跑的代价远小于丢一档数据）"
+              else
+                echo "⏭ 已有 $RUNNING 个 run 在跑 → 跳过本轮（非档位窗口，避免重复跑 + push 冲突）"
+                echo "should_run=0" >> "$GITHUB_OUTPUT"
+                echo "slot=busy" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
             fi
           fi
 

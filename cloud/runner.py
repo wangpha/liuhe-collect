@@ -3384,6 +3384,10 @@ def do_merge_summary(args) -> int:
     out_root = Path(args.out or work / "out").resolve()
     source = args.source
     started = _time.time()
+    # ⚠ 2026-11-27：本轮求证为「源站已删/隐藏」的帖 id。
+    #   数量断言段算出后写这里，供防线1（disappeared）与防线3（排除清单）共用，
+    #   避免「已判明是源站删帖却被防线3 当成我方丢失」。
+    _gone_deleted_ids: set[int] = set()
     log("=" * 70)
     log(f"[merge-summary] source={source} 输出根={out_root}（只汇总，不重抓）")
     log("=" * 70)
@@ -3773,6 +3777,18 @@ def do_merge_summary(args) -> int:
                 for _aid in _probe_ids:
                     if not (_pr.get("exists") or {}).get(_aid, True):
                         _gone.add(int(_aid))
+                # ⚠ 2026-11-27 根因修复（run 45996392328 实测：aocai 20:10 档失败）：
+                #
+                #   这里已经正确判定出「缺失的 3 帖中有 3 帖源站已删/隐藏」，
+                #   但 `_gone` 只是**局部变量**，没有传给防线1 的 `disappeared` 字段，
+                #   也没传给防线3 的排除清单。结果：
+                #     [merge-summary] ✅ 缺失的 3 帖中有 3 帖源站已删/隐藏（不算漏帖）
+                #     [防线1] 帖子对账：... 源站已删 0 ...        ← 明明删了却说 0
+                #     [防线3] 单调性：丢失 2 帖（样本 [3237528, 3237595]）← 误判
+                #   → 整轮失败、publish skipped，957 帖入不了库。
+                #
+                #   修法：存到函数级变量，供防线1/防线3 使用。
+                _gone_deleted_ids.update(_gone)
                 if _gone:
                     log(
                         f"[merge-summary] ✅ 缺失的 {len(missing)} 帖中有 {len(_gone)} 帖"
@@ -4528,6 +4544,10 @@ def do_merge_summary(args) -> int:
                             _explained.add(int(_x))
                         except (TypeError, ValueError):
                             continue
+            # ⚠ 2026-11-27：合并段求证为「源站已删/隐藏」的帖也要排除。
+            #   这些帖在上轮快照里有、本轮没有，且已确认源站已删 —— 不是我方丢失。
+            #   实测 run 45996392328：3 帖已判明源站已删，却仍被防线3 报「丢失 2 帖」→ 整轮失败。
+            _explained |= _gone_deleted_ids
             _lost = [x for x in _lost_all if x not in _explained]
             _n_explained = len(_lost_all) - len(_lost)
             # ⚠ 2026-11-27 根因修复之二（run 45981975062：防线3 与防线1 结论相反）：
