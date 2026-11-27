@@ -2162,21 +2162,87 @@ jobs:
       #
       #   修法：publish 里把各源 merge 上传的 state 下载回来，覆盖到 work/store/state，
       #        这样后面的 `git add -A` 就能把它们提交进数据仓。
-      - name: 下载各源跨轮状态（imagecost / user_shard / snapshot）
+      # ⚠ 2026-11-27 根因修复（run 45963991280 实测：只有 dahkg 的台账进了数据仓，
+      #   aocai/tuku 仍是旧值 329/18 片）：
+      #
+      #   原来 `merge-multiple: true` 把三个 state-<源>-<run_id> 解到**同一个目录**。
+      #   而每个 artifact 里都含**全部三个源**的 13 个文件（state 目录是共享的，
+      #   各 merge 都 restore 了全套）。三个 artifact 各有各的新数据：
+      #
+      #       state-dahkg: user_shard_dahkg = 331/8片/721 ✅   user_shard_aocai = 旧 ❌
+      #       state-aocai: user_shard_aocai = 2026331/5片/533 ✅  user_shard_dahkg = 旧 ❌
+      #       state-tuku : user_shard_tuku  = 331/4片/1353 ✅   user_shard_dahkg = 旧 ❌
+      #
+      #   merge-multiple 后解压的覆盖先解压的 → 每个源只剩「最后一个 artifact」的版本，
+      #   另外两个源的新台账被旧文件盖掉。
+      #
+      #   修法：不合并解压，而是**按源分目录**下载（merge-multiple: false 时
+      #   download-artifact 会为每个 artifact 建子目录），再由下一步按源取自己的文件。
+      - name: 下载各源跨轮状态（按源分目录，避免互相覆盖）
         if: always()
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          # ⚠ 2026-11-25：只取 merge 上传的 state-<源>-<run_id> 三个。
-          #   显式列举，不用通配 —— 因为 `state-[a-z]*-` 也会匹配到
-          #   `state-plan-<源>-`（prepare 上传的），两者都含 user_shard_<源>.json
-          #   但内容不同，merge-multiple 会互相覆盖。
-          #   merge 在 prepare 之后跑，且它的 --state 会读到 prepare 写的台账再回写，
-          #   所以 merge 那份是最新的。
           pattern: state-{dahkg,aocai,tuku}-${{ github.run_id }}
-          path: repo/work/store/state
-          merge-multiple: true
+          path: repo/work/state-incoming
+          merge-multiple: false
         # 没有 artifact 时不算失败（首轮或 merge 未产出）
+
+      # ⚠ 2026-11-27：按源挑自己的 state 文件，合并进数据仓 state 目录。
+      #   每个 artifact 里都含三个源的全套文件，但只有**自己那个源**是本次新写的；
+      #   另外两个源在该 artifact 里是它 restore 到的旧版本（可能是上上轮的）。
+      #   所以：源 X 的文件只从 state-X 目录取，绝不从别的源目录取。
+      #   共享文件（pending_* 是每源独立，current_period_* 也是每源独立）同样按源取。
+      - name: 合并各源 state（每个源只取自己那份）
+        if: always()
+        working-directory: repo
+        run: |
+          set -uo pipefail
+          SRC_STATE="work/store/state"
+          IN="work/state-incoming"
+          mkdir -p "$SRC_STATE"
+          if [ ! -d "$IN" ]; then
+            echo "⚠ 没有下载到 state artifact（首轮或 merge 未产出）→ 保持数据仓现有 state"
+            exit 0
+          fi
+          echo "下载到的 state artifact 目录："
+          ls -1 "$IN" 2>/dev/null || true
+          for S in dahkg aocai tuku; do
+            D="$IN/state-$S-${{ github.run_id }}"
+            if [ ! -d "$D" ]; then
+              echo "  [$S] ⚠ 缺 state-$S artifact → 跳过（保持旧值）"
+              continue
+            fi
+            n=0
+            # 只取属于本源的文件：user_shard_<S> / snapshot_<S>_* / hashsnapshot_<S>_*
+            #                    imagecost_<S> / pending_<S> / current_period_<S>
+            for pat in "user_shard_$S.json" "snapshot_$S"_*.json "hashsnapshot_$S"_*.json \
+                       "imagecost_$S.json" "pending_$S.json" "current_period_$S.json"; do
+              for f in $D/$pat; do
+                [ -f "$f" ] || continue
+                cp -f "$f" "$SRC_STATE/" && n=$((n+1))
+              done
+            done
+            echo "  [$S] 从 $D 取入 $n 个文件"
+          done
+          echo "合并后 $SRC_STATE："
+          ls -1 "$SRC_STATE" | head -30
+          # 校验：每个源的 user_shard 期号/片数必须与本源本轮一致（否则如实报错，不静默）
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          st = Path("work/store/state")
+          bad = []
+          for s in ("dahkg", "aocai", "tuku"):
+              p = st / f"user_shard_{s}.json"
+              if not p.exists():
+                  print(f"  [{s}] user_shard 缺失"); bad.append(s); continue
+              j = json.loads(p.read_text(encoding="utf-8"))
+              m = j.get("userToShard") or {}
+              print(f"  [{s}] user_shard: period={j.get('period')} shards={j.get('shards')} users={len(m)}")
+          if bad:
+              print("⚠ 以下源台账缺失：" + ",".join(bad))
+          PY
 
       - name: 下载各源产物
         uses: actions/download-artifact@v4
