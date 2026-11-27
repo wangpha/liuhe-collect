@@ -4241,6 +4241,50 @@ def do_merge_summary(args) -> int:
 
         _done_ids = {int(p_.get("articleId") or 0) for p_ in merged if p_.get("articleId")}
         _fail_map = {int(x): "unfinished" for x in (_unfinished_ids or [])}
+        # ⚠ 2026-11-27 根因修复：**图片下载失败的帖子也要进待补台账**。
+        #
+        #   原来 _fail_map 只收「帖子级漏帖」（_unfinished_ids），完全不看图片。
+        #   而分片删 unfinished 的判据是「帖子是否都处理完」(`not rest_ids`)，
+        #   所以「帖子跑完了、但图没下下来」这种状态会同时打印：
+        #       [图片] ⚠ 3 轮重试后仍有 79 张失败（如实上报）
+        #       [shard] ✅ 本片无遗漏 → 删除开跑前预写的 unfinished
+        #   → 台账 count=0 → 下一轮不补 → 该帖文字版永久缺图。
+        #
+        #   实测 run 45969047428（tuku 源站 522）：939 张图失败、65 帖受影响，
+        #   而 pending_tuku.json 是 count=0。
+        #
+        #   修法：**就地扫 merged 里每张图的 downloadStatus**（不依赖防线2 的 _image_check，
+        #         因为那个在本块之后才算出），非 exists/downloaded/cached 的即失败，
+        #         把所属帖子写进台账（reason=image_failed），下一轮 plan 强制并入 union_ids。
+        _OK_DL = {"exists", "downloaded", "cached"}
+        _img_fail_ids: set[int] = set()
+
+        def _scan_bad_images(_obj, _aid: int) -> None:
+            if isinstance(_obj, dict):
+                if "downloadStatus" in _obj or ("url" in _obj and "localPath" in _obj):
+                    _st = str(_obj.get("downloadStatus") or "")
+                    if _st and _st not in _OK_DL:
+                        _img_fail_ids.add(_aid)
+                for _v in _obj.values():
+                    _scan_bad_images(_v, _aid)
+            elif isinstance(_obj, list):
+                for _v in _obj:
+                    _scan_bad_images(_v, _aid)
+
+        for _p_ in merged:
+            try:
+                _aid_p = int(_p_.get("articleId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if _aid_p > 0:
+                _scan_bad_images(_p_, _aid_p)
+        if _img_fail_ids:
+            log(
+                f"[merge] 📌 图片下载失败的帖子 {len(_img_fail_ids)} 个 → 写入待补台账"
+                f"（下一轮重新下载这些图）：{sorted(_img_fail_ids)[:8]}"
+            )
+            for _aid_i in _img_fail_ids:
+                _fail_map.setdefault(_aid_i, "image_failed")
         # 台账里已有、且本档既没在产物里、也不在 unfinished 里的（异常消失）也要保留
         _led = _pend2.load_pending(_resolve_state_dir(args, work), source,
                                    int(plan.get("period") or 0))
@@ -4405,7 +4449,13 @@ def do_merge_summary(args) -> int:
     log("[防线3] ===== 新增内容不漏（R13）=====")
     try:
         # 单调性：与上一轮快照比，产物帖数不能少（少了就是丢了新增或旧帖）
-        _snap_path = work / "state" / f"snapshot_{source}_{period}.json"
+        # ⚠ 2026-11-27 根因修复（防线3 一直「无上轮快照（首次）」的真正原因）：
+        #   这里原来写 `work / "state"`，与 L4464 是**同一个错误**的第二个实例。
+        #   快照写进 <work>/state，而下一轮 plan/merge 从 --state（云端 work/store/state）读
+        #   → 永远读不到 → 每轮都判「首次」→ 单调性检查从未生效。
+        #   实测 run 45963991280 / 45969047428 两轮都打印「无上轮快照（首次）」。
+        #   修法：统一用 _resolve_state_dir(args, work)。
+        _snap_path = _resolve_state_dir(args, work) / f"snapshot_{source}_{period}.json"
         _prev_ids: set[int] = set()
         if _snap_path.exists():
             try:
