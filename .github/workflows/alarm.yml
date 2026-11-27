@@ -44,6 +44,12 @@ on:
         description: "接力标记（1 = 由上一个闹钟派生，内部使用）"
         required: false
         default: ""
+      # 验证钩子：自测实例填 1 时，在运行结束前 1 分钟派生一个**自测** relay 实例，
+      # 用来当天验证「到期前派生」这条路径（生产实例不受此开关影响）。
+      test_relay:
+        description: "自测：验证到期前派生（1 = 开启，需同时填 test_slot）"
+        required: false
+        default: ""
   # 每 6 小时兜底重启（万一上一条链被取消/超时）
   # ⚠ 注意：GitHub cron 一律是 UTC，不是北京时间！
   #   UTC 00/03/06/09/12/15/18/21 :07
@@ -220,7 +226,10 @@ jobs:
           IS_TEST=0
           [ -n "$TEST_SLOT" ] && IS_TEST=1
           # 接力提前量（分钟）：到期前这么久就派生下一个实例
+          TEST_RELAY="${{ github.event.inputs.test_relay }}"
           RELAY_LEAD=8
+          # 自测验证派生：运行结束前 1 分钟就派生
+          [ "$IS_TEST" = "1" ] && [ "$TEST_RELAY" = "1" ] && RELAY_LEAD=1
           RELAYED=0
           NEWER_ID=""
           # 有没有「比我新的生产闹钟」在跑？（返回 0=有 1=没有）
@@ -253,6 +262,12 @@ jobs:
           spawn_relay() {
             [ "$RELAYED" = "1" ] && return 0
             RELAYED=1
+            # 生产派生生产（relay=1 接管）；自测派生自测（带 relay=1 但 test_slot 非空 → 仍是自测实例，不参与生产）
+            if [ "$IS_TEST" = "1" ]; then
+              RELAY_PAYLOAD="{\"ref\":\"main\",\"inputs\":{\"test_slot\":\"$TEST_SLOT\",\"test_minutes\":\"$RUN_MIN\",\"relay\":\"1\"}}"
+            else
+              RELAY_PAYLOAD="{\"ref\":\"main\",\"inputs\":{\"test_slot\":\"\",\"test_minutes\":\"\",\"relay\":\"1\"}}"
+            fi
             echo "[接力 $(TZ=Asia/Shanghai date '+%H:%M:%S')] 距到期 ≤ ${RELAY_LEAD} 分钟 → 派生下一个闹钟"
             local code
             code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 40 \
@@ -261,7 +276,7 @@ jobs:
               -H "Accept: application/vnd.github+json" \
               -H "Content-Type: application/json" \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/alarm.yml/dispatches" \
-              -d '{"ref":"main","inputs":{"test_slot":"","test_minutes":"","relay":"1"}}' 2>/dev/null || echo "000")
+              -d "$RELAY_PAYLOAD" 2>/dev/null || echo "000")
             echo "    dispatch alarm.yml HTTP $CODE $([ "$code" = "204" ] && echo '✅ 已派生' || echo '⚠ 派生失败')"
             [ "$code" = "204" ] || RELAYED=0      # 失败则下一轮重试
           }
@@ -285,7 +300,11 @@ jobs:
             fi
 
             # ===== 到期前接力（每轮，生产实例）=====
-            if [ "$IS_TEST" = "0" ]; then
+            # 自测实例：仅当 test_relay=1 时验证「到期前派生」，且派生出的仍是自测实例
+            DO_RELAY=0
+            [ "$IS_TEST" = "0" ] && DO_RELAY=1
+            [ "$IS_TEST" = "1" ] && [ "$TEST_RELAY" = "1" ] && DO_RELAY=1
+            if [ "$DO_RELAY" = "1" ]; then
               LEFT_MIN=$(( (END - $(date +%s)) / 60 ))
               if [ "$LEFT_MIN" -le "$RELAY_LEAD" ]; then
                 spawn_relay
