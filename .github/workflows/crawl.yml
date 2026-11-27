@@ -1543,6 +1543,26 @@ jobs:
       # ⚠ 2026-11-25：把 state 也上传成 artifact，供 publish 合并提交进数据仓。
       #   （actions/cache 只服务于「下一轮的 plan」，不跨 job 传递；
       #     publish 是独立 job，必须靠 artifact 拿到这些文件。）
+      # ⚠ 2026-11-27 诊断（临时）：台账写入目录与上传目录是否同一个
+      - name: 诊断-state 目录实况
+        if: always()
+        run: |
+          echo "PWD=$(pwd)"
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          echo "--- repo/work/store/state ---"
+          ls -la repo/work/store/state 2>/dev/null | head -20 || echo "(不存在)"
+          echo "--- work/store/state ---"
+          ls -la work/store/state 2>/dev/null | head -20 || echo "(不存在)"
+          echo "--- period/shards ---"
+          for f in repo/work/store/state/user_shard_dahkg.json work/store/state/user_shard_dahkg.json; do
+            if [ -f "$f" ]; then
+              echo -n "$f => "
+              python3 -c "import json;d=json.load(open('$f'));print('period',d.get('period'),'shards',d.get('shards'),'users',len(d.get('userToShard') or {}))" || echo "解析失败"
+            fi
+          done
+          echo "--- snapshot ---"
+          ls repo/work/store/state/*snapshot* 2>/dev/null || echo "(repo 下无 snapshot)"
+
       - name: 上传跨轮状态（供 publish 提交进数据仓）
         if: always()
         continue-on-error: true
